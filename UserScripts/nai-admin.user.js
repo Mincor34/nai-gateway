@@ -11,6 +11,8 @@
 // @grant        GM_setValue
 // @grant        GM_getValue
 // @connect      *.duckdns.org
+// @updateURL    https://raw.githubusercontent.com/Mincor34/nai-gateway/master/UserScripts/nai-admin.user.js
+// @downloadURL  https://raw.githubusercontent.com/Mincor34/nai-gateway/master/UserScripts/nai-admin.user.js
 // ==/UserScript==
 
 /**
