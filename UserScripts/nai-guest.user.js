@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         NovelAI Split-Token Gateway Coordinator (Guest)
 // @namespace    http://tampermonkey.net/
-// @version      3.0.1
+// @version      3.0.2
 // @description  FIFO queue coordination, metadata spoofing, and background stream proxy pipeline
 // @author       Minco
 // @match        https://novelai.net/*
@@ -267,6 +267,16 @@
                             GM_setValue("approved", true);
                             window.location.reload();
                         }
+                    } else if (res.status === 401) {
+                        // Server deleted this device. Silently re-register to re-appear in the admin panel.
+                        console.warn("Nai-Guest: Server returned 401 during poll. Re-registering silently...");
+                        const nickname = GM_getValue("device_nickname", "Guest");
+                        backgroundRequest({
+                            method: "POST",
+                            url: `${validatedHost}/auth/register`,
+                            headers: { "Content-Type": "application/json" },
+                            data: JSON.stringify({ browser_id: browserId, device_secret: deviceSecret, label: nickname })
+                        }).catch(err => console.error("Nai-Guest: Silent re-registration failed:", err));
                     }
                 } catch (err) {
                     console.error("Setup wizard poll error:", err);
@@ -573,11 +583,20 @@
         } else {
             console.error(`[Nai-Guest] Telemetry: Proxy returned exception status code: ${status}`);
 
-            // Forcefully wipe the approved flag and reload the tab to mount the setup overlay
+            // Forcefully wipe the approved flag, silently re-register, and reload the tab to mount the setup overlay
             if (status === 401) {
-                console.warn("[Nai-Guest] Revocation signature caught. Restoring setup lock.");
+                console.warn("[Nai-Guest] Revocation signature caught. Restoring setup lock and silently re-registering.");
                 GM_setValue("approved", false);
-                setTimeout(() => window.location.reload(), 500);
+                const nickname = GM_getValue("device_nickname", "Guest");
+                backgroundRequest({
+                    method: "POST",
+                    url: `${VPS_HOST}/auth/register`,
+                    headers: { "Content-Type": "application/json" },
+                    data: JSON.stringify({ browser_id: browserId, device_secret: deviceSecret, label: nickname })
+                }).finally(() => {
+                    window.location.reload();
+                });
+                return true;
             }
 
             let errorText = "";
@@ -689,6 +708,20 @@
                 },
                 data: JSON.stringify({ browser_id: browserId, tab_id, req_id })
             });
+            if (joinRes.status === 401) {
+                console.warn("Nai-Guest: Server returned 401 on queue join. Re-registering silently...");
+                GM_setValue("approved", false);
+                const nickname = GM_getValue("device_nickname", "Guest");
+                backgroundRequest({
+                    method: "POST",
+                    url: `${VPS_HOST}/auth/register`,
+                    headers: { "Content-Type": "application/json" },
+                    data: JSON.stringify({ browser_id: browserId, device_secret: deviceSecret, label: nickname })
+                }).finally(() => {
+                    window.location.reload();
+                });
+                return new Response(JSON.stringify({ statusCode: 401, message: "Device revoked." }), { status: 401 });
+            }
             if (joinRes.status !== 200) throw new Error("Join rejection");
         } catch (e) {
             return new Response(JSON.stringify({ statusCode: 502, message: "Queue allocation failure" }), { status: 502 });
