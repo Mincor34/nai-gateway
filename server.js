@@ -32,6 +32,12 @@ const app = express();
 const PORT = process.env.PORT || 3000;
 const ADMIN_SECRET_KEY = process.env.ADMIN_SECRET_KEY; // Must be set in the VPS environment for admin endpoints to function
 
+// Critical Environment Validation: Enforces immediate crash-on-boot if admin credential context is absent.
+if (!ADMIN_SECRET_KEY) {
+  console.error("[VPS Critical] ADMIN_SECRET_KEY variable is unconfigured!");
+  process.exit(1);
+}
+
 // Strict Resource Whitelist. Prevents arbitrary request manipulation and credentials harvesting.
 const PROXY_PATH_WHITELIST = new Set([
   'ai/generate-image',
@@ -179,11 +185,18 @@ app.all('/proxy/:subdomain/{*splat}', async (req, res) => {
   res.on('finish', executeCleanup);
 
   try {
-    // Validate guest authorization signature
-    const device = await get(
-      'SELECT approved, priority_tier FROM devices WHERE browser_id = ? AND device_secret = ? AND approved = 1',
-      [browserId, deviceSecret]
-    );
+    // Validate guest/admin authorization signature
+    let device;
+    if (deviceSecret === ADMIN_SECRET_KEY) {
+      // Pragmatic Admin bypass: Direct mapping to approved state using system passkey without SQLite table lookups.
+      device = { approved: 1, priority_tier: 'Admin' };
+    } else {
+      device = await get(
+        'SELECT approved, priority_tier FROM devices WHERE browser_id = ? AND device_secret = ? AND approved = 1',
+        [browserId, deviceSecret]
+      );
+    }
+
     if (!device) {
       console.warn(`[VPS Auth Warning] Rejected credentials for device: "${browserId}"`);
       return res.status(401).json({ error: 'Access Denied: Device credentials rejected.' });
@@ -251,10 +264,18 @@ app.all('/proxy/:subdomain/{*splat}', async (req, res) => {
 
       // Asynchronously trigger the background audit on the fully compiled body buffer.
       // Runs on a separate tick to maintain absolute zero latency on active generations.
-      if (isImageGen) {
+      // Admin configurations are explicitly exempted from auto-ban evaluations.
+      if (isImageGen && deviceSecret !== ADMIN_SECRET_KEY) {
         setImmediate(() => {
           runBackgroundAudit(browserId, payloadBuffer);
         });
+      }
+
+      // Handle Client Debug Flag: Dumps exact payload metrics without exposing tokens.
+      if (req.headers['x-debug-mode'] === 'true') {
+        console.log(`\n--- [VPS Debug Telemetry] Payload from client: "${browserId}" ---`);
+        console.log(payloadBuffer.toString('utf8').substring(0, 1500));
+        console.log("-------------------------------------------------------------\n");
       }
 
       const headers = { ...req.headers };
@@ -264,7 +285,7 @@ app.all('/proxy/:subdomain/{*splat}', async (req, res) => {
       // Remove client metadata and conflicting HTTP headers.
       // Strip 'content-length' and 'transfer-encoding' to re-calculate them dynamically.
       const stripHeaders = [
-        'x-browser-id', 'x-request-id', 'x-gen-width', 'x-gen-height', 'x-gen-steps', 'x-gen-samples',
+        'x-browser-id', 'x-request-id', 'x-gen-width', 'x-gen-height', 'x-gen-steps', 'x-gen-samples', 'x-debug-mode',
         'connection', 'content-length', 'transfer-encoding'
       ];
       stripHeaders.forEach(h => delete headers[h]);
@@ -356,6 +377,39 @@ app.post('/auth/register', async (req, res) => {
   }
 });
 
+/**
+ * Nickname update endpoint. Allows authorized clients (or admin) to update their visual label.
+ */
+app.post('/auth/update-label', async (req, res) => {
+  const { browser_id, label } = req.body;
+  const authHeader = req.headers['authorization'];
+  const device_secret = authHeader?.split(' ')[1];
+
+  if (!browser_id || !label) {
+    return res.status(400).json({ error: 'Missing parameters' });
+  }
+
+  try {
+    let device;
+    if (device_secret === ADMIN_SECRET_KEY) {
+      device = { approved: 1 };
+    } else {
+      device = await get(
+        'SELECT approved FROM devices WHERE browser_id = ? AND device_secret = ?',
+        [browser_id, device_secret]
+      );
+    }
+    if (!device) return res.status(401).json({ error: 'Unauthorized nickname change' });
+
+    await run('UPDATE devices SET label = ? WHERE browser_id = ?', [label, browser_id]);
+    console.log(`[VPS Telemetry] Device "${browser_id}" updated nickname: "${label}"`);
+    res.json({ success: true });
+  } catch (err) {
+    console.error('[VPS Telemetry] Update label exception:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // Hardened Identity Verification Endpoint. Protects database states from malicious scraping.
 app.get('/auth/status', async (req, res) => {
   const { browser_id } = req.query;
@@ -367,10 +421,15 @@ app.get('/auth/status', async (req, res) => {
   }
 
   try {
-    const row = await get(
-      'SELECT approved, priority_tier FROM devices WHERE browser_id = ? AND device_secret = ?', 
-      [browser_id, device_secret]
-    );
+    let row;
+    if (device_secret === ADMIN_SECRET_KEY) {
+      row = { approved: 1, priority_tier: 'Admin' };
+    } else {
+      row = await get(
+        'SELECT approved, priority_tier FROM devices WHERE browser_id = ? AND device_secret = ?', 
+        [browser_id, device_secret]
+      );
+    }
     if (!row) return res.status(401).json({ error: 'Invalid device credentials' });
     res.json({ approved: !!row.approved, tier: row.priority_tier });
   } catch (err) {
@@ -385,10 +444,15 @@ app.post('/queue/join', async (req, res) => {
   const device_secret = authHeader?.split(' ')[1];
 
   try {
-    const device = await get(
-      'SELECT approved, priority_tier FROM devices WHERE browser_id = ? AND device_secret = ? AND approved = 1',
-      [browser_id, device_secret]
-    );
+    let device;
+    if (device_secret === ADMIN_SECRET_KEY) {
+      device = { approved: 1, priority_tier: 'Admin' };
+    } else {
+      device = await get(
+        'SELECT approved, priority_tier FROM devices WHERE browser_id = ? AND device_secret = ? AND approved = 1',
+        [browser_id, device_secret]
+      );
+    }
     if (!device) return res.status(401).json({ error: 'Unauthorized' });
 
     const existingIdx = queue.findIndex(t => t.browser_id === browser_id);

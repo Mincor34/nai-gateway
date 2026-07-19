@@ -34,42 +34,6 @@
 
     console.log("Nai-Guest: Script injected successfully at document-start.");
 
-    // Retrieve host from browser storage; prompt on first run to avoid hardcoding targets
-    let VPS_HOST = GM_getValue("vps_host", "");
-    if (!VPS_HOST) {
-        const inputHost = prompt("Nai-Guest: Enter your VPS Gateway URL (e.g., https://your-domain.duckdns.org):");
-        if (inputHost) {
-            let sanitized = inputHost.trim().replace(/\/+$/, "");
-            if (!/^https?:\/\//i.test(sanitized)) {
-                sanitized = "https://" + sanitized;
-            }
-            GM_setValue("vps_host", sanitized);
-            VPS_HOST = sanitized;
-            alert(`VPS Host saved: ${VPS_HOST}. Reloading page.`);
-            window.location.reload();
-        } else {
-            console.error("Nai-Guest: Missing VPS Gateway target URL. Interception halted.");
-            return;
-        }
-    }
-
-    // Dynamic configuration modifier key listener (Ctrl + Shift + H) to update VPS target
-    window.addEventListener("keydown", (e) => {
-        if (e.ctrlKey && e.shiftKey && e.key === "H") {
-            const currentHost = GM_getValue("vps_host", "");
-            const newHost = prompt("Enter new VPS Gateway URL (e.g., https://your-domain.duckdns.org):", currentHost);
-            if (newHost !== null) {
-                let sanitized = newHost.trim().replace(/\/+$/, "");
-                if (sanitized && !/^https?:\/\//i.test(sanitized)) {
-                    sanitized = "https://" + sanitized;
-                }
-                GM_setValue("vps_host", sanitized);
-                alert("VPS Gateway URL updated. Page reloading.");
-                window.location.reload();
-            }
-        }
-    });
-
     function generateUUID() {
         let d = new Date().getTime();
         let d2 = ((typeof performance !== 'undefined') && performance.now && (performance.now() * 1000)) || 0;
@@ -89,6 +53,7 @@
     let browserId = GM_getValue("browser_id");
     let deviceSecret = GM_getValue("device_secret");
     let approved = GM_getValue("approved", false);
+    let VPS_HOST = GM_getValue("vps_host", "");
 
     try {
         if (!browserId || !deviceSecret) {
@@ -123,7 +88,6 @@
     }
 
     // High-frequency UI enforcement loop (forces UI overlay to stay mounted and visible)
-    let overlayMessage = "This device is currently awaiting administrator verification. Give the Device ID below to the coordinator.";
     let enforcementInterval = null;
 
     function startUIEnforcement() {
@@ -139,69 +103,390 @@
                 overlay.id = "vps-approval-overlay";
                 overlay.style.cssText = "position:fixed !important; top:0 !important; left:0 !important; width:100vw !important; height:100vh !important; background:#121212 !important; color:#fff !important; z-index:2147483647 !important; display:flex !important; flex-direction:column !important; align-items:center !important; justify-content:center !important; font-family:sans-serif !important;";
                 document.body.appendChild(overlay);
-            }
-
-            // Ensure the content matches the active message
-            const expectedHTML = `
-                <div style="background:#252525 !important; padding:35px !important; border-radius:6px !important; text-align:center !important; border:1px solid #333 !important; box-shadow:0 8px 30px rgba(0,0,0,0.6) !important; max-width:400px !important; color:#fff !important; font-family:sans-serif !important;">
-                    <h3 style="margin:0 0 10px 0 !important; color:#00bc8c !important; letter-spacing:1px !important;">GATEWAY VERIFICATION</h3>
-                    <p style="margin:0 0 20px 0 !important; color:#bbb !important; font-size:14px !important; line-height:1.5 !important;">${overlayMessage}</p>
-                    <div style="font-size:11px !important; color:#777 !important; background:#111 !important; padding:12px !important; border-radius:4px !important; word-break:break-all !important; font-family:monospace !important;">
-                        DEVICE ID: <span style="color:#f0ad4e !important; font-weight:bold !important;">${browserId}</span>
-                    </div>
-                </div>
-            `;
-
-            if (overlay.innerHTML !== expectedHTML) {
-                overlay.innerHTML = expectedHTML;
+                renderSetupWizard(overlay);
             }
         }, 50);
     }
 
-    if (!approved) {
-        console.log("Nai-Guest: Device is unapproved. Bootstrapping gateway routes...");
+    /**
+     * Renders the dynamic, sequential setup wizard. 
+     * Restricts inputs and validates steps asynchronously.
+     */
+    function renderSetupWizard(container) {
+        if (container.querySelector(".setup-wizard-card")) return;
+        
+        container.innerHTML = `
+            <div class="setup-wizard-card" style="background:#1c1c1c; padding:35px; border-radius:6px; border:1px solid #c0392b; box-shadow:0 8px 30px rgba(0,0,0,0.6); max-width:450px; width:100%; box-sizing:border-box;">
+                <h3 style="margin:0 0 15px 0; color:#00bc8c; text-align:center; letter-spacing:1px; font-size:18px; font-family:sans-serif;">GATEWAY COORDINATOR SETUP</h3>
+                
+                <!-- Step 1: Gateway Domain Configuration -->
+                <div id="step-1-container" style="margin-bottom:20px;">
+                    <label style="display:block; font-size:12px; color:#aaa; margin-bottom:5px; font-weight:bold; font-family:sans-serif;">STEP 1: ENTER GATEWAY DOMAIN</label>
+                    <div style="display:flex; gap:10px;">
+                        <input type="text" id="setup-domain" value="${GM_getValue("vps_host", "")}" placeholder="https://your-domain.duckdns.org" style="flex:1; background:#111; border:1px solid #444; color:#fff; padding:8px; font-size:12px; border-radius:3px;">
+                        <button id="btn-verify-domain" style="background:#2980b9; border:none; color:#fff; padding:8px 15px; font-size:11px; font-weight:bold; cursor:pointer; border-radius:3px; font-family:sans-serif;">Verify</button>
+                    </div>
+                    <div id="step-1-status" style="margin-top:5px; font-size:11px; font-family:sans-serif; display:none;"></div>
+                </div>
 
-        // Quietly register device with backend
-        backgroundRequest({
-            method: "POST",
-            url: `${VPS_HOST}/auth/register`,
-            headers: { "Content-Type": "application/json" },
-            data: JSON.stringify({ browser_id: browserId, device_secret: deviceSecret, label: "Guest Client Node" })
-        }).catch(err => console.error("Nai-Guest: Registration post failed:", err));
+                <!-- Step 2: Nickname Configuration -->
+                <div id="step-2-container" style="margin-bottom:20px; display:none;">
+                    <label style="display:block; font-size:12px; color:#aaa; margin-bottom:5px; font-weight:bold; font-family:sans-serif;">STEP 2: ENTER NICKNAME</label>
+                    <div style="display:flex; gap:10px;">
+                        <input type="text" id="setup-nickname" value="${GM_getValue("device_nickname", "")}" placeholder="e.g. Guest" style="flex:1; background:#111; border:1px solid #444; color:#fff; padding:8px; font-size:12px; border-radius:3px;">
+                        <button id="btn-register-nickname" style="background:#27ae60; border:none; color:#fff; padding:8px 15px; font-size:11px; font-weight:bold; cursor:pointer; border-radius:3px; font-family:sans-serif;">Register</button>
+                    </div>
+                    <div id="step-2-status" style="margin-top:5px; font-size:11px; font-family:sans-serif; display:none;"></div>
+                </div>
 
-        const checkAuth = async () => {
+                <!-- Step 3: Instructions & Background Verification -->
+                <div id="step-3-container" style="display:none; border-top:1px solid #333; padding-top:15px; margin-top:15px;">
+                    <label style="display:block; font-size:12px; color:#aaa; margin-bottom:5px; font-weight:bold; font-family:sans-serif;">STEP 3: CONFIGURATION COMPLETE</label>
+                    <div id="step-3-content" style="font-size:12px; color:#bbb; line-height:1.5; font-family:sans-serif;"></div>
+                </div>
+            </div>
+        `;
+
+        const domainInput = container.querySelector("#setup-domain");
+        const verifyBtn = container.querySelector("#btn-verify-domain");
+        const step1Status = container.querySelector("#step-1-status");
+        
+        const nicknameInput = container.querySelector("#setup-nickname");
+        const registerBtn = container.querySelector("#btn-register-nickname");
+        const step2Status = container.querySelector("#step-2-status");
+        
+        const step2Container = container.querySelector("#step-2-container");
+        const step3Container = container.querySelector("#step-3-container");
+        const step3Content = container.querySelector("#step-3-content");
+
+        let validatedHost = GM_getValue("vps_host", "");
+        let validatedNickname = GM_getValue("device_nickname", "");
+
+        async function verifyDomainAction() {
+            let val = domainInput.value.trim().replace(/\/+$/, "");
+            if (!val) {
+                step1Status.style.display = "block";
+                step1Status.style.color = "#e74c3c";
+                step1Status.innerHTML = "✗ Domain cannot be empty.";
+                return;
+            }
+            if (!/^https?:\/\//i.test(val)) {
+                val = "https://" + val;
+            }
+
+            step1Status.style.display = "block";
+            step1Status.style.color = "#f39c12";
+            step1Status.innerHTML = "Connecting to server...";
+
             try {
+                // Connection evaluation ping targeting the gateway authorization endpoint
                 const res = await backgroundRequest({
                     method: "GET",
-                    url: `${VPS_HOST}/auth/status?browser_id=${browserId}`,
-                    headers: { "Authorization": `Bearer ${deviceSecret}` }
+                    url: `${val}/auth/status?browser_id=ping`
                 });
-                if (res.status === 200) {
-                    const data = JSON.parse(res.responseText);
-                    console.log("Nai-Guest: Current status check results:", data);
-                    if (data.approved) {
-                        console.log("Nai-Guest: Credentials verified! Reloading page contexts...");
-                        GM_setValue("approved", true);
-                        window.location.reload();
-                    } else {
-                        overlayMessage = "This device is currently awaiting administrator verification. Give the Device ID below to the coordinator.";
-                        startUIEnforcement();
-                    }
+                if (res.status > 0) {
+                    step1Status.style.color = "#2ecc71";
+                    step1Status.innerHTML = "✓ Connected to Gateway!";
+                    GM_setValue("vps_host", val);
+                    validatedHost = val;
+                    step2Container.style.display = "block";
+                    domainInput.disabled = true;
+                    verifyBtn.disabled = true;
+                } else {
+                    throw new Error("Bad response status");
                 }
             } catch (err) {
-                console.error("Nai-Guest: Connection check execution crash:", err);
-                overlayMessage = "Lost gateway routing connection. Re-attempting handshake...";
-                startUIEnforcement();
+                step1Status.style.color = "#e74c3c";
+                step1Status.innerHTML = "✗ Connection failed. Ensure domain is correct and reachable.";
+            }
+        }
+
+        async function registerNicknameAction() {
+            const nickname = nicknameInput.value.trim();
+            if (!nickname) {
+                step2Status.style.display = "block";
+                step2Status.style.color = "#e74c3c";
+                step2Status.innerHTML = "✗ Nickname cannot be empty.";
+                return;
+            }
+            if (!/^[a-zA-Z0-9_\s]+$/.test(nickname)) {
+                step2Status.style.display = "block";
+                step2Status.style.color = "#e74c3c";
+                step2Status.innerHTML = "✗ Nickname cannot contain special characters.";
+                return;
+            }
+
+            step2Status.style.display = "block";
+            step2Status.style.color = "#f39c12";
+            step2Status.innerHTML = "Registering device...";
+
+            try {
+                const res = await backgroundRequest({
+                    method: "POST",
+                    url: `${validatedHost}/auth/register`,
+                    headers: { "Content-Type": "application/json" },
+                    data: JSON.stringify({ browser_id: browserId, device_secret: deviceSecret, label: nickname })
+                });
+                if (res.status === 200) {
+                    step2Status.style.color = "#2ecc71";
+                    step2Status.innerHTML = "✓ Registered nickname successfully!";
+                    GM_setValue("device_nickname", nickname);
+                    validatedNickname = nickname;
+                    nicknameInput.disabled = true;
+                    registerBtn.disabled = true;
+                    step3Container.style.display = "block";
+                    showStep3();
+                } else {
+                    throw new Error("Registration rejected");
+                }
+            } catch (err) {
+                step2Status.style.color = "#e74c3c";
+                step2Status.innerHTML = "✗ Registration failed on server.";
+            }
+        }
+
+        function showStep3() {
+            step3Content.innerHTML = `
+                <p style="margin: 0 0 10px 0;">Your device is registered! Provide the Device ID below to your administrator for approval:</p>
+                <div style="background:#111; padding:10px; border-radius:4px; font-family:monospace; font-size:11px; word-break:break-all; border:1px solid #333; margin-bottom:10px; color:#f39c12; text-align:center;">
+                    ${browserId}
+                </div>
+                <p style="margin:0; color:#888; font-size:11px; text-align:center;">⏳ Polling administrator approval status...</p>
+            `;
+            // Verification short-polling loop
+            const checkAuth = async () => {
+                try {
+                    const res = await backgroundRequest({
+                        method: "GET",
+                        url: `${validatedHost}/auth/status?browser_id=${browserId}`,
+                        headers: { "Authorization": `Bearer ${deviceSecret}` }
+                    });
+                    if (res.status === 200) {
+                        const data = JSON.parse(res.responseText);
+                        if (data.approved) {
+                            GM_setValue("approved", true);
+                            window.location.reload();
+                        }
+                    }
+                } catch (err) {
+                    console.error("Setup wizard poll error:", err);
+                }
+            };
+            setInterval(checkAuth, 5000);
+        }
+
+        verifyBtn.onclick = verifyDomainAction;
+        registerBtn.onclick = registerNicknameAction;
+
+        if (validatedHost) {
+            domainInput.value = validatedHost;
+            step1Status.style.display = "block";
+            step1Status.style.color = "#2ecc71";
+            step1Status.innerHTML = "✓ Connected";
+            domainInput.disabled = true;
+            verifyBtn.disabled = true;
+            step2Container.style.display = "block";
+            
+            if (validatedNickname) {
+                nicknameInput.value = validatedNickname;
+                step2Status.style.display = "block";
+                step2Status.style.color = "#2ecc71";
+                step2Status.innerHTML = "✓ Registered";
+                nicknameInput.disabled = true;
+                registerBtn.disabled = true;
+                step3Container.style.display = "block";
+                showStep3();
+            }
+        }
+    }
+
+    if (!approved || !VPS_HOST) {
+        startUIEnforcement();
+        return; // Halt execution until gateway is resolved
+    }
+
+    // ----------------- DYNAMIC SETTINGS GEAR MODAL -----------------
+    function injectGearButton() {
+        if (document.getElementById("vps-gear-btn")) return;
+        const gearBtn = document.createElement("button");
+        gearBtn.id = "vps-gear-btn";
+        gearBtn.innerHTML = "⚙️";
+        gearBtn.style.cssText = "position:fixed; bottom:15px; right:15px; width:36px; height:36px; background:#1a1a1a; border:1px solid #c0392b; border-radius:50%; color:#fff; font-size:18px; cursor:pointer; z-index:99999; display:flex; align-items:center; justify-content:center; box-shadow:0 4px 10px rgba(0,0,0,0.5); transition:transform 0.2s;";
+        gearBtn.onclick = openSettingsModal;
+        
+        const banner = document.getElementById("vps-queue-banner");
+        if (banner) {
+            banner.style.bottom = "60px";
+            banner.style.right = "15px";
+        }
+        document.documentElement.appendChild(gearBtn);
+        if (GM_getValue("debug_mode", false)) {
+            injectWarningBadge();
+        }
+    }
+
+    function injectWarningBadge() {
+        if (document.getElementById("vps-debug-badge")) return;
+        const badge = document.createElement("div");
+        badge.id = "vps-debug-badge";
+        badge.innerHTML = "⚠️ VPS DEBUG MODE ACTIVE";
+        badge.style.cssText = "position:fixed; top:10px; left:50%; transform:translateX(-50%); background:#e74c3c; color:#fff; font-weight:bold; font-size:11px; padding:6px 12px; border-radius:4px; z-index:99999; box-shadow:0 2px 8px rgba(0,0,0,0.4); pointer-events:none;";
+        document.documentElement.appendChild(badge);
+    }
+
+    function removeWarningBadge() {
+        const badge = document.getElementById("vps-debug-badge");
+        if (badge) badge.remove();
+    }
+
+    async function openSettingsModal() {
+        let modal = document.getElementById("vps-settings-modal");
+        let backdrop = document.getElementById("vps-settings-backdrop");
+        if (modal) {
+            modal.remove();
+            if (backdrop) backdrop.remove();
+            return;
+        }
+
+        backdrop = document.createElement("div");
+        backdrop.id = "vps-settings-backdrop";
+        backdrop.style.cssText = "position:fixed; top:0; left:0; width:100vw; height:100vh; background:rgba(0,0,0,0.6); z-index:99998;";
+        backdrop.onclick = () => { modal.remove(); backdrop.remove(); };
+        document.documentElement.appendChild(backdrop);
+
+        modal = document.createElement("div");
+        modal.id = "vps-settings-modal";
+        modal.style.cssText = "position:fixed; top:50%; left:50%; transform:translate(-50%, -50%); width:400px; background:#1c1c1c; border:1px solid #c0392b; border-radius:6px; z-index:99999; color:#fff; padding:20px; font-family:sans-serif; box-shadow:0 10px 40px rgba(0,0,0,0.6); max-height:90vh; overflow-y:auto;";
+        
+        const nickname = GM_getValue("device_nickname", "Guest");
+        const domain = GM_getValue("vps_host", "");
+        const debugActive = GM_getValue("debug_mode", false);
+        const imageCount = GM_getValue("count_image_gens", 0);
+        const textCount = GM_getValue("count_text_gens", 0);
+        
+        let tier = "Loading...";
+        try {
+            const res = await backgroundRequest({
+                method: "GET",
+                url: `${domain}/auth/status?browser_id=${browserId}`,
+                headers: { "Authorization": `Bearer ${deviceSecret}` }
+            });
+            if (res.status === 200) {
+                const data = JSON.parse(res.responseText);
+                tier = data.tier || "Normal";
+            } else {
+                tier = "Unknown";
+            }
+        } catch (e) {
+            tier = "Error fetching";
+        }
+
+        modal.innerHTML = `
+            <h4 style="margin:0 0 15px 0; color:#00bc8c; border-bottom:1px solid #333; padding-bottom:8px; font-size:16px;">GATEWAY SETTINGS</h4>
+            
+            <div style="margin-bottom:15px;">
+                <label style="display:block; font-size:11px; color:#aaa; margin-bottom:5px;">NICKNAME</label>
+                <div style="display:flex; gap:10px;">
+                    <input type="text" id="settings-nickname" value="${nickname}" style="flex:1; background:#111; border:1px solid #444; color:#fff; padding:6px; font-size:12px; border-radius:3px;">
+                    <button id="btn-save-nickname" style="background:#27ae60; border:none; color:#fff; padding:6px 12px; font-size:11px; font-weight:bold; cursor:pointer; border-radius:3px;">Save</button>
+                </div>
+                <div id="settings-nickname-status" style="font-size:10px; margin-top:3px; display:none;"></div>
+            </div>
+
+            <div style="margin-bottom:15px;">
+                <label style="display:block; font-size:11px; color:#aaa; margin-bottom:5px;">VPS DOMAIN</label>
+                <div style="display:flex; gap:10px;">
+                    <input type="text" id="settings-domain" value="${domain}" style="flex:1; background:#111; border:1px solid #444; color:#fff; padding:6px; font-size:12px; border-radius:3px;">
+                    <button id="btn-save-domain" style="background:#2980b9; border:none; color:#fff; padding:6px 12px; font-size:11px; font-weight:bold; cursor:pointer; border-radius:3px; white-space:nowrap;">Save & Reset</button>
+                </div>
+            </div>
+
+            <div style="background:#111; padding:12px; border-radius:4px; margin-bottom:15px; border:1px solid #333;">
+                <label style="display:block; font-size:10px; color:#888; font-weight:bold; margin-bottom:6px; text-transform:uppercase;">Usage Stats & Information</label>
+                <div style="display:grid; grid-template-columns:1fr 1fr; gap:8px; font-size:12px;">
+                    <div>Tier: <span style="color:#00bc8c; font-weight:bold;">${tier}</span></div>
+                    <div>Anlas Spent: <span style="color:#f39c12; font-weight:bold;">0 Anlas</span></div>
+                    <div>Image Gens: <span style="font-weight:bold;">${imageCount}</span></div>
+                    <div>Text Gens: <span style="font-weight:bold;">${textCount}</span></div>
+                </div>
+                <div style="font-size:10px; color:#666; margin-top:6px; text-align:center;">All generations are within free Opus limits.</div>
+            </div>
+
+            <div style="border-top:1px solid #333; padding-top:12px; margin-top:12px;">
+                <label style="display:flex; align-items:center; gap:8px; font-size:12px; cursor:pointer; font-weight:bold; color:#f39c12;">
+                    <input type="checkbox" id="settings-debug" ${debugActive ? 'checked' : ''} style="cursor:pointer;">
+                    ENABLE DEBUG MODE
+                </label>
+                <div id="debug-consent" style="font-size:11px; color:#999; margin-top:6px; line-height:1.4; background:#222; padding:8px; border-radius:4px; border-left:2px solid #f39c12;">
+                    <strong>Consent Form:</strong> Enabling Debug Mode will log full API request payloads (including prompt texts and image inputs such as image-to-image, vibe transfer, and precise reference) to the VPS log telemetry. Your NovelAI authorization token and personal account credentials will <strong>NOT</strong> be logged.
+                </div>
+            </div>
+        `;
+
+        document.documentElement.appendChild(modal);
+
+        const nickInput = modal.querySelector("#settings-nickname");
+        const saveNickBtn = modal.querySelector("#btn-save-nickname");
+        const nickStatus = modal.querySelector("#settings-nickname-status");
+        const domInput = modal.querySelector("#settings-domain");
+        const saveDomBtn = modal.querySelector("#btn-save-domain");
+        const debugCheckbox = modal.querySelector("#settings-debug");
+
+        saveNickBtn.onclick = async () => {
+            const nickname = nickInput.value.trim();
+            if (!nickname || !/^[a-zA-Z0-9_\s]+$/.test(nickname)) {
+                nickStatus.style.display = "block";
+                nickStatus.style.color = "#e74c3c";
+                nickStatus.innerHTML = "✗ Invalid nickname characters.";
+                return;
+            }
+            nickStatus.style.display = "block";
+            nickStatus.style.color = "#f39c12";
+            nickStatus.innerHTML = "Updating nickname...";
+
+            try {
+                const res = await backgroundRequest({
+                    method: "POST",
+                    url: `${domain}/auth/update-label`,
+                    headers: { "Content-Type": "application/json", "Authorization": `Bearer ${deviceSecret}` },
+                    data: JSON.stringify({ browser_id: browserId, label: nickname })
+                });
+                if (res.status === 200) {
+                    nickStatus.style.color = "#2ecc71";
+                    nickStatus.innerHTML = "✓ Nickname updated successfully!";
+                    GM_setValue("device_nickname", nickname);
+                } else {
+                    throw new Error("Update failed");
+                }
+            } catch (err) {
+                nickStatus.style.color = "#e74c3c";
+                nickStatus.innerHTML = "✗ Failed to update nickname on VPS.";
             }
         };
 
-        checkAuth();
-        setInterval(checkAuth, 10000);
-        return; // Halt loading sequence
+        saveDomBtn.onclick = () => {
+            let val = domInput.value.trim().replace(/\/+$/, "");
+            if (!val) return;
+            if (!/^https?:\/\//i.test(val)) {
+                val = "https://" + val;
+            }
+            GM_setValue("vps_host", val);
+            GM_setValue("approved", false);
+            modal.remove();
+            backdrop.remove();
+            window.location.reload();
+        };
+
+        debugCheckbox.onchange = () => {
+            const checked = debugCheckbox.checked;
+            GM_setValue("debug_mode", checked);
+            if (checked) injectWarningBadge();
+            else removeWarningBadge();
+        };
     }
 
-    // ----------------- STANDARD INTERCEPTION CODE (Below Approved Checks) -----------------
-    console.log("Nai-Guest: Client approved. Interception hooks active.");
+    // High-frequency injection listener to guarantee UI recovery
+    setInterval(injectGearButton, 1000);
 
     function parseResponseHeaders(headerStr) {
         const headers = new Headers();
@@ -260,7 +545,7 @@
         return result;
     }
 
-    async function tryResolveProxyResponse(responseDetails, resolveObj) {
+    async function tryResolveProxyResponse(responseDetails, resolveObj, isImageGen, isTextGen) {
         const status = extractStatusCode(responseDetails);
         if (status === 0) {
             return false; // Status code not yet populated; defer resolution
@@ -272,6 +557,14 @@
                 return false; // Wait for response body context to bind
             }
             console.log("[Nai-Guest] Telemetry: Stream successfully acquired. Piping stream response directly to web page fetch promise.");
+            
+            // Increment telemetry variables on validation success
+            if (isImageGen) {
+                GM_setValue("count_image_gens", GM_getValue("count_image_gens", 0) + 1);
+            } else if (isTextGen) {
+                GM_setValue("count_text_gens", GM_getValue("count_text_gens", 0) + 1);
+            }
+
             resolveObj(new Response(responseDetails.response, {
                 status: status,
                 headers: parseResponseHeaders(responseDetails.responseHeaders)
@@ -353,7 +646,7 @@
         if (!banner) {
             banner = document.createElement("div");
             banner.id = "vps-queue-banner";
-            banner.style = "position:fixed;bottom:25px;right:25px;background:#1b1b1b;color:#00bc8c;padding:12px 20px;border:1px solid #00bc8c;border-radius:4px;z-index:99998;font-family:sans-serif;font-size:13px;box-shadow:0 4px 15px rgba(0,0,0,0.4);display:flex;align-items:center;gap:10px;";
+            banner.style = "position:fixed;bottom:60px;right:15px;background:#1b1b1b;color:#00bc8c;padding:12px 20px;border:1px solid #00bc8c;border-radius:4px;z-index:99998;font-family:sans-serif;font-size:13px;box-shadow:0 4px 15px rgba(0,0,0,0.4);display:flex;align-items:center;gap:10px;";
             document.documentElement.appendChild(banner);
         }
         banner.innerHTML = `<div style="width:8px;height:8px;background:#00bc8c;border-radius:50%;animation:vpsPulse 1s infinite alternate;"></div><span>${text}</span>
@@ -428,7 +721,9 @@
         }
 
         const originalUrlObj = new URL(url);
-        const proxyUrl = `${VPS_HOST}/proxy/image${originalUrlObj.pathname}${originalUrlObj.search}`;
+        // Extract subdomain dynamically (e.g., 'image' or 'text' or 'api') to support flexible routing across multiple NovelAI subdomains.
+        const subdomain = originalUrlObj.hostname.split('.')[0];
+        const proxyUrl = `${VPS_HOST}/proxy/${subdomain}${originalUrlObj.pathname}${originalUrlObj.search}`;
 
         const updatedHeaders = new Map();
         if (config.headers) {
@@ -450,6 +745,10 @@
         updatedHeaders.set("x-gen-steps", imgParams.steps.toString());
         updatedHeaders.set("x-gen-samples", imgParams.n_samples.toString());
         updatedHeaders.set("authorization", `Bearer ${deviceSecret}`);
+        if (GM_getValue("debug_mode", false)) {
+            updatedHeaders.set("x-debug-mode", "true");
+            console.log(`[VPS Debug Mode] Outbound image generation details:`, originalBody);
+        }
 
         updatedHeaders.delete("host");
         updatedHeaders.delete("content-length"); // Prevent boundary mismatches from desynchronizing streams
@@ -468,12 +767,20 @@
                 headers: Object.fromEntries(updatedHeaders.entries()),
                 data: originalBody,
                 responseType: "stream",
+                onloadstart: async function(responseDetails) {
+                    console.log(`[Nai-Guest] Telemetry: onloadstart fired. ReadyState: ${responseDetails.readyState}, Status: ${extractStatusCode(responseDetails)}`);
+                    if (hasResolved) return;
+                    // Resolve immediately on stream header initiation to preserve live piping features.
+                    if (await tryResolveProxyResponse(responseDetails, resolve, true, false)) {
+                        hasResolved = true;
+                    }
+                },
                 onreadystatechange: async function(responseDetails) {
                     console.log(`[Nai-Guest] Telemetry: onreadystatechange fired. ReadyState: ${responseDetails.readyState}, ExtractedStatus: ${extractStatusCode(responseDetails)}`);
                     if (hasResolved) return;
-                    // Resolve as soon as the VPS returns headers and the stream body becomes readable (HEADERS_RECEIVED or LOADING)
+                    // Fallback evaluation for legacy engines
                     if (responseDetails.readyState >= 2) {
-                        if (await tryResolveProxyResponse(responseDetails, resolve)) {
+                        if (await tryResolveProxyResponse(responseDetails, resolve, true, false)) {
                             hasResolved = true;
                         }
                     }
@@ -481,7 +788,7 @@
                 onload: async function(responseDetails) {
                     console.log(`[Nai-Guest] Telemetry: onload fired. Status: ${extractStatusCode(responseDetails)}. Socket download complete.`);
                     if (hasResolved) return;
-                    if (await tryResolveProxyResponse(responseDetails, resolve)) {
+                    if (await tryResolveProxyResponse(responseDetails, resolve, true, false)) {
                         hasResolved = true;
                     }
                 },
@@ -510,7 +817,9 @@
      */
     async function handleTextGenerationIntercept(url, config) {
         const originalUrlObj = new URL(url);
-        const proxyUrl = `${VPS_HOST}/proxy/text${originalUrlObj.pathname}${originalUrlObj.search}`;
+        // Extract subdomain dynamically (e.g., 'image' or 'text' or 'api') to support flexible routing across multiple NovelAI subdomains.
+        const subdomain = originalUrlObj.hostname.split('.')[0];
+        const proxyUrl = `${VPS_HOST}/proxy/${subdomain}${originalUrlObj.pathname}${originalUrlObj.search}`;
         const updatedHeaders = new Map();
 
         if (config.headers) {
@@ -527,6 +836,10 @@
 
         updatedHeaders.set("x-browser-id", browserId);
         updatedHeaders.set("authorization", `Bearer ${deviceSecret}`);
+        if (GM_getValue("debug_mode", false)) {
+            updatedHeaders.set("x-debug-mode", "true");
+            console.log(`[VPS Debug Mode] Outbound text prompt payload:`, config.body);
+        }
 
         updatedHeaders.delete("host");
         updatedHeaders.delete("content-length"); // Prevent stream desynchronization
@@ -540,12 +853,20 @@
                 headers: Object.fromEntries(updatedHeaders.entries()),
                 data: config.body,
                 responseType: "stream",
+                onloadstart: async function(responseDetails) {
+                    console.log(`[Nai-Guest] Telemetry (Text): onloadstart fired. ReadyState: ${responseDetails.readyState}, Status: ${extractStatusCode(responseDetails)}`);
+                    if (hasResolved) return;
+                    // Resolve immediately on stream header initiation to preserve live piping features.
+                    if (await tryResolveProxyResponse(responseDetails, resolve, false, true)) {
+                        hasResolved = true;
+                    }
+                },
                 onreadystatechange: async function(responseDetails) {
                     console.log(`[Nai-Guest] Telemetry (Text): onreadystatechange fired. ReadyState: ${responseDetails.readyState}, Status: ${extractStatusCode(responseDetails)}`);
                     if (hasResolved) return;
-                    // Resolve as soon as the VPS returns headers and the stream body becomes readable (HEADERS_RECEIVED or LOADING)
+                    // Fallback evaluation for legacy engines
                     if (responseDetails.readyState >= 2) {
-                        if (await tryResolveProxyResponse(responseDetails, resolve)) {
+                        if (await tryResolveProxyResponse(responseDetails, resolve, false, true)) {
                             hasResolved = true;
                         }
                     }
@@ -553,7 +874,7 @@
                 onload: async function(responseDetails) {
                     console.log(`[Nai-Guest] Telemetry (Text): onload fired. Status: ${extractStatusCode(responseDetails)}. Socket download complete.`);
                     if (hasResolved) return;
-                    if (await tryResolveProxyResponse(responseDetails, resolve)) {
+                    if (await tryResolveProxyResponse(responseDetails, resolve, false, true)) {
                         hasResolved = true;
                     }
                 },
