@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         NovelAI Split-Token Gateway Coordinator (Guest)
 // @namespace    http://tampermonkey.net/
-// @version      2.2.0
+// @version      2.2.1
 // @description  FIFO queue coordination, metadata spoofing, and background stream proxy pipeline
 // @author       Minco
 // @match        https://novelai.net/*
