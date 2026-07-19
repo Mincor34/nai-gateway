@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         NovelAI Split-Token Gateway Coordinator (Guest)
 // @namespace    http://tampermonkey.net/
-// @version      2.3.1
+// @version      2.3.2
 // @description  FIFO queue coordination, metadata spoofing, and background stream proxy pipeline
 // @author       Minco
 // @match        https://novelai.net/*
@@ -468,11 +468,14 @@
                 headers: Object.fromEntries(updatedHeaders.entries()),
                 data: originalBody,
                 responseType: "stream",
-                onloadstart: async function(responseDetails) {
-                    console.log(`[Nai-Guest] Telemetry: onloadstart fired. RawStatus: ${responseDetails.status}, ExtractedStatus: ${extractStatusCode(responseDetails)}, HasResponse: ${!!responseDetails.response}`);
+                onreadystatechange: async function(responseDetails) {
+                    console.log(`[Nai-Guest] Telemetry: onreadystatechange fired. ReadyState: ${responseDetails.readyState}, ExtractedStatus: ${extractStatusCode(responseDetails)}`);
                     if (hasResolved) return;
-                    if (await tryResolveProxyResponse(responseDetails, resolve)) {
-                        hasResolved = true;
+                    // Resolve as soon as the VPS returns headers and the stream body becomes readable (HEADERS_RECEIVED or LOADING)
+                    if (responseDetails.readyState >= 2) {
+                        if (await tryResolveProxyResponse(responseDetails, resolve)) {
+                            hasResolved = true;
+                        }
                     }
                 },
                 onload: async function(responseDetails) {
@@ -537,11 +540,14 @@
                 headers: Object.fromEntries(updatedHeaders.entries()),
                 data: config.body,
                 responseType: "stream",
-                onloadstart: async function(responseDetails) {
-                    console.log(`[Nai-Guest] Telemetry (Text): onloadstart fired. Status: ${extractStatusCode(responseDetails)}`);
+                onreadystatechange: async function(responseDetails) {
+                    console.log(`[Nai-Guest] Telemetry (Text): onreadystatechange fired. ReadyState: ${responseDetails.readyState}, Status: ${extractStatusCode(responseDetails)}`);
                     if (hasResolved) return;
-                    if (await tryResolveProxyResponse(responseDetails, resolve)) {
-                        hasResolved = true;
+                    // Resolve as soon as the VPS returns headers and the stream body becomes readable (HEADERS_RECEIVED or LOADING)
+                    if (responseDetails.readyState >= 2) {
+                        if (await tryResolveProxyResponse(responseDetails, resolve)) {
+                            hasResolved = true;
+                        }
                     }
                 },
                 onload: async function(responseDetails) {
