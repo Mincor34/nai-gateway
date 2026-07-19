@@ -36,7 +36,8 @@ const ADMIN_SECRET_KEY = process.env.ADMIN_SECRET_KEY; // Must be set in the VPS
 const PROXY_PATH_WHITELIST = new Set([
   'ai/generate-image',
   'ai/generate-image-stream',
-  'ai/generate-stream' // Text/story Generation API endpoint
+  'ai/generate-stream',  // Legacy Text/story Generation API endpoint
+  'oa/v1/completions'    // New OpenAI-compatible Text Generation API endpoint (GLM-4, Erato, Xialong, etc.)
 ]);
 
 // In-Memory Queue State for Channel A (Exclusive Generation Slot)
@@ -189,7 +190,7 @@ app.all('/proxy/:subdomain/{*splat}', async (req, res) => {
     }
 
     isImageGen = pathPart === 'ai/generate-image' || pathPart === 'ai/generate-image-stream';
-    isTextGen = pathPart === 'ai/generate-stream';
+    isTextGen = pathPart === 'ai/generate-stream' || pathPart === 'oa/v1/completions';
 
     if (isImageGen) {
       // Validate active queue lock requirements for Channel A
@@ -285,7 +286,7 @@ app.all('/proxy/:subdomain/{*splat}', async (req, res) => {
         // Inject explicit anti-buffering headers for streaming routes.
         // This forces CDNs (like Cloudflare), reverse proxies (like Nginx/Caddy), 
         // and VPN nodes to immediately flush raw binary chunks to the client browser without delays.
-        if (pathPart === 'ai/generate-image-stream' || pathPart === 'ai/generate-stream') {
+        if (pathPart === 'ai/generate-image-stream' || pathPart === 'ai/generate-stream' || pathPart === 'oa/v1/completions') {
           upstreamRes.headers['x-accel-buffering'] = 'no';
           upstreamRes.headers['cache-control'] = 'no-cache, no-transform';
         }

@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         NovelAI Split-Token Gateway Coordinator (Guest)
 // @namespace    http://tampermonkey.net/
-// @version      2.2.2
+// @version      2.3.0
 // @description  FIFO queue coordination, metadata spoofing, and background stream proxy pipeline
 // @author       Minco
 // @match        https://novelai.net/*
@@ -624,7 +624,8 @@
                 return handleGenerationIntercept(urlString, config);
             }
 
-            if (urlString.includes('/ai/generate-stream')) {
+            // Route both legacy and new OpenAI-compatible text generation endpoints through our secure fast-track text queue
+            if (urlString.includes('/ai/generate-stream') || urlString.includes('/oa/v1/completions')) {
                 return handleTextGenerationIntercept(urlString, config);
             }
         }
