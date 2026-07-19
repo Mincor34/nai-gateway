@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         NovelAI Split-Token Gateway Coordinator (Admin Panel)
 // @namespace    http://tampermonkey.net/
-// @version      3.0.1
+// @version      3.0.2
 // @description  Secure administration panel and session token injector
 // @author       Minco
 // @match        https://novelai.net/*
@@ -797,6 +797,13 @@
                 },
                 data: JSON.stringify({ browser_id: browserId, tab_id, req_id })
             });
+            if (joinRes.status === 401) {
+                // Wipe admin's approval state if passkey is revoked/rejected
+                console.warn("Nai-Admin: Server returned 401 on queue join. Restoring setup lock.");
+                GM_setValue("approved", false);
+                setTimeout(() => window.location.reload(), 500);
+                return new Response(JSON.stringify({ statusCode: 401, message: "Admin credentials rejected." }), { status: 401 });
+            }
             if (joinRes.status !== 200) throw new Error("Join rejection");
         } catch (e) {
             return new Response(JSON.stringify({ statusCode: 502, message: "Queue allocation failure" }), { status: 502 });
