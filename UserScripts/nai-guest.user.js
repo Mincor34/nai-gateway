@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         NovelAI Split-Token Gateway Coordinator (Guest)
 // @namespace    http://tampermonkey.net/
-// @version      2.3.0
+// @version      2.3.1
 // @description  FIFO queue coordination, metadata spoofing, and background stream proxy pipeline
 // @author       Minco
 // @match        https://novelai.net/*
@@ -544,7 +544,15 @@
                         hasResolved = true;
                     }
                 },
+                onload: async function(responseDetails) {
+                    console.log(`[Nai-Guest] Telemetry (Text): onload fired. Status: ${extractStatusCode(responseDetails)}. Socket download complete.`);
+                    if (hasResolved) return;
+                    if (await tryResolveProxyResponse(responseDetails, resolve)) {
+                        hasResolved = true;
+                    }
+                },
                 onerror: (err) => {
+                    console.error("[Nai-Guest] Telemetry (Text): Fatal network transport crash during GM_xmlhttpRequest transmission.", err);
                     if (!hasResolved) {
                         hasResolved = true;
                         reject(err);
