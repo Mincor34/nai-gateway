@@ -1,0 +1,36 @@
+# Dependency directories
+node_modules/
+jspm_packages/
+
+# Local state databases & SQLite lockfiles (CRITICAL: Contains tokens and secrets)
+*.db
+*.db-journal
+*.db-shm
+*.db-wal
+data.db
+
+# Environment configuration overrides (if added later)
+.env
+.env.local
+.env.*.local
+
+# Logs
+logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+lerna-debug.log*
+pm2.log
+
+# System files
+.DS_Store
+Thumbs.db
+
+# Dev Tools
+.dev/
+.tmp/
+
+# Other
+Caddy.template
+Plan.md
