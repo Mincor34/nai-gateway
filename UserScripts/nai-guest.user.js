@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         NovelAI Split-Token Gateway Coordinator (Guest)
 // @namespace    http://tampermonkey.net/
-// @version      3.0.0
+// @version      3.0.1
 // @description  FIFO queue coordination, metadata spoofing, and background stream proxy pipeline
 // @author       Minco
 // @match        https://novelai.net/*
@@ -572,6 +572,13 @@
             return true;
         } else {
             console.error(`[Nai-Guest] Telemetry: Proxy returned exception status code: ${status}`);
+
+            // Forcefully wipe the approved flag and reload the tab to mount the setup overlay
+            if (status === 401) {
+                console.warn("[Nai-Guest] Revocation signature caught. Restoring setup lock.");
+                GM_setValue("approved", false);
+                setTimeout(() => window.location.reload(), 500);
+            }
 
             let errorText = "";
             try {
