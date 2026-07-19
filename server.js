@@ -25,6 +25,7 @@
 
 const express = require('express');
 const https = require('https');
+const crypto = require('crypto');
 const { run, get, all } = require('./database');
 
 const app = express();
@@ -47,10 +48,31 @@ const MAX_CONCURRENT_TEXT_GENS = 3;
 
 const TIER_PRIORITIES = { 'Low': 0, 'Normal': 10, 'High': 20, 'Admin': 30 };
 
+// Cryptographic Salt for IP hashing.
+// Regenerating this on startup ensures maximum privacy: hashes remain identical 
+// during runtime (allowing you to track/rate-limit a session), but become 
+// completely un-reconstructible if log files are ever leaked.
+const IP_SALT = crypto.randomBytes(16).toString('hex');
+
+/**
+ * Computes a secure, salted SHA-256 hash of an IP address.
+ * Takes the first 12 characters to keep terminal telemetry readable.
+ */
+function hashIP(ip) {
+  if (!ip || ip === 'unknown' || ip === '127.0.0.1' || ip === '::1') {
+    return 'local/unknown';
+  }
+  return crypto.createHash('sha256').update(ip + IP_SALT).digest('hex').substring(0, 12);
+}
+
 // ----------------- CENTRAL TELEMETRY MIDDLEWARE -----------------
 app.use((req, res, next) => {
   const timestamp = new Date().toISOString();
-  console.log(`[VPS Telemetry] ${timestamp} | ${req.method} ${req.url} | IP: ${req.ip || req.headers['x-real-ip'] || 'unknown'}`);
+  // Read Caddy's X-Real-IP first, falling back to local socket IP if absent
+  const rawIp = req.headers['x-real-ip'] || req.ip || 'unknown'; 
+  const maskedIp = hashIP(rawIp);
+  
+  console.log(`[VPS Telemetry] ${timestamp} | ${req.method} ${req.url} | Client: ${maskedIp}`);
   next();
 });
 
@@ -256,7 +278,7 @@ app.all('/proxy/:subdomain/{*splat}', async (req, res) => {
         req.socket.setNoDelay(true);
 
         // Inject explicit anti-buffering headers for streaming routes.
-        // This forces front-facing CDNs (like Cloudflare), reverse proxies (like Nginx/Caddy), 
+        // This forces CDNs (like Cloudflare), reverse proxies (like Nginx/Caddy), 
         // and VPN nodes to immediately flush raw binary chunks to the client browser without delays.
         if (pathPart === 'ai/generate-image-stream' || pathPart === 'ai/generate-stream') {
           upstreamRes.headers['x-accel-buffering'] = 'no';
