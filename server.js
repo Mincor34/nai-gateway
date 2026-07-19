@@ -113,6 +113,43 @@ app.all('/proxy/:subdomain/{*splat}', async (req, res) => {
   }
   const deviceSecret = clientAuth.split(' ')[1];
 
+  // Declare variables in the parent scope to prevent resource leakage on aborted uploads
+  let activeTask = null;
+  let upstreamReq = null;
+  let cleanupExecuted = false;
+  let isTextGenClaimed = false;
+  let isImageGen = false;
+  let isTextGen = false;
+
+  // Single-Path Resource Cleanup logic to mitigate duplicate execution and race conditions.
+  // This function is declared early to safely teardown states even if client aborts during upload.
+  const executeCleanup = () => {
+    if (cleanupExecuted) return;
+    cleanupExecuted = true;
+
+    if (upstreamReq) {
+      try { upstreamReq.destroy(); } catch (err) {}
+    }
+
+    if (isTextGen && isTextGenClaimed) {
+      activeTextGenerations = Math.max(0, activeTextGenerations - 1);
+    }
+
+    if (activeTask) {
+      const idx = queue.findIndex(t => t.req_id === activeTask.req_id);
+      if (idx !== -1) {
+        queue.splice(idx, 1);
+        console.log(`[VPS Telemetry] Stream cleaned up. Slot released for request: "${activeTask.req_id}"`);
+        processQueue();
+      }
+    }
+  };
+
+  // Bind cleanup immediately. If a client disconnects during the body upload stream,
+  // this triggers and prevents permanent concurrency leaks.
+  res.on('close', executeCleanup);
+  res.on('finish', executeCleanup);
+
   try {
     // Validate guest authorization signature
     const device = await get(
@@ -124,9 +161,8 @@ app.all('/proxy/:subdomain/{*splat}', async (req, res) => {
       return res.status(401).json({ error: 'Access Denied: Device credentials rejected.' });
     }
 
-    const isImageGen = pathPart === 'ai/generate-image' || pathPart === 'ai/generate-image-stream';
-    const isTextGen = pathPart === 'ai/generate-stream';
-    let activeTask = null;
+    isImageGen = pathPart === 'ai/generate-image' || pathPart === 'ai/generate-image-stream';
+    isTextGen = pathPart === 'ai/generate-stream';
 
     if (isImageGen) {
       // Validate active queue lock requirements for Channel A
@@ -142,6 +178,7 @@ app.all('/proxy/:subdomain/{*splat}', async (req, res) => {
       }
 
       // Enforce Hard Parametric Firewall Restrictions (Max 1MP, 28 Steps, Single Sample)
+      // Serving as a defensive, front-facing check before the background audit.
       const width = parseInt(req.headers['x-gen-width'], 10) || 0;
       const height = parseInt(req.headers['x-gen-height'], 10) || 0;
       const steps = parseInt(req.headers['x-gen-steps'], 10) || 0;
@@ -162,12 +199,13 @@ app.all('/proxy/:subdomain/{*splat}', async (req, res) => {
         return res.status(429).json({ error: 'Text processing pipelines saturated. Retry request.' });
       }
       activeTextGenerations++;
+      isTextGenClaimed = true; // Mark as successfully allocated
     }
 
     // Retrieve system session credential
     const configRecord = await get('SELECT value FROM config WHERE key = ?', ['master_token']);
     if (!configRecord || !configRecord.value) {
-      if (isTextGen) activeTextGenerations = Math.max(0, activeTextGenerations - 1);
+      executeCleanup();
       return res.status(503).json({ error: 'System unconfigured: No master token pushed.' });
     }
     const masterToken = configRecord.value;
@@ -182,6 +220,14 @@ app.all('/proxy/:subdomain/{*splat}', async (req, res) => {
     
     req.on('end', () => {
       const payloadBuffer = Buffer.concat(bodyChunks);
+
+      // Asynchronously trigger the background audit on the fully compiled body buffer.
+      // Runs on a separate tick to maintain absolute zero latency on active generations.
+      if (isImageGen) {
+        setImmediate(() => {
+          runBackgroundAudit(browserId, payloadBuffer);
+        });
+      }
 
       const headers = { ...req.headers };
       headers['host'] = `${subdomain}.novelai.net`;
@@ -202,8 +248,21 @@ app.all('/proxy/:subdomain/{*splat}', async (req, res) => {
 
       console.log(`[VPS Telemetry] Forwarding piped request upstream to NovelAI: ${upstreamUrl} (Body: ${payloadBuffer.length} bytes)`);
 
-      const upstreamReq = https.request(upstreamUrl, { method: req.method, headers }, (upstreamRes) => {
+      upstreamReq = https.request(upstreamUrl, { method: req.method, headers }, (upstreamRes) => {
         console.log(`[VPS Telemetry] Received upstream headers. Status: ${upstreamRes.statusCode}`);
+        
+        // Disable Nagle's algorithm on response socket to flush streaming progress chunks instantly.
+        // Prevents TCP stream chunk buffering delays over VPN connections.
+        req.socket.setNoDelay(true);
+
+        // Inject explicit anti-buffering headers for streaming routes.
+        // This forces front-facing CDNs (like Cloudflare), reverse proxies (like Nginx/Caddy), 
+        // and VPN nodes to immediately flush raw binary chunks to the client browser without delays.
+        if (pathPart === 'ai/generate-image-stream' || pathPart === 'ai/generate-stream') {
+          upstreamRes.headers['x-accel-buffering'] = 'no';
+          upstreamRes.headers['cache-control'] = 'no-cache, no-transform';
+        }
+
         res.writeHead(upstreamRes.statusCode, upstreamRes.headers);
         upstreamRes.pipe(res);
       });
@@ -220,33 +279,10 @@ app.all('/proxy/:subdomain/{*splat}', async (req, res) => {
         }
       });
 
+      // Disable Nagle's algorithm on outbound request connection to minimize upstream latency
+      upstreamReq.setNoDelay(true);
+
       if (activeTask) activeTask.upstreamReq = upstreamReq;
-
-      // Single-Path Resource Cleanup logic to mitigate duplicate execution and race conditions.
-      // Bound strictly to response output events to prevent premature socket abortion on tiny payloads.
-      let cleanupExecuted = false;
-      const executeCleanup = () => {
-        if (cleanupExecuted) return;
-        cleanupExecuted = true;
-
-        upstreamReq.destroy();
-
-        if (isTextGen) {
-          activeTextGenerations = Math.max(0, activeTextGenerations - 1);
-        }
-
-        if (activeTask) {
-          const idx = queue.findIndex(t => t.req_id === activeTask.req_id);
-          if (idx !== -1) {
-            queue.splice(idx, 1);
-            console.log(`[VPS Telemetry] Stream cleaned up. Slot released for request: "${activeTask.req_id}"`);
-            processQueue();
-          }
-        }
-      };
-
-      res.on('close', executeCleanup);
-      res.on('finish', executeCleanup);
 
       // Transmit the accumulated body buffer directly and end the socket cleanly
       upstreamReq.write(payloadBuffer);
@@ -255,7 +291,10 @@ app.all('/proxy/:subdomain/{*splat}', async (req, res) => {
 
   } catch (err) {
     console.error('[VPS Telemetry] Fatal exception thrown inside proxy router context:', err);
-    res.status(500).json({ error: 'Proxy execution failure.' });
+    executeCleanup();
+    if (!res.headersSent) {
+      res.status(500).json({ error: 'Proxy execution failure.' });
+    }
   }
 });
 
@@ -438,5 +477,86 @@ setInterval(() => {
     processQueue();
   }
 }, 5000);
+
+/**
+ * Extract actual parameters from the raw request buffer.
+ * Performs a fast, low-overhead string search to bypass large binary image payloads.
+ */
+function extractParametersFromRawBody(buffer) {
+  try {
+    const bodyStr = buffer.toString('utf8');
+
+    // 1. Handle raw JSON payloads (Text-to-Image)
+    if (bodyStr.trim().startsWith('{')) {
+      const parsed = JSON.parse(bodyStr);
+      if (parsed && parsed.parameters) {
+        return {
+          width: parsed.parameters.width || null,
+          height: parsed.parameters.height || null,
+          steps: parsed.parameters.steps || null,
+          n_samples: parsed.parameters.n_samples || null
+        };
+      }
+    }
+
+    // 2. Handle Multipart/FormData payloads (Image-to-Image / Inpainting)
+    const paramIndex = bodyStr.indexOf('"parameters"');
+    if (paramIndex !== -1) {
+      // Isolate a small 1000-character slice starting from the parameters configuration
+      const chunk = bodyStr.slice(paramIndex, paramIndex + 1000);
+
+      const widthMatch = chunk.match(/"width"\s*:\s*(\d+)/);
+      const heightMatch = chunk.match(/"height"\s*:\s*(\d+)/);
+      const stepsMatch = chunk.match(/"steps"\s*:\s*(\d+)/);
+      const samplesMatch = chunk.match(/"n_samples"\s*:\s*(\d+)/);
+
+      return {
+        width: widthMatch ? parseInt(widthMatch[1], 10) : null,
+        height: heightMatch ? parseInt(heightMatch[1], 10) : null,
+        steps: stepsMatch ? parseInt(stepsMatch[1], 10) : null,
+        n_samples: samplesMatch ? parseInt(samplesMatch[1], 10) : null
+      };
+    }
+  } catch (err) {
+    console.error('[VPS Audit] Error extracting parameters from raw buffer:', err);
+  }
+  return null;
+}
+
+/**
+ * Audit the request parameters in a separate event loop tick.
+ * Automatically revokes device approval if parameters exceed free limits.
+ */
+async function runBackgroundAudit(browserId, payloadBuffer) {
+  const actualParams = extractParametersFromRawBody(payloadBuffer);
+  if (!actualParams) return;
+
+  const { width, height, steps, n_samples } = actualParams;
+  
+  const actualPixels = (width && height) ? (width * height) : 0;
+  const actualSteps = steps || 0;
+  const actualSamples = n_samples || 1;
+
+  // Enforce the strict NovelAI Opus free generation parameters
+  const maxPixels = 1048576; // 1 Megapixel (1024x1024)
+  const maxSteps = 28;
+
+  const isViolation = (actualPixels > maxPixels) || (actualSteps > maxSteps) || (actualSamples !== 1);
+
+  if (isViolation) {
+    console.warn(`\x1b[31m[VPS SECURITY AUDIT] !!! VIOLATION DETECTED !!!\x1b[0m`);
+    console.warn(`[VPS Security Audit] Device: "${browserId}"`);
+    console.warn(`[VPS Security Audit] Actual parameters: ${width}x${height} (${actualPixels} px), Steps: ${actualSteps}, Samples: ${actualSamples}`);
+    console.warn(`[VPS Security Audit] Revoking device approval in SQLite database...`);
+
+    try {
+      // Revoke approval state
+      await run('UPDATE devices SET approved = 0 WHERE browser_id = ?', [browserId]);
+      console.log(`[VPS Security Audit] Success. Device "${browserId}" has been banned.`);
+    } catch (dbErr) {
+      console.error('[VPS Security Audit] Failed to execute database ban:', dbErr);
+    }
+  }
+}
 
 app.listen(PORT, '127.0.0.1', () => console.log(`Gateway coordinator running on port ${PORT}`));

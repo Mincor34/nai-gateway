@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         NovelAI Split-Token Gateway Coordinator (Guest)
 // @namespace    http://tampermonkey.net/
-// @version      2.2.1
+// @version      2.2.2
 // @description  FIFO queue coordination, metadata spoofing, and background stream proxy pipeline
 // @author       Minco
 // @match        https://novelai.net/*
@@ -619,8 +619,8 @@
                 });
             }
 
-            // Generation Interceptions
-            if (urlString.includes('/ai/generate-image')) {
+            // Generation Interceptions (Explicitly bypass tag suggestions autocomplete to keep autocomplete functional)
+            if (urlString.includes('/ai/generate-image') && !urlString.includes('/suggest-tags')) {
                 return handleGenerationIntercept(urlString, config);
             }
 
