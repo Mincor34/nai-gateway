@@ -67,6 +67,11 @@ function hashIP(ip) {
 
 // ----------------- CENTRAL TELEMETRY MIDDLEWARE -----------------
 app.use((req, res, next) => {
+  // Silently handle and ignore favicon requests to keep logs clean
+  if (req.url === '/favicon.ico') {
+    return res.status(204).end();
+  }
+
   const timestamp = new Date().toISOString();
   // Read Caddy's X-Real-IP first, falling back to local socket IP if absent
   const rawIp = req.headers['x-real-ip'] || req.ip || 'unknown'; 
