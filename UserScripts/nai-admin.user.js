@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         NovelAI Split-Token Gateway Coordinator (Admin Panel)
 // @namespace    http://tampermonkey.net/
-// @version      3.0.2
+// @version      3.0.3
 // @description  Secure administration panel and session token injector
 // @author       Minco
 // @match        https://novelai.net/*
@@ -813,7 +813,7 @@
         showQueueStatusBanner("Acquiring channel slot...");
 
         while (!turnAcquired) {
-            await new Promise(r => setTimeout(r, 2000));
+            await new Promise(r => setTimeout(r, 600));
             try {
                 const statusRes = await backgroundRequest({
                     method: "GET",
