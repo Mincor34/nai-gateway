@@ -42,6 +42,7 @@ if (!ADMIN_SECRET_KEY) {
 const PROXY_PATH_WHITELIST = new Set([
   'ai/generate-image',
   'ai/generate-image-stream',
+  'ai/encode-vibe',      // Whitelisted path to support vibe transfer pre-processing via master token
   'ai/generate-stream',  // Legacy Text/story Generation API endpoint
   'oa/v1/completions'    // New OpenAI-compatible Text Generation API endpoint (GLM-4, Erato, Xialong, etc.)
 ]);
@@ -185,10 +186,10 @@ app.all('/proxy/:subdomain/{*splat}', async (req, res) => {
   res.on('finish', executeCleanup);
 
   try {
-    // Validate guest/admin authorization signature
+    // Validate guest authorization signature
     let device;
     if (deviceSecret === ADMIN_SECRET_KEY) {
-      // Pragmatic Admin bypass: Direct mapping to approved state using system passkey without SQLite table lookups.
+      // Pragmatic Admin override: Bypasses the SQLite device validation table since they possess the master ADMIN_SECRET_KEY.
       device = { approved: 1, priority_tier: 'Admin' };
     } else {
       device = await get(
@@ -264,7 +265,7 @@ app.all('/proxy/:subdomain/{*splat}', async (req, res) => {
 
       // Asynchronously trigger the background audit on the fully compiled body buffer.
       // Runs on a separate tick to maintain absolute zero latency on active generations.
-      // Admin configurations are explicitly exempted from auto-ban evaluations.
+      // Admin is excluded from audits to prevent accidental bans.
       if (isImageGen && deviceSecret !== ADMIN_SECRET_KEY) {
         setImmediate(() => {
           runBackgroundAudit(browserId, payloadBuffer);
@@ -285,7 +286,7 @@ app.all('/proxy/:subdomain/{*splat}', async (req, res) => {
       // Remove client metadata and conflicting HTTP headers.
       // Strip 'content-length' and 'transfer-encoding' to re-calculate them dynamically.
       const stripHeaders = [
-        'x-browser-id', 'x-request-id', 'x-gen-width', 'x-gen-height', 'x-gen-steps', 'x-gen-samples', 'x-debug-mode',
+        'x-browser-id', 'x-request-id', 'x-gen-width', 'x-gen-height', 'x-gen-steps', 'x-gen-samples', 'x-debug-mode', 'x-script-version',
         'connection', 'content-length', 'transfer-encoding'
       ];
       stripHeaders.forEach(h => delete headers[h]);
@@ -378,7 +379,8 @@ app.post('/auth/register', async (req, res) => {
 });
 
 /**
- * Nickname update endpoint. Allows authorized clients (or admin) to update their visual label.
+ * Hardened identity modifier.
+ * Permits authorized devices or administrators to update their registered nicknames.
  */
 app.post('/auth/update-label', async (req, res) => {
   const { browser_id, label } = req.body;
@@ -529,6 +531,7 @@ app.post('/admin/approve', verifyAdmin, async (req, res) => {
 
 app.post('/admin/revoke', verifyAdmin, async (req, res) => {
   try {
+    // Retains hard DELETE schema to avoid control panel pollution
     await run('DELETE FROM devices WHERE browser_id = ?', [req.body.browser_id]);
     console.log(`[VPS Telemetry Admin] Revoked approval for browser: "${req.body.browser_id}"`);
     res.json({ success: true });
