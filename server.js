@@ -14,12 +14,25 @@
  *
  * Recommended Caddy Configuration File (/etc/caddy/Caddyfile):
  * -------------------------------------------------------------------------
- * <SUBDOMAIN>.duckdns.org {
- *     reverse_proxy localhost:3000 {
- *         header_up Host {upstream_host}
- *         header_up X-Real-IP {remote_host}
- *     }
- * }
+ <SUBDOMAIN>.duckdns.org {
+     # Matcher restricted strictly to functional prefix paths
+     @allowed_api {
+         path /proxy/* /auth/* /queue/* /admin/*
+     }
+ 
+     # Only forward whitelisted routes to the Express backend
+     handle @allowed_api {
+         reverse_proxy localhost:3000 {
+             header_up Host {upstream_hostport}
+             header_up X-Real-IP {remote_host}
+         }
+     }
+ 
+     # Fail fast with a generic 404 for everything else
+     handle {
+         respond "Not Found" 404
+     }
+ }
  * -------------------------------------------------------------------------
  */
 
