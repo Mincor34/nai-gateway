@@ -13,6 +13,7 @@ data.db
 .env
 .env.local
 .env.*.local
+ecosystem.config.js
 
 # Logs
 logs

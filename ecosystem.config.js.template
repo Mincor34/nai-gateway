@@ -1,0 +1,14 @@
+module.exports = {
+  apps: [{
+    name: "nai-gateway-prod",
+    script: "./server.js",
+    watch: false,
+    max_memory_restart: "200M",
+    env: {
+      NODE_ENV: "production",
+      PORT: 3000,
+      DATABASE_PATH: "data.db",
+      ADMIN_SECRET_KEY: "YOUR_SUPER_SECRET_KEY_HERE"
+    }
+  }]
+};
