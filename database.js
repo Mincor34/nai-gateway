@@ -13,8 +13,12 @@
 const sqlite3 = require('sqlite3').verbose();
 const path = require('path');
 
-// Ensure database sits in root context, persistent across process lifecycles
-const dbPath = path.join(__dirname, 'data.db');
+// Allow the database file path to be set via environment variable with a default fallback
+const dbFilename = process.env.DATABASE_PATH || 'data.db';
+const dbPath = path.isAbsolute(dbFilename) 
+  ? dbFilename 
+  : path.join(__dirname, dbFilename);
+
 const db = new sqlite3.Database(dbPath);
 
 // Synchronously initialize required schema definitions

@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         NovelAI Split-Token Gateway Coordinator (Guest)
 // @namespace    http://tampermonkey.net/
-// @version      3.0.2
+// @version      3.0.4
 // @description  FIFO queue coordination, metadata spoofing, and background stream proxy pipeline
 // @author       Minco
 // @match        https://novelai.net/*
@@ -72,9 +72,15 @@
 
     function backgroundRequest(details) {
         console.log(`Nai-Guest: Dispatching request to ${details.url}...`);
+        
+        // Dynamically append current running script version to outbound headers
+        const headers = details.headers || {};
+        headers["x-script-version"] = GM_info.script.version;
+
         return new Promise((resolve, reject) => {
             GM_xmlhttpRequest({
                 ...details,
+                headers,
                 onload: (r) => {
                     console.log(`Nai-Guest: Received response status ${r.status} from ${details.url}`);
                     resolve(r);
@@ -110,13 +116,13 @@
 
     /**
      * Renders the dynamic, sequential setup wizard. 
-     * Restricts inputs and validates steps asynchronously.
+     * Restricts inputs and validates steps asynchronously with adaptive mobile dimensions.
      */
     function renderSetupWizard(container) {
         if (container.querySelector(".setup-wizard-card")) return;
         
         container.innerHTML = `
-            <div class="setup-wizard-card" style="background:#1c1c1c; padding:35px; border-radius:6px; border:1px solid #c0392b; box-shadow:0 8px 30px rgba(0,0,0,0.6); max-width:450px; width:100%; box-sizing:border-box;">
+            <div class="setup-wizard-card" style="background:#1c1c1c; padding:35px; border-radius:6px; border:1px solid #c0392b; box-shadow:0 8px 30px rgba(0,0,0,0.6); max-width:90vw; width:420px; box-sizing:border-box;">
                 <h3 style="margin:0 0 15px 0; color:#00bc8c; text-align:center; letter-spacing:1px; font-size:18px; font-family:sans-serif;">GATEWAY COORDINATOR SETUP</h3>
                 
                 <!-- Step 1: Gateway Domain Configuration -->
@@ -321,12 +327,13 @@
         const gearBtn = document.createElement("button");
         gearBtn.id = "vps-gear-btn";
         gearBtn.innerHTML = "⚙️";
-        gearBtn.style.cssText = "position:fixed; bottom:15px; right:15px; width:36px; height:36px; background:#1a1a1a; border:1px solid #c0392b; border-radius:50%; color:#fff; font-size:18px; cursor:pointer; z-index:99999; display:flex; align-items:center; justify-content:center; box-shadow:0 4px 10px rgba(0,0,0,0.5); transition:transform 0.2s;";
+        // Relocated to bottom: 120px to avoid colliding with bottom-right options on mobile
+        gearBtn.style.cssText = "position:fixed; bottom:120px; right:15px; width:44px; height:44px; background:#1a1a1a; border:1px solid #c0392b; border-radius:50%; color:#fff; font-size:22px; cursor:pointer; z-index:99999; display:flex; align-items:center; justify-content:center; box-shadow:0 4px 10px rgba(0,0,0,0.5); transition:transform 0.2s;";
         gearBtn.onclick = openSettingsModal;
         
         const banner = document.getElementById("vps-queue-banner");
         if (banner) {
-            banner.style.bottom = "60px";
+            banner.style.bottom = "175px"; // Adjust banner to sit stacked cleanly above the gear
             banner.style.right = "15px";
         }
         document.documentElement.appendChild(gearBtn);
@@ -366,7 +373,7 @@
 
         modal = document.createElement("div");
         modal.id = "vps-settings-modal";
-        modal.style.cssText = "position:fixed; top:50%; left:50%; transform:translate(-50%, -50%); width:400px; background:#1c1c1c; border:1px solid #c0392b; border-radius:6px; z-index:99999; color:#fff; padding:20px; font-family:sans-serif; box-shadow:0 10px 40px rgba(0,0,0,0.6); max-height:90vh; overflow-y:auto;";
+        modal.style.cssText = "position:fixed; top:50%; left:50%; transform:translate(-50%, -50%); width:90vw; max-width:400px; background:#1c1c1c; border:1px solid #c0392b; border-radius:6px; z-index:99999; color:#fff; padding:20px; font-family:sans-serif; box-shadow:0 10px 40px rgba(0,0,0,0.6); max-height:90vh; overflow-y:auto;";
         
         const nickname = GM_getValue("device_nickname", "Guest");
         const domain = GM_getValue("vps_host", "");
@@ -583,7 +590,7 @@
         } else {
             console.error(`[Nai-Guest] Telemetry: Proxy returned exception status code: ${status}`);
 
-            // Forcefully wipe the approved flag, silently re-register, and reload the tab to mount the setup overlay
+            // Self-Healing Hook: Forcefully wipe the approved flag, silently re-register, and reload on 401
             if (status === 401) {
                 console.warn("[Nai-Guest] Revocation signature caught. Restoring setup lock and silently re-registering.");
                 GM_setValue("approved", false);
@@ -672,7 +679,8 @@
         if (!banner) {
             banner = document.createElement("div");
             banner.id = "vps-queue-banner";
-            banner.style = "position:fixed;bottom:60px;right:15px;background:#1b1b1b;color:#00bc8c;padding:12px 20px;border:1px solid #00bc8c;border-radius:4px;z-index:99998;font-family:sans-serif;font-size:13px;box-shadow:0 4px 15px rgba(0,0,0,0.4);display:flex;align-items:center;gap:10px;";
+            // Set bottom: 175px to stack above the settings gear cleanly on mobile
+            banner.style = "position:fixed;bottom:175px;right:15px;background:#1b1b1b;color:#00bc8c;padding:12px 20px;border:1px solid #00bc8c;border-radius:4px;z-index:99998;font-family:sans-serif;font-size:13px;box-shadow:0 4px 15px rgba(0,0,0,0.4);display:flex;align-items:center;gap:10px;";
             document.documentElement.appendChild(banner);
         }
         banner.innerHTML = `<div style="width:8px;height:8px;background:#00bc8c;border-radius:50%;animation:vpsPulse 1s infinite alternate;"></div><span>${text}</span>
@@ -731,7 +739,8 @@
         showQueueStatusBanner("Acquiring channel slot...");
 
         while (!turnAcquired) {
-            await new Promise(r => setTimeout(r, 2000));
+            // Reduced to 1000ms to completely eliminate dead-time gaps between generations
+            await new Promise(r => setTimeout(r, 1000));
             try {
                 const statusRes = await backgroundRequest({
                     method: "GET",
@@ -785,6 +794,7 @@
         updatedHeaders.set("x-gen-steps", imgParams.steps.toString());
         updatedHeaders.set("x-gen-samples", imgParams.n_samples.toString());
         updatedHeaders.set("authorization", `Bearer ${deviceSecret}`);
+        updatedHeaders.set("x-script-version", GM_info.script.version); // Dyn Version Injection
         if (GM_getValue("debug_mode", false)) {
             updatedHeaders.set("x-debug-mode", "true");
             console.log(`[VPS Debug Mode] Outbound image generation details:`, originalBody);
@@ -876,6 +886,7 @@
 
         updatedHeaders.set("x-browser-id", browserId);
         updatedHeaders.set("authorization", `Bearer ${deviceSecret}`);
+        updatedHeaders.set("x-script-version", GM_info.script.version); // Dyn Version Injection
         if (GM_getValue("debug_mode", false)) {
             updatedHeaders.set("x-debug-mode", "true");
             console.log(`[VPS Debug Mode] Outbound text prompt payload:`, config.body);
@@ -883,6 +894,11 @@
 
         updatedHeaders.delete("host");
         updatedHeaders.delete("content-length"); // Prevent stream desynchronization
+
+        // Forcefully delete content-type header for FormData blocks to allow native browser boundary calculations
+        if (config.body instanceof FormData) {
+            updatedHeaders.delete("content-type");
+        }
 
         let hasResolved = false;
 
@@ -1001,6 +1017,11 @@
 
             // Route both legacy and new OpenAI-compatible text generation endpoints through our secure fast-track text queue
             if (urlString.includes('/ai/generate-stream') || urlString.includes('/oa/v1/completions')) {
+                return handleTextGenerationIntercept(urlString, config);
+            }
+
+            // Intercept vibe transfer pre-processing requests to swap with master token instantly
+            if (urlString.includes('/ai/encode-vibe')) {
                 return handleTextGenerationIntercept(urlString, config);
             }
         }
