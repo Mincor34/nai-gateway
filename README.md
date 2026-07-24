@@ -5,21 +5,23 @@ A single-concurrency transaction queue and split-token reverse proxy designed to
 ## 1. System Architecture
 
 ```
-                       [ HTTPS (443) ]
-  [ Guest Browser ]  ==================>  [ Reverse Proxy (Caddy/Nginx) ]
-                                                   ||
-                                             (Local Port 3000)
-                                                   ||
-                                                   \/
-                                          [ Express Gateway ]
-                                           ├── SQLite Store (Devices/State)
-                                           ├── In-Memory Queues
-                                           └── Request Buffer Accumulator
-                                                   ||
-                                            (Token Swapping)
-                                                   ||
-                                                   \/
-                                          [ NovelAI Upstream ]
+                                [ HTTPS (443) ]
+  [ Guest Browser ]  ===================================>  [ Reverse Proxy (Caddy/Nginx) ]
+                                                                     ||
+                                                       (Process-Level Route Selection)
+                                                        //                         \\
+                                             (Local Port 3000)             (Local Port 3001)
+                                                    ||                             ||
+                                                    \/                             \/
+                                        [ Express Gateway (PROD) ]    [ Express Gateway (STAGING) ]
+                                        ├── SQLite Store (data.db)    ├── SQLite Store (staging_data.db)
+                                        ├── In-Memory Queues          ├── In-Memory Queues
+                                        └── Request Accumulator       └── Request Accumulator
+                                                    ||                             ||
+                                             (Token Swapping)               (Token Swapping)
+                                                    ||                             ||
+                                                    \/                             \/
+                                           [ NovelAI Upstream ]           [ NovelAI Upstream ]
 ```
 
 ### Key Security Safeguards
@@ -42,28 +44,70 @@ A single-concurrency transaction queue and split-token reverse proxy designed to
 ### Deployment Steps
 
 1. **Clone and Install Dependencies**
-   Navigate to your project directory on your remote VPS and run:
+   To set up isolated development pipelines, maintain separate production and staging clones pointing to your remote repository:
    ```bash
+   # Production Directory Setup
+   git clone -b master [YOUR_REMOTE_URL] ~/nai-gateway
+   cd ~/nai-gateway
+   npm install
+
+   # Staging Directory Setup
+   git clone -b staging [YOUR_REMOTE_URL] ~/nai-gateway-staging
+   cd ~/nai-gateway-staging
    npm install
    ```
 
-2. **Configure Environment Variables**
-   The application reads runtime secrets from process environment variables. Define these globally or pass them during startup:
-   ```bash
-   export PORT=3000
-   export ADMIN_SECRET_KEY="your_extremely_secure_vps_admin_passkey_change_me"
-   ```
+2. **Configure Runtime Environment Manifests**
+   Environment variables are managed dynamically via local PM2 configuration files. This separates runtime states without requiring manual exports or external environment dependency management.
+
+   * **Production Configuration (`~/nai-gateway/ecosystem.config.js`):**
+     ```javascript
+     module.exports = {
+       apps: [{
+         name: "nai-gateway-prod",
+         script: "./server.js",
+         watch: false,
+         max_memory_restart: "200M",
+         env: {
+           NODE_ENV: "production",
+           PORT: 3000,
+           DATABASE_PATH: "data.db",
+           ADMIN_SECRET_KEY: "your_vps_production_admin_passkey"
+         }
+       }]
+     };
+     ```
+
+   * **Staging Configuration (`~/nai-gateway-staging/ecosystem.config.js`):**
+     ```javascript
+     module.exports = {
+       apps: [{
+         name: "nai-gateway-staging",
+         script: "./server.js",
+         watch: false,
+         max_memory_restart: "200M",
+         env: {
+           NODE_ENV: "staging",
+           PORT: 3001,
+           DATABASE_PATH: "staging_data.db",
+           ADMIN_SECRET_KEY: "your_vps_staging_admin_passkey"
+         }
+       }]
+     };
+     ```
 
 3. **Initialize Persistent Daemon Execution**
-   Do not run this server directly in your interactive shell session. Use `pm2` to monitor and keep the process alive:
+   Deploy the instances using their respective manifest files. PM2 will read the parameters and maintain runtime memory separation:
    ```bash
-   # Install pm2 globally if not already available
-   npm install -g pm2
+   # Start production gateway
+   cd ~/nai-gateway
+   pm2 start ecosystem.config.js
 
-   # Start the daemon
-   ADMIN_SECRET_KEY="your_secure_passkey" PORT=3000 pm2 start server.js --name "nai-gateway"
+   # Start staging gateway
+   cd ~/nai-gateway-staging
+   pm2 start ecosystem.config.js
 
-   # Configure pm2 to restart on VPS reboot
+   # Configure PM2 to restart on VPS reboot
    pm2 startup
    pm2 save
    ```
@@ -72,53 +116,51 @@ A single-concurrency transaction queue and split-token reverse proxy designed to
 
 ## 3. Reverse Proxy Configuration (TLS/SSL Enforced)
 
-**Never expose the Express application directly to the public internet on port 3000.** You must run a front-facing reverse proxy to enforce HTTPS and protect client authorization headers from eavesdropping.
+**Never expose the Express application directly to the public internet on ports 3000 or 3001.** You must run a front-facing reverse proxy to enforce HTTPS and protect client authorization headers from eavesdropping.
 
 ### Option A: Caddy (Highly Recommended)
 Caddy automatically provisions, configures, and renews Let's Encrypt SSL certificates out-of-the-box with minimal overhead.
 
-1. Edit your system Caddy configuration file (`/etc/caddy/Caddyfile`):
-   ```caddy
-   your-domain.duckdns.org {
-       reverse_proxy localhost:3000 {
-           header_up Host {upstream_hostport}
-           header_up X-Real-IP {remote_host}
-       }
-   }
-   ```
-2. Restart Caddy: `systemctl restart caddy`
+Edit your system Caddy configuration file (`/etc/caddy/Caddyfile`):
+```caddy
+# Production Reverse Proxy Gateway
+your-domain.duckdns.org {
+    @allowed_api {
+        path /proxy/* /auth/* /queue/* /admin/*
+    }
 
-### Option B: Nginx
-If using Nginx, you must manually coordinate Certbot to obtain and renew certificates.
+    handle @allowed_api {
+        reverse_proxy localhost:3000 {
+            header_up Host {upstream_hostport}
+            header_up X-Real-IP {remote_host}
+        }
+    }
 
-1. Configure an Nginx server block:
-   ```nginx
-   server {
-       listen 80;
-       server_name your-domain.duckdns.org;
-       return 301 https://$host$request_uri;
-   }
+    handle {
+        respond "Not Found" 404
+    }
+}
 
-   server {
-       listen 443 ssl;
-       server_name your-domain.duckdns.org;
+# Staging Reverse Proxy Gateway
+your-staging-domain.duckdns.org {
+    @allowed_api {
+        path /proxy/* /auth/* /queue/* /admin/*
+    }
 
-       ssl_certificate /etc/letsencrypt/live/your-domain.duckdns.org/fullchain.pem;
-       ssl_certificate_key /etc/letsencrypt/live/your-domain.duckdns.org/privkey.pem;
+    handle @allowed_api {
+        reverse_proxy localhost:3001 {
+            header_up Host {upstream_hostport}
+            header_up X-Real-IP {remote_host}
+        }
+    }
 
-       location / {
-           proxy_pass http://localhost:3000;
-           proxy_http_version 1.1;
-           proxy_set_header Upgrade $http_upgrade;
-           proxy_set_header Connection 'upgrade';
-           proxy_set_header Host $host;
-           proxy_cache_bypass $http_upgrade;
-           proxy_set_header X-Real-IP $remote_addr;
-           proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-       }
-   }
-   ```
-2. Restart Nginx: `systemctl restart nginx`
+    handle {
+        respond "Not Found" 404
+    }
+}
+```
+Restart Caddy: `systemctl restart caddy`
+
 
 ---
 
@@ -133,7 +175,7 @@ Guests and administrators must install their respective browser scripts using Ta
    * **Guest Script:** Install `UserScripts/nai-guest.user.js` on guest browsers.
    * **Admin Script:** Install `UserScripts/nai-admin.user.js` on your own administrator browser.
 3. **Change VPS URL Target:**
-   Open the installed scripts inside the Tampermonkey editor and modify the `VPS_HOST` variable to point to your domain:
+   Open the installed scripts inside the Tampermonkey editor and modify the `VPS_HOST` variable to point to your respective production or staging domain:
    ```javascript
    const VPS_HOST = 'https://your-domain.duckdns.org';
    ```
@@ -157,10 +199,16 @@ Guests log in natively with their own personal, free NovelAI accounts. All profi
 ## 6. Maintenance & Troubleshooting
 
 ### Viewing Server Diagnostics
-Centralized telemetry is printed to standard output in real-time. Use the PM2 CLI utility to trace incoming traffic and exceptions:
-```bash
-pm2 logs nai-gateway
-```
+Centralized telemetry is printed to standard output in real-time. Use the PM2 CLI utility to trace incoming traffic and exceptions, specifying the process target:
+
+* **Production Telemetry Logs:**
+  ```bash
+  pm2 logs nai-gateway-prod
+  ```
+* **Staging Telemetry Logs:**
+  ```bash
+  pm2 logs nai-gateway-staging
+  ```
 
 Every request, database query, and proxy event is logged to standard output using the `[VPS Telemetry]` prefix.
 
