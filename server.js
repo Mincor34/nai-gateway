@@ -1,45 +1,17 @@
 /**
  * COORDINATOR GATEWAY CORE (server.js)
  *
- * This coordinator manages concurrent API executions targeting NovelAI. 
- * It decouples guest configurations using a Split-Token schema, enforcing 
- * strict rate limits, programmatic parameter firewalls, and priority queuing.
- *
- * =========================================================================
- * PRODUCTION VPS ARCHITECTURE & SSL REVERSE PROXY REFERENCE
- * =========================================================================
- * Running this application nakedly on an exposed port (e.g. 3000) over http is 
- * an absolute security failure. This coordinator MUST run behind a reverse proxy 
- * handling automated TLS termination (e.g. Let's Encrypt via Caddy or Nginx).
- *
- * Recommended Caddy Configuration File (/etc/caddy/Caddyfile):
- * -------------------------------------------------------------------------
- <SUBDOMAIN>.duckdns.org {
-     # Matcher restricted strictly to functional prefix paths
-     @allowed_api {
-         path /proxy/* /auth/* /queue/* /admin/*
-     }
- 
-     # Only forward whitelisted routes to the Express backend
-     handle @allowed_api {
-         reverse_proxy localhost:3000 {
-             header_up Host {upstream_hostport}
-             header_up X-Real-IP {remote_host}
-         }
-     }
- 
-     # Fail fast with a generic 404 for everything else
-     handle {
-         respond "Not Found" 404
-     }
- }
- * -------------------------------------------------------------------------
+ * Implements:
+ * - Sequential Promise DB Startup Guard
+ * - Preserved Fractional Token Accumulation (RAM-bound)
+ * - Safe Boundary-Sliced Multipart JSON Parser for Background Post-Audits
+ * - Dual-Rate Dynamic Queue Aging with 120s AUTO Promotion
  */
 
 const express = require('express');
 const https = require('https');
 const crypto = require('crypto');
-const { run, get, all } = require('./database');
+const { initDatabase, run, get, all } = require('./database');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -51,7 +23,14 @@ if (!ADMIN_SECRET_KEY) {
   process.exit(1);
 }
 
-// Strict Resource Whitelist. Prevents arbitrary request manipulation and credentials harvesting.
+const TIER_CONFIGS = {
+  'Admin':   { basePriority: 30, slope: 'fast', maxBurst: Infinity,  refillRate: 0,      preciseLimit: Infinity },
+  'High':    { basePriority: 20, slope: 'fast', maxBurst: Infinity,  refillRate: 0,      preciseLimit: 3 },
+  'Normal':  { basePriority: 10, slope: 'base', maxBurst: 15,        refillRate: 120000, preciseLimit: 2 },
+  'Low B':   { basePriority: 0,  slope: 'base', maxBurst: 10,        refillRate: 120000, preciseLimit: 1 },
+  'Low A':   { basePriority: 0,  slope: 'base', maxBurst: 5,         refillRate: 120000, preciseLimit: 0 }
+};
+
 const PROXY_PATH_WHITELIST = new Set([
   'ai/generate-image',
   'ai/generate-image-stream',
@@ -60,15 +39,13 @@ const PROXY_PATH_WHITELIST = new Set([
   'oa/v1/completions'    // New OpenAI-compatible Text Generation API endpoint (GLM-4, Erato, Xialong, etc.)
 ]);
 
+const deviceBuckets = new Map();
 // In-Memory Queue State for Channel A (Exclusive Generation Slot)
 let queue = [];
 
 // Channel B Concurrency State (Shared Text Generation Slots)
 let activeTextGenerations = 0;
 const MAX_CONCURRENT_TEXT_GENS = 3; 
-
-const TIER_PRIORITIES = { 'Low': 0, 'Normal': 10, 'High': 20, 'Admin': 30 };
-
 // Cryptographic Salt for IP hashing.
 // Regenerating this on startup ensures maximum privacy: hashes remain identical 
 // during runtime (allowing you to track/rate-limit a session), but become 
@@ -86,43 +63,81 @@ function hashIP(ip) {
   return crypto.createHash('sha256').update(ip + IP_SALT).digest('hex').substring(0, 12);
 }
 
+/**
+ * Volatile dynamic token-bucket retriever implementing lazy math refills on-demand.
+ * Preserves fractional token accumulation drift.
+ */
+function getOrInitBucket(browserId, tier) {
+  const config = TIER_CONFIGS[tier];
+  if (!config || config.maxBurst === Infinity) return null;
+
+  let bucket = deviceBuckets.get(browserId);
+  const now = Date.now();
+  if (!bucket) {
+    bucket = {
+      tokens: config.maxBurst,
+      lastTx: now
+    };
+    deviceBuckets.set(browserId, bucket);
+  } else {
+    const elapsed = now - bucket.lastTx;
+    if (elapsed >= config.refillRate) {
+      const gained = Math.floor(elapsed / config.refillRate);
+      bucket.tokens = Math.min(config.maxBurst, bucket.tokens + gained);
+      bucket.lastTx += gained * config.refillRate; // Keeps exact fractional remainder alignment
+    }
+  }
+  return bucket;
+}
+
 // ----------------- CENTRAL TELEMETRY MIDDLEWARE -----------------
 app.use((req, res, next) => {
-  // Silently handle and ignore favicon requests to keep logs clean
-  if (req.url === '/favicon.ico') {
-    return res.status(204).end();
-  }
-
+  if (req.url === '/favicon.ico') return res.status(204).end();
   const timestamp = new Date().toISOString();
-  // Read Caddy's X-Real-IP first, falling back to local socket IP if absent
   const rawIp = req.headers['x-real-ip'] || req.ip || 'unknown'; 
   const maskedIp = hashIP(rawIp);
-  
   console.log(`[VPS Telemetry] ${timestamp} | ${req.method} ${req.url} | Client: ${maskedIp}`);
   next();
 });
 
 /**
- * Dynamically updates effective queue priorities using dynamic linear aging decay 
- * and allocates the next active execution task slot.
+ * Dynamically updates effective queue priorities using dynamic linear aging decay (Fast vs Base slopes).
+ * Evaluates step-function promotions (AUTO) at 120s thresholds.
  */
 function processQueue() {
   const activeImageTask = queue.find(t => t.status === 'processing');
-  if (activeImageTask) return; // Non-preemptive constraint: active slots cannot be aborted midway
+  if (activeImageTask) return; 
   if (queue.length === 0) return;
 
   const now = Date.now();
   const pendingTasks = queue.filter(t => t.status === 'pending');
   if (pendingTasks.length === 0) return;
 
-  // Compute aged priorities: 1 increment per 30 seconds wait ceiling
   pendingTasks.forEach(task => {
     const elapsedSeconds = (now - task.timestamp) / 1000;
-    const baseVal = TIER_PRIORITIES[task.priority_tier] ?? 10;
-    task.effective_priority = baseVal + Math.floor(elapsedSeconds / 30);
+    
+    // Dynamic Step-Function Jump (AUTO state promotion) at 120s
+    if (!task.has_burst_boost && elapsedSeconds >= 120) {
+      const bucket = getOrInitBucket(task.browser_id, task.priority_tier);
+      if (bucket && bucket.tokens >= 1.0) {
+        bucket.tokens -= 1.0;
+        task.has_burst_boost = true;
+        console.log(`[VPS Queue AUTO] Task "${task.req_id}" hit 120s threshold. Promoting to Fast Slope.`);
+      }
+    }
+
+    let p = 0;
+    if (task.has_burst_boost) {
+      const base = (task.priority_tier === 'Admin') ? 30 : 20;
+      p = base + Math.floor(elapsedSeconds / 5);
+    } else {
+      const config = TIER_CONFIGS[task.priority_tier] || TIER_CONFIGS['Normal'];
+      p = config.basePriority + Math.floor(elapsedSeconds / 15);
+    }
+    
+    task.effective_priority = p;
   });
 
-  // Sort Descending by priority, using creation timestamp as structural FIFO tiebreaker
   pendingTasks.sort((a, b) => b.effective_priority - a.effective_priority || a.timestamp - b.timestamp);
 
   const nextTask = pendingTasks[0];
@@ -202,7 +217,7 @@ app.all('/proxy/:subdomain/{*splat}', async (req, res) => {
     // Validate guest authorization signature
     let device;
     if (deviceSecret === ADMIN_SECRET_KEY) {
-      // Pragmatic Admin override: Bypasses the SQLite device validation table since they possess the master ADMIN_SECRET_KEY.
+      // Admin override: Bypasses the SQLite device validation table since they possess the master ADMIN_SECRET_KEY.
       device = { approved: 1, priority_tier: 'Admin' };
     } else {
       device = await get(
@@ -232,7 +247,7 @@ app.all('/proxy/:subdomain/{*splat}', async (req, res) => {
         });
       }
 
-      // Enforce Hard Parametric Firewall Restrictions (Max 1MP, 28 Steps, Single Sample)
+      // Enforce Soft Parametric Firewall Restrictions (Max 1MP, 28 Steps, Single Sample)
       // Serving as a defensive, front-facing check before the background audit.
       const width = parseInt(req.headers['x-gen-width'], 10) || 0;
       const height = parseInt(req.headers['x-gen-height'], 10) || 0;
@@ -277,7 +292,7 @@ app.all('/proxy/:subdomain/{*splat}', async (req, res) => {
       const payloadBuffer = Buffer.concat(bodyChunks);
 
       // Asynchronously trigger the background audit on the fully compiled body buffer.
-      // Runs on a separate tick to maintain absolute zero latency on active generations.
+      // Runs on a separate tick to maintain zero latency on active generations.
       // Admin is excluded from audits to prevent accidental bans.
       if (isImageGen && deviceSecret !== ADMIN_SECRET_KEY) {
         setImmediate(() => {
@@ -285,7 +300,7 @@ app.all('/proxy/:subdomain/{*splat}', async (req, res) => {
         });
       }
 
-      // Handle Client Debug Flag: Dumps exact payload metrics without exposing tokens.
+      // Handle Client Debug Flag: Dumps full payload metrics without exposing tokens.
       if (req.headers['x-debug-mode'] === 'true') {
         console.log(`\n--- [VPS Debug Telemetry] Payload from client: "${browserId}" ---`);
         console.log(payloadBuffer.toString('utf8').substring(0, 1500));
@@ -332,7 +347,6 @@ app.all('/proxy/:subdomain/{*splat}', async (req, res) => {
 
       upstreamReq.on('error', (err) => {
         console.error('[VPS Telemetry] Upstream connection socket exception occurred:', err);
-        
         if (!res.headersSent) {
           res.status(502).json({ 
             error: 'Upstream dynamic pipe disconnected',
@@ -344,7 +358,6 @@ app.all('/proxy/:subdomain/{*splat}', async (req, res) => {
 
       // Disable Nagle's algorithm on outbound request connection to minimize upstream latency
       upstreamReq.setNoDelay(true);
-
       if (activeTask) activeTask.upstreamReq = upstreamReq;
 
       // Transmit the accumulated body buffer directly and end the socket cleanly
@@ -361,7 +374,7 @@ app.all('/proxy/:subdomain/{*splat}', async (req, res) => {
   }
 });
 
-// ----------------- STANDARD API ENDPOINTS (MIDDLEWARE APPLIED) -----------------
+// ----------------- STANDARD API ENDPOINTS -----------------
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
@@ -474,6 +487,24 @@ app.post('/queue/join', async (req, res) => {
     if (existingIdx !== -1) {
       if (queue[existingIdx].upstreamReq) queue[existingIdx].upstreamReq.destroy();
       queue.splice(existingIdx, 1);
+      console.log(`[VPS Telemetry] Ghost session evicted for: ${browser_id}`);
+    }
+
+    let hasBurstBoost = false;
+    const tierConfig = TIER_CONFIGS[device.priority_tier] || TIER_CONFIGS['Normal'];
+
+    if (tierConfig.maxBurst === Infinity) {
+      hasBurstBoost = true;
+    } else {
+      const bucket = getOrInitBucket(browser_id, device.priority_tier);
+      if (bucket && bucket.tokens >= 1.0) {
+        bucket.tokens -= 1.0; 
+        hasBurstBoost = true;
+        console.log(`[VPS Token Bucket] Allocated 1.0 token. Browser: ${browser_id}. Tokens remaining: ${bucket.tokens}`);
+      } else {
+        hasBurstBoost = false;
+        console.log(`[VPS Token Bucket] Saturated bucket. Defaulting ${browser_id} to Base Slope.`);
+      }
     }
 
     queue.push({
@@ -485,7 +516,8 @@ app.post('/queue/join', async (req, res) => {
       last_polled_at: Date.now(),
       status: 'pending',
       started_processing_at: null,
-      upstreamReq: null
+      upstreamReq: null,
+      has_burst_boost: hasBurstBoost
     });
 
     console.log(`[VPS Telemetry] Device "${browser_id}" joined queue. ReqId: "${req_id}". Tier: "${device.priority_tier}"`);
@@ -508,8 +540,25 @@ app.get('/queue/status', async (req, res) => {
   const now = Date.now();
   const tempPending = queue.filter(t => t.status === 'pending');
   tempPending.forEach(t => {
-    const baseVal = TIER_PRIORITIES[t.priority_tier] ?? 10;
-    t.effective_priority = baseVal + Math.floor((now - t.timestamp) / 30000);
+    const elapsedSeconds = (now - t.timestamp) / 1000;
+    
+    if (!t.has_burst_boost && elapsedSeconds >= 120) {
+      const bucket = getOrInitBucket(t.browser_id, t.priority_tier);
+      if (bucket && bucket.tokens >= 1.0) {
+        bucket.tokens -= 1.0;
+        t.has_burst_boost = true;
+      }
+    }
+
+    let p = 0;
+    if (t.has_burst_boost) {
+      const base = (t.priority_tier === 'Admin') ? 30 : 20;
+      p = base + Math.floor(elapsedSeconds / 5);
+    } else {
+      const config = TIER_CONFIGS[t.priority_tier] || TIER_CONFIGS['Normal'];
+      p = config.basePriority + Math.floor(elapsedSeconds / 15);
+    }
+    t.effective_priority = p;
   });
 
   tempPending.sort((a, b) => b.effective_priority - a.effective_priority || a.timestamp - b.timestamp);
@@ -571,8 +620,8 @@ setInterval(() => {
       console.warn(`[Nai-Gateway GC] Discarding inactive pending client: BrowserId: ${t.browser_id}`);
       return false; 
     }
-    // Forcefully drop processing connections stuck/hung for over 75 seconds
-    if (t.status === 'processing' && (now - t.started_processing_at > 75000)) {
+    // Forcefully drop processing connections stuck/hung for over 25 seconds
+    if (t.status === 'processing' && (now - t.started_processing_at > 25000)) {
       if (t.upstreamReq) t.upstreamReq.destroy();
       stateChanged = true;
       console.warn(`[Nai-Gateway GC] Terminating hung generation lock. Extinguished active socket for: ${t.browser_id}`);
@@ -587,84 +636,136 @@ setInterval(() => {
 }, 5000);
 
 /**
- * Extract actual parameters from the raw request buffer.
- * Performs a fast, low-overhead string search to bypass large binary image payloads.
+ * Format-agnostic parameters extractor. 
+ * Extracts the request form part from a multipart body using actual boundaries 
+ * before converting binary segments to UTF-8. Operates at the raw string level.
  */
 function extractParametersFromRawBody(buffer) {
   try {
-    const bodyStr = buffer.toString('utf8');
+    if (!buffer || buffer.length === 0) return null;
 
-    // 1. Handle raw JSON payloads (Text-to-Image)
-    if (bodyStr.trim().startsWith('{')) {
-      const parsed = JSON.parse(bodyStr);
-      if (parsed && parsed.parameters) {
+    // Clean out massive Base64 strings to make the payload safely-parsable
+    const bodyStr = buffer.toString('utf8');
+    const cleanedStr = bodyStr.replace(/"(?:data:image\/[^"]+|[A-Za-z0-9+/=]{1000,})"/g, '""');
+
+    // Multipart/FormData JSON Extraction
+    if (buffer[0] === 0x2d && buffer[1] === 0x2d) { // "--"
+      const firstLineEnd = cleanedStr.indexOf('\n');
+      const boundary = firstLineEnd !== -1 ? cleanedStr.slice(0, firstLineEnd).trim() : '';
+
+      const requestIndex = cleanedStr.indexOf('name="request"');
+      if (requestIndex !== -1 && boundary) {
+        const startIdx = cleanedStr.indexOf('{', requestIndex);
+        if (startIdx !== -1) {
+          // Robust exact boundary search (prevents prompt-injection dashes "--" from truncating JSON)
+          const nextBoundary = cleanedStr.indexOf(boundary, startIdx);
+          const endIdx = nextBoundary !== -1 ? nextBoundary : cleanedStr.length;
+
+          let jsonCandidate = cleanedStr.slice(startIdx, endIdx).trim();
+          const lastBrace = jsonCandidate.lastIndexOf('}');
+          if (lastBrace !== -1) {
+            jsonCandidate = jsonCandidate.slice(0, lastBrace + 1);
+          }
+
+          const parsed = JSON.parse(jsonCandidate);
+          const params = parsed.parameters || {};
+          const totalRefs = (Array.isArray(params.reference_image_multiple) ? params.reference_image_multiple.length : 0) +
+                            (Array.isArray(params.character_reference) ? params.character_reference.length : 0) +
+                            (Array.isArray(params.vibe_transfer) ? params.vibe_transfer.length : 0);
+
+          return {
+            width: params.width || null,
+            height: params.height || null,
+            steps: params.steps || null,
+            n_samples: params.n_samples || null,
+            precise_ref_count: totalRefs
+          };
+        }
+      }
+    } else {
+      // Direct JSON Payload Parsing
+      if (cleanedStr.trim().startsWith('{')) {
+        const parsed = JSON.parse(cleanedStr);
+        const params = parsed.parameters || {};
+        const totalRefs = (Array.isArray(params.reference_image_multiple) ? params.reference_image_multiple.length : 0) +
+                          (Array.isArray(params.character_reference) ? params.character_reference.length : 0) +
+                          (Array.isArray(params.vibe_transfer) ? params.vibe_transfer.length : 0);
+
         return {
-          width: parsed.parameters.width || null,
-          height: parsed.parameters.height || null,
-          steps: parsed.parameters.steps || null,
-          n_samples: parsed.parameters.n_samples || null
+          width: params.width || parsed.width || null,
+          height: params.height || parsed.height || null,
+          steps: params.steps || parsed.steps || null,
+          n_samples: params.n_samples || parsed.n_samples || null,
+          precise_ref_count: totalRefs
         };
       }
     }
-
-    // 2. Handle Multipart/FormData payloads (Image-to-Image / Inpainting)
-    const paramIndex = bodyStr.indexOf('"parameters"');
-    if (paramIndex !== -1) {
-      // Isolate a small 1000-character slice starting from the parameters configuration
-      const chunk = bodyStr.slice(paramIndex, paramIndex + 1000);
-
-      const widthMatch = chunk.match(/"width"\s*:\s*(\d+)/);
-      const heightMatch = chunk.match(/"height"\s*:\s*(\d+)/);
-      const stepsMatch = chunk.match(/"steps"\s*:\s*(\d+)/);
-      const samplesMatch = chunk.match(/"n_samples"\s*:\s*(\d+)/);
-
-      return {
-        width: widthMatch ? parseInt(widthMatch[1], 10) : null,
-        height: heightMatch ? parseInt(heightMatch[1], 10) : null,
-        steps: stepsMatch ? parseInt(stepsMatch[1], 10) : null,
-        n_samples: samplesMatch ? parseInt(samplesMatch[1], 10) : null
-      };
-    }
   } catch (err) {
-    console.error('[VPS Audit] Error extracting parameters from raw buffer:', err);
+    console.error('[VPS Audit] Error extracting parameters:', err);
   }
   return null;
 }
 
 /**
- * Audit the request parameters in a separate event loop tick.
- * Automatically revokes device approval if parameters exceed free limits.
+ * Audit request parameters in separate event tick.
+ * Executes immediate database deauthorization sweeps on resource limit violations.
  */
 async function runBackgroundAudit(browserId, payloadBuffer) {
   const actualParams = extractParametersFromRawBody(payloadBuffer);
   if (!actualParams) return;
 
-  const { width, height, steps, n_samples } = actualParams;
+  const { width, height, steps, n_samples, precise_ref_count } = actualParams;
   
   const actualPixels = (width && height) ? (width * height) : 0;
   const actualSteps = steps || 0;
   const actualSamples = n_samples || 1;
+  const actualRefs = precise_ref_count || 0;
 
   // Enforce the strict NovelAI Opus free generation parameters
   const maxPixels = 1048576; // 1 Megapixel (1024x1024)
   const maxSteps = 28;
 
-  const isViolation = (actualPixels > maxPixels) || (actualSteps > maxSteps) || (actualSamples !== 1);
+  const device = await get('SELECT priority_tier, discord_id FROM devices WHERE browser_id = ?', [browserId]);
+  if (!device) return;
+
+  const config = TIER_CONFIGS[device.priority_tier] || TIER_CONFIGS['Normal'];
+  
+  const isViolation = (actualPixels > maxPixels) || 
+                      (actualSteps > maxSteps) || 
+                      (actualSamples !== 1) || 
+                      (actualRefs > config.preciseLimit);
 
   if (isViolation) {
     console.warn(`\x1b[31m[VPS SECURITY AUDIT] !!! VIOLATION DETECTED !!!\x1b[0m`);
-    console.warn(`[VPS Security Audit] Device: "${browserId}"`);
-    console.warn(`[VPS Security Audit] Actual parameters: ${width}x${height} (${actualPixels} px), Steps: ${actualSteps}, Samples: ${actualSamples}`);
-    console.warn(`[VPS Security Audit] Revoking device approval in SQLite database...`);
+    console.warn(`[VPS Security Audit] Device: "${browserId}", Tier: "${device.priority_tier}"`);
+    console.warn(`[VPS Security Audit] Params: ${width}x${height} (${actualPixels} px), Steps: ${actualSteps}, Refs: ${actualRefs} (Limit: ${config.preciseLimit})`);
 
     try {
-      // Revoke approval state
-      await run('UPDATE devices SET approved = 0 WHERE browser_id = ?', [browserId]);
-      console.log(`[VPS Security Audit] Success. Device "${browserId}" has been banned.`);
+      if (device.discord_id) {
+        console.warn(`[VPS Security Audit] Revoking all devices linked to Discord ID: "${device.discord_id}"`);
+        await run('INSERT OR REPLACE INTO banned_discords (discord_id, banned_at, reason) VALUES (?, ?, ?)', [
+          device.discord_id,
+          Date.now(),
+          `Firewall Violation: ${width}x${height}, steps: ${actualSteps}, refs: ${actualRefs} on device ${browserId}`
+        ]);
+        await run('UPDATE devices SET approved = 0 WHERE discord_id = ?', [device.discord_id]);
+      } else {
+        console.warn(`[VPS Security Audit] Revoking browser_id directly: "${browserId}"`);
+        await run('UPDATE devices SET approved = 0 WHERE browser_id = ?', [browserId]);
+      }
+      console.log(`[VPS Security Audit] Success. Ban execution completed.`);
     } catch (dbErr) {
       console.error('[VPS Security Audit] Failed to execute database ban:', dbErr);
     }
   }
 }
 
-app.listen(PORT, '127.0.0.1', () => console.log(`Gateway coordinator running on port ${PORT}`));
+// Sequential Promise DB Bootstrapper
+initDatabase()
+  .then(() => {
+    app.listen(PORT, '127.0.0.1', () => console.log(`Gateway coordinator running on port ${PORT}`));
+  })
+  .catch((err) => {
+    console.error("[VPS Critical] Database initialization failed. Terminating engine process.", err);
+    process.exit(1);
+  });
