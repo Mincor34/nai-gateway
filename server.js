@@ -6,6 +6,7 @@
  * - Preserved Fractional Token Accumulation (RAM-bound)
  * - Safe Boundary-Sliced Multipart JSON Parser for Background Post-Audits
  * - Dual-Rate Dynamic Queue Aging with 120s AUTO Promotion
+ * - Sliding-Window Daily Session Enforcement on Queue Entry
  */
 
 const express = require('express');
@@ -27,8 +28,8 @@ const TIER_CONFIGS = {
   'Admin':   { basePriority: 30, slope: 'fast', maxBurst: Infinity,  refillRate: 0,      preciseLimit: Infinity },
   'High':    { basePriority: 20, slope: 'fast', maxBurst: Infinity,  refillRate: 0,      preciseLimit: 3 },
   'Normal':  { basePriority: 10, slope: 'base', maxBurst: 15,        refillRate: 120000, preciseLimit: 2 },
-  'Low B':   { basePriority: 0,  slope: 'base', maxBurst: 10,        refillRate: 120000, preciseLimit: 1 },
-  'Low A':   { basePriority: 0,  slope: 'base', maxBurst: 5,         refillRate: 120000, preciseLimit: 0 }
+  'Low':     { basePriority: 0,  slope: 'base', maxBurst: 10,        refillRate: 120000, preciseLimit: 1 },
+  'Metered': { basePriority: 0,  slope: 'base', maxBurst: 5,         refillRate: 120000, preciseLimit: 0 }
 };
 
 const PROXY_PATH_WHITELIST = new Set([
@@ -483,6 +484,48 @@ app.post('/queue/join', async (req, res) => {
     }
     if (!device) return res.status(401).json({ error: 'Unauthorized' });
 
+    // Enforce sliding-window session controls exclusively for the Metered/lowest tier
+    if (device.priority_tier === 'Metered') {
+      const today = new Date().toISOString().split('T')[0]; // YYYY-MM-DD (UTC aligned)
+      const session = await get(
+        'SELECT session_count, last_session_at FROM device_sessions WHERE browser_id = ? AND session_date = ?',
+        [browser_id, today]
+      );
+
+      const now = Date.now();
+      const SESSION_WINDOW_MS = 30 * 60 * 1000; // Hard 30 minutes allocation limit
+
+      if (!session) {
+        // Initiating first dynamic session of the day
+        await run(
+          'INSERT INTO device_sessions (browser_id, session_date, session_count, last_session_at) VALUES (?, ?, 1, ?)',
+          [browser_id, today, now]
+        );
+        console.log(`[VPS Session Allocation] Initialized first daily session window for Metered browser: ${browser_id}`);
+      } else {
+        const elapsed = now - session.last_session_at;
+        if (elapsed > SESSION_WINDOW_MS) {
+          // Current session window has elapsed; attempting to open a new sliding window
+          if (session.session_count >= 6) {
+            console.warn(`[VPS Session Block] Metered browser ${browser_id} rejected. 6 daily sessions exhausted.`);
+            return res.status(403).json({
+              statusCode: 403,
+              message: 'Session Limit Exceeded: Metered users are restricted to a maximum of 6 x 30m sessions per day.'
+            });
+          }
+          await run(
+            'UPDATE device_sessions SET session_count = session_count + 1, last_session_at = ? WHERE browser_id = ? AND session_date = ?',
+            [now, browser_id, today]
+          );
+          console.log(`[VPS Session Allocation] Allocated session window #${session.session_count + 1} for Metered browser: ${browser_id}`);
+        } else {
+          // Client is within their active, paid 30-minute sliding window; pass through cleanly
+          const remainingMinutes = ((SESSION_WINDOW_MS - elapsed) / 1000 / 60).toFixed(1);
+          console.log(`[VPS Session Check] Metered browser ${browser_id} within active window. ${remainingMinutes}m remaining.`);
+        }
+      }
+    }
+
     const existingIdx = queue.findIndex(t => t.browser_id === browser_id);
     if (existingIdx !== -1) {
       if (queue[existingIdx].upstreamReq) queue[existingIdx].upstreamReq.destroy();
@@ -606,6 +649,91 @@ app.post('/admin/update-token', verifyAdmin, async (req, res) => {
     console.log('[VPS Admin] Pushed fresh master Opus session token to configuration schema.');
     res.json({ success: true });
   } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+/**
+ * @api {post} /admin/link Link Hardware Footprint
+ * @apiGroup Admin
+ * @apiDescription Links a registered device's browser footprint directly to a verified Discord ID.
+ * Implements an automatic blacklist and physical device existence check.
+ */
+app.post('/admin/link', verifyAdmin, async (req, res) => {
+  const { browser_id, discord_id, priority_tier } = req.body;
+  if (!browser_id || !discord_id || !priority_tier) {
+    return res.status(400).json({ error: "Missing required linking parameters." });
+  }
+
+  try {
+    // Check if user has been placed in the persistent blacklist schema
+    const isBanned = await get('SELECT 1 FROM banned_discords WHERE discord_id = ?', [discord_id]);
+    if (isBanned) {
+      return res.status(403).json({ error: "This Discord account is permanently blacklisted." });
+    }
+
+    // Verify browser footprint exists on database
+    const device = await get('SELECT 1 FROM devices WHERE browser_id = ?', [browser_id]);
+    if (!device) {
+      return res.status(404).json({ error: "Device ID not recognized. Open NovelAI to register the client." });
+    }
+
+    // Atomically link discord context and approve device
+    await run(
+      'UPDATE devices SET approved = 1, priority_tier = ?, discord_id = ? WHERE browser_id = ?',
+      [priority_tier, discord_id, browser_id]
+    );
+    console.log(`[VPS Admin API] Linked Discord ID ${discord_id} to browser ${browser_id} (${priority_tier})`);
+    res.json({ success: true });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+/**
+ * @api {post} /admin/sync-tier Synchronize Discord User Tiers
+ * @apiGroup Admin
+ * @apiDescription Updates priority tiers for all approved devices matched to a specific Discord identity.
+ */
+app.post('/admin/sync-tier', verifyAdmin, async (req, res) => {
+  const { discord_id, priority_tier } = req.body;
+  if (!discord_id || !priority_tier) {
+    return res.status(400).json({ error: "Missing sync parameters." });
+  }
+
+  try {
+    const isBanned = await get('SELECT 1 FROM banned_discords WHERE discord_id = ?', [discord_id]);
+    if (isBanned) {
+      return res.status(403).json({ error: "This Discord account is blacklisted." });
+    }
+
+    await run(
+      'UPDATE devices SET approved = 1, priority_tier = ? WHERE discord_id = ?',
+      [priority_tier, discord_id]
+    );
+    console.log(`[VPS Admin API] Updated tiers for devices mapped to Discord ID ${discord_id} to ${priority_tier}`);
+    res.json({ success: true });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+/**
+ * @api {post} /admin/revoke-discord Revoke Discord Devices
+ * @apiGroup Admin
+ * @apiDescription Instantly deauthorizes every active browser footprint associated with a Discord ID.
+ */
+app.post('/admin/revoke-discord', verifyAdmin, async (req, res) => {
+  const { discord_id } = req.body;
+  if (!discord_id) {
+    return res.status(400).json({ error: "Missing discord_id parameter." });
+  }
+
+  try {
+    await run('UPDATE devices SET approved = 0 WHERE discord_id = ?', [discord_id]);
+    console.log(`[VPS Admin API] Deauthorized all devices registered to Discord ID ${discord_id}`);
+    res.json({ success: true });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
 });
 
 // Scavenger Loop (TTL Maintenance - Fixed O(N) Mutation Implementation)

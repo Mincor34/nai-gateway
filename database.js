@@ -23,7 +23,7 @@ const db = new sqlite3.Database(dbPath);
 const initDatabase = () => {
   return new Promise((resolve, reject) => {
     db.serialize(() => {
-      //  Initial Table Setup
+      // Initial Table Setup
       db.run(`CREATE TABLE IF NOT EXISTS devices (
         browser_id TEXT PRIMARY KEY,
         device_secret TEXT NOT NULL,
@@ -42,6 +42,15 @@ const initDatabase = () => {
       db.run(`CREATE TABLE IF NOT EXISTS config (
         key TEXT PRIMARY KEY,
         value TEXT NOT NULL
+      )`, (err) => { if (err) return reject(err); });
+
+      // Daily Session Tracker: Enforces the 6 x 30-minute daily constraints for Metered tiers
+      db.run(`CREATE TABLE IF NOT EXISTS device_sessions (
+        browser_id TEXT NOT NULL,
+        session_date TEXT NOT NULL,
+        session_count INTEGER NOT NULL DEFAULT 0,
+        last_session_at INTEGER NOT NULL,
+        PRIMARY KEY (browser_id, session_date)
       )`, (err) => { if (err) return reject(err); });
 
       // Schema Migration Check
