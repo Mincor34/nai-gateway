@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         NovelAI Split-Token Gateway Coordinator (Guest)
 // @namespace    http://tampermonkey.net/
-// @version      3.0.4.1
+// @version      3.1.4
 // @description  FIFO queue coordination, metadata spoofing, and background stream proxy pipeline
 // @author       Minco
 // @match        https://novelai.net/*
@@ -115,8 +115,7 @@
     }
 
     /**
-     * Renders the dynamic, sequential setup wizard. 
-     * Restricts inputs and validates steps asynchronously with adaptive mobile dimensions.
+     * Setup Wizard UI updated to explicitly instruct guests on Discord slash command usage.
      */
     function renderSetupWizard(container) {
         if (container.querySelector(".setup-wizard-card")) return;
@@ -253,11 +252,13 @@
 
         function showStep3() {
             step3Content.innerHTML = `
-                <p style="margin: 0 0 10px 0;">Your device is registered! Provide the Device ID below to your administrator for approval:</p>
-                <div style="background:#111; padding:10px; border-radius:4px; font-family:monospace; font-size:11px; word-break:break-all; border:1px solid #333; margin-bottom:10px; color:#f39c12; text-align:center;">
-                    ${browserId}
+                <p style="margin: 0 0 10px 0; font-weight: bold; color: #fff;">Register This Device Natively on Discord:</p>
+                <p style="margin: 0 0 10px 0; color: #bbb; line-height: 1.4;">Copy the Browser ID below, navigate to your server, and register using this command:</p>
+                <div style="background:#111; padding:10px; border-radius:4px; font-family:monospace; font-size:11px; word-break:break-all; border:1px solid #333; margin-bottom:10px; color:#f39c12; text-align:center; font-weight:bold;">
+                    /link browser_id:${browserId}
                 </div>
-                <p style="margin:0; color:#888; font-size:11px; text-align:center;">⏳ Polling administrator approval status...</p>
+                <p style="margin:0; color:#888; font-size:11px; text-align:center; animation: vpsFader 1.5s infinite alternate;">⏳ Polling approval status from Discord registration...</p>
+                <style>@keyframes vpsFader { 0% { opacity: 0.3; } 100% { opacity: 1; } }</style>
             `;
             // Verification short-polling loop
             const checkAuth = async () => {
@@ -321,25 +322,99 @@
         return; // Halt execution until gateway is resolved
     }
 
-    // ----------------- DYNAMIC SETTINGS GEAR MODAL -----------------
+    // ----------------- DYNAMIC SETTINGS GEAR MODAL (WITH PROGRESS RING) -----------------
     function injectGearButton() {
-        if (document.getElementById("vps-gear-btn")) return;
+        if (document.getElementById("vps-gear-container")) return;
+
+        const container = document.createElement("div");
+        container.id = "vps-gear-container";
+        container.style.cssText = "position:fixed; bottom:120px; right:15px; width:44px; height:44px; z-index:99999;";
+
         const gearBtn = document.createElement("button");
         gearBtn.id = "vps-gear-btn";
         gearBtn.innerHTML = "⚙️";
-        // Relocated to bottom: 120px to avoid colliding with bottom-right options on mobile
-        gearBtn.style.cssText = "position:fixed; bottom:120px; right:15px; width:44px; height:44px; background:#1a1a1a; border:1px solid #c0392b; border-radius:50%; color:#fff; font-size:22px; cursor:pointer; z-index:99999; display:flex; align-items:center; justify-content:center; box-shadow:0 4px 10px rgba(0,0,0,0.5); transition:transform 0.2s;";
+        gearBtn.style.cssText = "width:44px; height:44px; background:#1a1a1a; border:1px solid #c0392b; border-radius:50%; color:#fff; font-size:22px; cursor:pointer; display:flex; align-items:center; justify-content:center; box-shadow:0 4px 10px rgba(0,0,0,0.5); transition:transform 0.2s; position:relative; z-index:2;";
         gearBtn.onclick = openSettingsModal;
-        
+
+        const svgRing = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+        svgRing.id = "vps-progress-svg";
+        svgRing.setAttribute("width", "52");
+        svgRing.setAttribute("height", "52");
+        svgRing.style.cssText = "position:absolute; top:-4px; left:-4px; z-index:1; pointer-events:none; display:none;";
+
+        const circle = document.createElementNS("http://www.w3.org/2000/svg", "circle");
+        circle.id = "vps-ring-circle";
+        circle.setAttribute("stroke", "#e74c3c");
+        circle.setAttribute("stroke-width", "3");
+        circle.setAttribute("fill", "transparent");
+        circle.setAttribute("r", "23");
+        circle.setAttribute("cx", "26");
+        circle.setAttribute("cy", "26");
+        circle.style.cssText = "transition: stroke-dashoffset 0.35s; transform: rotate(-90deg); transform-origin: 50% 50%;";
+
+        svgRing.appendChild(circle);
+        container.appendChild(gearBtn);
+        container.appendChild(svgRing);
+
         const banner = document.getElementById("vps-queue-banner");
         if (banner) {
             banner.style.bottom = "175px"; // Adjust banner to sit stacked cleanly above the gear
             banner.style.right = "15px";
         }
-        document.documentElement.appendChild(gearBtn);
+        document.documentElement.appendChild(container);
         if (GM_getValue("debug_mode", false)) {
             injectWarningBadge();
         }
+
+        startStatePolling();
+    }
+
+    function updateProgressRing(percent, color, visible = true) {
+        const svg = document.getElementById("vps-progress-svg");
+        const circle = document.getElementById("vps-ring-circle");
+        if (!svg || !circle) return;
+
+        if (!visible) {
+            svg.style.display = "none";
+            return;
+        }
+
+        svg.style.display = "block";
+        const radius = 23;
+        const circumference = 2 * Math.PI * radius; // Circumference is approx 144.5
+        circle.style.strokeDasharray = `${circumference} ${circumference}`;
+        const offset = circumference - (percent / 100) * circumference;
+        circle.style.strokeDashoffset = offset;
+        circle.style.stroke = color;
+    }
+
+    function startStatePolling() {
+        const poll = async () => {
+            try {
+                const res = await backgroundRequest({
+                    method: "GET",
+                    url: `${VPS_HOST}/auth/status?browser_id=${browserId}`,
+                    headers: { "Authorization": `Bearer ${deviceSecret}` }
+                });
+                if (res.status === 200) {
+                    const data = JSON.parse(res.responseText);
+                    if (data.session) {
+                        if (data.session.active) {
+                            const percent = (data.session.time_remaining / (30 * 60 * 1000)) * 100;
+                            updateProgressRing(percent, "#2ecc71", true);
+                        } else {
+                            updateProgressRing(100, "#e74c3c", true);
+                        }
+                    } else {
+                        updateProgressRing(0, "transparent", false);
+                    }
+                }
+            } catch (e) {
+                console.error("Nai-Guest: Failed to poll session state", e);
+            }
+        };
+        setInterval(poll, 10000);
+        poll();
     }
 
     function injectWarningBadge() {
@@ -373,7 +448,7 @@
 
         modal = document.createElement("div");
         modal.id = "vps-settings-modal";
-        modal.style.cssText = "position:fixed; top:50%; left:50%; transform:translate(-50%, -50%); width:90vw; max-width:400px; background:#1c1c1c; border:1px solid #c0392b; border-radius:6px; z-index:99999; color:#fff; padding:20px; font-family:sans-serif; box-shadow:0 10px 40px rgba(0,0,0,0.6); max-height:90vh; overflow-y:auto;";
+        modal.style.cssText = "position:fixed; top:50%; left:50%; transform:translate(-50%, -50%); width:90vw; max-width:420px; background:#1c1c1c; border:1px solid #c0392b; border-radius:6px; z-index:99999; color:#fff; padding:25px; font-family:sans-serif; box-shadow:0 10px 40px rgba(0,0,0,0.6); max-height:90vh; overflow-y:auto; box-sizing:border-box;";
         
         const nickname = GM_getValue("device_nickname", "Guest");
         const domain = GM_getValue("vps_host", "");
@@ -382,6 +457,13 @@
         const textCount = GM_getValue("count_text_gens", 0);
         
         let tier = "Loading...";
+        let anlasConsumed = 0;
+        let preciseLimit = 0;
+        let sessionStatus = "Loading...";
+        let linkedDevicesList = '';
+        let showStartSessionBtn = false;
+        let sessionsLeft = 0;
+
         try {
             const res = await backgroundRequest({
                 method: "GET",
@@ -391,18 +473,59 @@
             if (res.status === 200) {
                 const data = JSON.parse(res.responseText);
                 tier = data.tier || "Normal";
+                anlasConsumed = data.anlas_consumed || 0;
+                preciseLimit = data.precise_limit ?? 0;
+                
+                if (data.session) {
+                    sessionsLeft = data.session.remaining;
+                    if (data.session.active) {
+                        const mins = (data.session.time_remaining / 1000 / 60).toFixed(1);
+                        sessionStatus = `<span style="color:#2ecc71; font-weight:bold;">Active Window (${mins}m left)</span> | ${data.session.remaining} sessions remaining`;
+                    } else {
+                        sessionStatus = `<span style="color:#e74c3c; font-weight:bold;">Expired / Idle</span> | ${data.session.remaining} sessions remaining`;
+                        if (data.session.remaining > 0) showStartSessionBtn = true;
+                    }
+                } else {
+                    sessionStatus = `<span style="color:#00bc8c; font-weight:bold;">Exempt (Unlimited)</span>`;
+                }
+
+                if (data.linked_devices && data.linked_devices.length > 0) {
+                    linkedDevicesList = data.linked_devices.map(d => `- \`${d.id.substring(0, 10)}...\` (${d.label})`).join('<br>');
+                } else {
+                    linkedDevicesList = 'No other active links.';
+                }
             } else {
                 tier = "Unknown";
+                sessionStatus = "Error loading";
             }
         } catch (e) {
             tier = "Error fetching";
+            sessionStatus = "Network error";
         }
 
         modal.innerHTML = `
-            <h4 style="margin:0 0 15px 0; color:#00bc8c; border-bottom:1px solid #333; padding-bottom:8px; font-size:16px;">GATEWAY SETTINGS</h4>
+            <h4 style="margin:0 0 15px 0; color:#00bc8c; border-bottom:1px solid #333; padding-bottom:8px; font-size:16px; letter-spacing:0.5px;">VPS GATEWAY CONTROL PORTAL</h4>
             
+            <div style="background:#111; padding:15px; border-radius:4px; margin-bottom:15px; border:1px solid #333; font-size:12px; line-height:1.6;">
+                <label style="display:block; font-size:10px; color:#888; font-weight:bold; margin-bottom:6px; text-transform:uppercase; letter-spacing:0.5px;">Telemetry Stats & Profile</label>
+                <div style="display:grid; grid-template-columns:1fr 1fr; gap:10px; margin-bottom:10px;">
+                    <div>Assigned Tier: <span style="color:#00bc8c; font-weight:bold;">${tier}</span></div>
+                    <div>Precise Ref Limit: <span style="color:#f39c12; font-weight:bold;">${preciseLimit} Refs</span></div>
+                    <div>Anlas Consumed: <span style="color:#e74c3c; font-weight:bold;">${anlasConsumed} Anlas</span></div>
+                    <div>Daily Sessions: <span style="font-weight:bold;">${sessionStatus}</span></div>
+                    <div>Image Gens: <span style="font-weight:bold;">${imageCount}</span></div>
+                    <div>Text Gens: <span style="font-weight:bold;">${textCount}</span></div>
+                </div>
+
+                ${showStartSessionBtn ? `
+                    <button id="btn-portal-start-session" style="background:#2ecc71; border:none; color:#111; font-weight:bold; font-size:11px; padding:8px 12px; border-radius:3px; cursor:pointer; width:100%; text-transform:uppercase; margin-top:5px; box-shadow:0 2px 6px rgba(46,204,113,0.3);">
+                        Start 30-Minute Generation Session (${sessionsLeft} Left)
+                    </button>
+                ` : ''}
+            </div>
+
             <div style="margin-bottom:15px;">
-                <label style="display:block; font-size:11px; color:#aaa; margin-bottom:5px;">NICKNAME</label>
+                <label style="display:block; font-size:11px; color:#aaa; margin-bottom:5px; font-weight:bold;">NICKNAME</label>
                 <div style="display:flex; gap:10px;">
                     <input type="text" id="settings-nickname" value="${nickname}" style="flex:1; background:#111; border:1px solid #444; color:#fff; padding:6px; font-size:12px; border-radius:3px;">
                     <button id="btn-save-nickname" style="background:#27ae60; border:none; color:#fff; padding:6px 12px; font-size:11px; font-weight:bold; cursor:pointer; border-radius:3px;">Save</button>
@@ -411,31 +534,28 @@
             </div>
 
             <div style="margin-bottom:15px;">
-                <label style="display:block; font-size:11px; color:#aaa; margin-bottom:5px;">VPS DOMAIN</label>
+                <label style="display:block; font-size:11px; color:#aaa; margin-bottom:5px; font-weight:bold;">VPS GATEWAY DOMAIN</label>
                 <div style="display:flex; gap:10px;">
                     <input type="text" id="settings-domain" value="${domain}" style="flex:1; background:#111; border:1px solid #444; color:#fff; padding:6px; font-size:12px; border-radius:3px;">
                     <button id="btn-save-domain" style="background:#2980b9; border:none; color:#fff; padding:6px 12px; font-size:11px; font-weight:bold; cursor:pointer; border-radius:3px; white-space:nowrap;">Save & Reset</button>
                 </div>
             </div>
 
-            <div style="background:#111; padding:12px; border-radius:4px; margin-bottom:15px; border:1px solid #333;">
-                <label style="display:block; font-size:10px; color:#888; font-weight:bold; margin-bottom:6px; text-transform:uppercase;">Usage Stats & Information</label>
-                <div style="display:grid; grid-template-columns:1fr 1fr; gap:8px; font-size:12px;">
-                    <div>Tier: <span style="color:#00bc8c; font-weight:bold;">${tier}</span></div>
-                    <div>Anlas Spent: <span style="color:#f39c12; font-weight:bold;">0 Anlas</span></div>
-                    <div>Image Gens: <span style="font-weight:bold;">${imageCount}</span></div>
-                    <div>Text Gens: <span style="font-weight:bold;">${textCount}</span></div>
+            <div style="background:#111; padding:12px; border-radius:4px; margin-bottom:15px; border:1px solid #333; font-size:11px;">
+                <label style="display:block; font-size:10px; color:#888; font-weight:bold; margin-bottom:6px; text-transform:uppercase;">Hardware Footprints Linked (Max 3)</label>
+                <div style="color:#ccc; font-family:monospace; line-height:1.4;">
+                    ${linkedDevicesList}
                 </div>
-                <div style="font-size:10px; color:#666; margin-top:6px; text-align:center;">All generations are within free Opus limits.</div>
+                <div style="font-size:10px; color:#666; margin-top:6px;">Prune unneeded profiles natively inside Discord using \`/mygateway unlink\`.</div>
             </div>
 
-            <div style="border-top:1px solid #333; padding-top:12px; margin-top:12px;">
+            <div style="border-top:1px solid #333; padding-top:12px; margin-top:12px; font-size:11px;">
                 <label style="display:flex; align-items:center; gap:8px; font-size:12px; cursor:pointer; font-weight:bold; color:#f39c12;">
                     <input type="checkbox" id="settings-debug" ${debugActive ? 'checked' : ''} style="cursor:pointer;">
-                    ENABLE DEBUG MODE
+                    ENABLE DIAGNOSTIC PROMPT DEBUGGING
                 </label>
-                <div id="debug-consent" style="font-size:11px; color:#999; margin-top:6px; line-height:1.4; background:#222; padding:8px; border-radius:4px; border-left:2px solid #f39c12;">
-                    <strong>Consent Form:</strong> Enabling Debug Mode will log full API request payloads (including prompt texts and image inputs such as image-to-image, vibe transfer, and precise reference) to the VPS log telemetry. Your NovelAI authorization token and personal account credentials will <strong>NOT</strong> be logged.
+                <div id="debug-consent" style="color:#999; margin-top:6px; line-height:1.4; background:#222; padding:8px; border-radius:4px; border-left:2px solid #f39c12; font-size:10px;">
+                    <strong>Privacy transparency:</strong> Enabling debugging uploads raw generation payloads to gateway logs for performance troubleshooting. Text prompt contexts, settings, and resolutions will be saved on the VPS. Personal tokens and encrypted databases remain strictly isolated.
                 </div>
             </div>
         `;
@@ -448,6 +568,27 @@
         const domInput = modal.querySelector("#settings-domain");
         const saveDomBtn = modal.querySelector("#btn-save-domain");
         const debugCheckbox = modal.querySelector("#settings-debug");
+        const startSessionBtn = modal.querySelector("#btn-portal-start-session");
+
+        if (startSessionBtn) {
+            startSessionBtn.onclick = async () => {
+                startSessionBtn.disabled = true;
+                startSessionBtn.innerHTML = "Initializing connection...";
+                try {
+                    const result = await triggerStartSession();
+                    if (result.success) {
+                        modal.remove();
+                        backdrop.remove();
+                        openSettingsModal(); // Reload dynamically
+                    } else {
+                        startSessionBtn.innerHTML = `Rejection: ${result.error}`;
+                        setTimeout(() => { startSessionBtn.disabled = false; startSessionBtn.innerHTML = "Retry Session Start"; }, 2000);
+                    }
+                } catch (e) {
+                    startSessionBtn.innerHTML = "Execution Error.";
+                }
+            };
+        }
 
         saveNickBtn.onclick = async () => {
             const nickname = nickInput.value.trim();
@@ -562,6 +703,32 @@
         return result;
     }
 
+    async function triggerStartSession() {
+        try {
+            const res = await backgroundRequest({
+                method: "POST",
+                url: `${VPS_HOST}/queue/start-session`,
+                headers: { 
+                    "Content-Type": "application/json", 
+                    "Authorization": `Bearer ${deviceSecret}` 
+                },
+                data: JSON.stringify({ browser_id: browserId })
+            });
+
+            if (res.status === 200) {
+                return { success: true };
+            } else {
+                let errData = {};
+                try {
+                    errData = JSON.parse(res.responseText);
+                } catch (e) {}
+                return { success: false, error: errData.error || `HTTP ${res.status}` };
+            }
+        } catch (e) {
+            return { success: false, error: "Network transport exception." };
+        }
+    }
+
     async function tryResolveProxyResponse(responseDetails, resolveObj, isImageGen, isTextGen) {
         const status = extractStatusCode(responseDetails);
         if (status === 0) {
@@ -570,10 +737,10 @@
 
         if (status === 200) {
             if (!responseDetails.response) {
-                console.error("[Nai-Guest] Telemetry: Success code detected, but readable response stream was empty.");
+                console.error("[VPS Gateway] Telemetry: Success code detected, but readable response stream was empty.");
                 return false; // Wait for response body context to bind
             }
-            console.log("[Nai-Guest] Telemetry: Stream successfully acquired. Piping stream response directly to web page fetch promise.");
+            console.log("[VPS Gateway] Telemetry: Stream successfully acquired. Piping stream response directly to fetch promise.");
             
             // Increment telemetry variables on validation success
             if (isImageGen) {
@@ -588,21 +755,33 @@
             }));
             return true;
         } else {
-            console.error(`[Nai-Guest] Telemetry: Proxy returned exception status code: ${status}`);
+            // For error responses, defer resolution until the request has fully completed (readyState 4)
+            // so we can read the fully buffered error body.
+            if (responseDetails.readyState !== 4 && responseDetails.readyState !== undefined) {
+                return false;
+            }
 
-            // Self-Healing Hook: Forcefully wipe the approved flag, silently re-register, and reload on 401
+            console.error("[VPS Gateway] Telemetry: Proxy returned exception status code:", status);
+
+            // Self-Healing Hook for Admin/Guest
             if (status === 401) {
-                console.warn("[Nai-Guest] Revocation signature caught. Restoring setup lock and silently re-registering.");
+                console.warn("[VPS Gateway] Revocation signature caught. Restoring setup lock.");
                 GM_setValue("approved", false);
-                const nickname = GM_getValue("device_nickname", "Guest");
-                backgroundRequest({
-                    method: "POST",
-                    url: `${VPS_HOST}/auth/register`,
-                    headers: { "Content-Type": "application/json" },
-                    data: JSON.stringify({ browser_id: browserId, device_secret: deviceSecret, label: nickname })
-                }).finally(() => {
-                    window.location.reload();
-                });
+                if (typeof browserId !== 'undefined' && typeof deviceSecret !== 'undefined') {
+                    // Guest self-healing
+                    const nickname = GM_getValue("device_nickname", "Guest");
+                    backgroundRequest({
+                        method: "POST",
+                        url: `${VPS_HOST}/auth/register`,
+                        headers: { "Content-Type": "application/json" },
+                        data: JSON.stringify({ browser_id: browserId, device_secret: deviceSecret, label: nickname })
+                    }).finally(() => {
+                        window.location.reload();
+                    });
+                } else {
+                    // Admin self-healing
+                    setTimeout(() => window.location.reload(), 500);
+                }
                 return true;
             }
 
@@ -615,11 +794,15 @@
                         errorText = responseDetails.response;
                     }
                 }
+                // Fallback to text representation if stream parsing yielded nothing
+                if (!errorText && responseDetails.responseText) {
+                    errorText = responseDetails.responseText;
+                }
             } catch (e) {
-                console.error("[Nai-Guest] Error: Failed to extract string from raw exception stream:", e);
+                console.error("[VPS Gateway] Error: Failed to extract string from raw exception stream:", e);
             }
 
-            console.log(`[Nai-Guest] Telemetry: Received raw error text: "${errorText}"`);
+            console.log(`[VPS Gateway] Telemetry: Received raw error text: "${errorText}"`);
 
             // Standardize raw anomalies into correct structured exception parameters for SPA parsing
             let parsedError = null;
@@ -645,6 +828,11 @@
         }
     }
 
+    /**
+     * Extracts and validates parameters from incoming client payloads.
+     * Isolates precise character reference arrays (character_reference) to 
+     * accurately compute 5 Anlas per-generation billing metrics.
+     */
     async function extractImageParams(body) {
         if (!body) return null;
         try {
@@ -660,16 +848,25 @@
                 payload = JSON.parse(body);
             }
 
-            if (payload && payload.parameters) {
+            if (payload) {
+                const params = payload.parameters || payload || {};
+                
+                // Aggregates legacy and modern NAI reference structures to secure client-side checks
+                const preciseRefs = 
+                    (Array.isArray(params.director_reference_images_cached) ? params.director_reference_images_cached.length : 0) +
+                    (Array.isArray(params.director_reference_images) ? params.director_reference_images.length : 0) +
+                    (Array.isArray(params.reference_image_multiple) ? params.reference_image_multiple.length : 0);
+
                 return {
-                    width: parseInt(payload.parameters.width, 10) || 1024,
-                    height: parseInt(payload.parameters.height, 10) || 1024,
-                    steps: parseInt(payload.parameters.steps, 10) || 28,
-                    n_samples: parseInt(payload.parameters.n_samples, 10) || 1
+                    width: parseInt(params.width || payload.width, 10) || 1024,
+                    height: parseInt(params.height || payload.height, 10) || 1024,
+                    steps: parseInt(params.steps || payload.steps, 10) || 28,
+                    n_samples: parseInt(params.n_samples || payload.n_samples, 10) || 1,
+                    precise_refs: preciseRefs
                 };
             }
         } catch (e) {
-            console.error("Nai-Guest: Parameter extraction failed:", e);
+            console.error("Parameter extraction failed:", e);
         }
         return null;
     }
@@ -692,6 +889,54 @@
         if (banner) banner.remove();
     }
 
+    /**
+     * Session Required Interactive Banner.
+     * Prevents passive drainage by forcing metered users to explicitly verify and allocate windows.
+     */
+    function showStartSessionBanner(remainingCount, onStartCallback) {
+        let banner = document.getElementById("vps-session-prompt-banner");
+        if (!banner) {
+            banner = document.createElement("div");
+            banner.id = "vps-session-prompt-banner";
+            banner.style = "position:fixed; bottom:175px; right:15px; background:#1b1b1b; color:#fff; padding:15px 20px; border:2px solid #e74c3c; border-radius:6px; z-index:99998; font-family:sans-serif; font-size:13px; box-shadow:0 6px 20px rgba(0,0,0,0.5); display:flex; flex-direction:column; gap:10px; width:300px; box-sizing:border-box;";
+            document.documentElement.appendChild(banner);
+        }
+
+        banner.innerHTML = `
+            <div style="font-weight:bold; color:#e74c3c; display:flex; align-items:center; gap:8px;">
+                <span style="font-size:16px;">⚠️</span> SESSION EXPIRED
+            </div>
+            <div style="color:#ddd; line-height:1.4; font-size:11px;">
+                An active generation session is required to continue. Starting a new session will consume <b>1</b> of your daily 30-minute allocations.
+            </div>
+            <div style="font-weight:bold; color:#f39c12; font-size:11px;">
+                Daily Sessions Remaining: ${remainingCount} Left
+            </div>
+            <button id="btn-banner-start-session" style="background:#2ecc71; border:none; color:#111; font-weight:bold; padding:8px 12px; border-radius:3px; cursor:pointer; font-size:11px; text-transform:uppercase; box-shadow:0 2px 8px rgba(46,204,113,0.3);">
+                Start 30-Minute Session
+            </button>
+        `;
+
+        const startBtn = banner.querySelector("#btn-banner-start-session");
+        startBtn.onclick = async () => {
+            startBtn.disabled = true;
+            startBtn.innerHTML = "Processing allocation...";
+            const result = await triggerStartSession();
+            if (result.success) {
+                banner.remove();
+                onStartCallback(); // Transparently trigger target queue join
+            } else {
+                startBtn.innerHTML = `Error: ${result.error}`;
+                setTimeout(() => { startBtn.disabled = false; startBtn.innerHTML = "Retry Session Start"; }, 2500);
+            }
+        };
+    }
+
+    function hideSessionPromptBanner() {
+        const banner = document.getElementById("vps-session-prompt-banner");
+        if (banner) banner.remove();
+    }
+
     async function handleGenerationIntercept(url, config) {
         const req_id = 'req_' + generateUUID();
         const tab_id = sessionStorage.getItem("vps_tab_id") || (() => {
@@ -706,165 +951,195 @@
         const extracted = await extractImageParams(originalBody);
         if (extracted) imgParams = extracted;
 
-        try {
-            const joinRes = await backgroundRequest({
-                method: "POST",
-                url: `${VPS_HOST}/queue/join`,
-                headers: {
-                    "Content-Type": "application/json",
-                    "Authorization": `Bearer ${deviceSecret}`
-                },
-                data: JSON.stringify({ browser_id: browserId, tab_id, req_id })
-            });
-            if (joinRes.status === 401) {
-                console.warn("Nai-Guest: Server returned 401 on queue join. Re-registering silently...");
-                GM_setValue("approved", false);
-                const nickname = GM_getValue("device_nickname", "Guest");
-                backgroundRequest({
-                    method: "POST",
-                    url: `${VPS_HOST}/auth/register`,
-                    headers: { "Content-Type": "application/json" },
-                    data: JSON.stringify({ browser_id: browserId, device_secret: deviceSecret, label: nickname })
-                }).finally(() => {
-                    window.location.reload();
-                });
-                return new Response(JSON.stringify({ statusCode: 401, message: "Device revoked." }), { status: 401 });
-            }
-            if (joinRes.status !== 200) throw new Error("Join rejection");
-        } catch (e) {
-            return new Response(JSON.stringify({ statusCode: 502, message: "Queue allocation failure" }), { status: 502 });
-        }
-
-        let turnAcquired = false;
-        showQueueStatusBanner("Acquiring channel slot...");
-
-        while (!turnAcquired) {
-            // Reduced to 1000ms to completely eliminate dead-time gaps between generations
-            await new Promise(r => setTimeout(r, 1000));
+        const executeQueueJoin = async () => {
             try {
-                const statusRes = await backgroundRequest({
-                    method: "GET",
-                    url: `${VPS_HOST}/queue/status?req_id=${req_id}`
-                });
-                if (statusRes.status === 200) {
-                    const sData = JSON.parse(statusRes.responseText);
-                    if (sData.status === 'your_turn') {
-                        turnAcquired = true;
-                        hideQueueStatusBanner();
-                    } else if (sData.status === 'waiting') {
-                        showQueueStatusBanner(`Queue Position: ${sData.position}`);
-                    }
-                } else {
-                    throw new Error("Expired state");
-                }
-            } catch (e) {
-                hideQueueStatusBanner();
-                backgroundRequest({
+                const joinRes = await backgroundRequest({
                     method: "POST",
-                    url: `${VPS_HOST}/queue/complete`,
-                    headers: { "Content-Type": "application/json" },
-                    data: JSON.stringify({ req_id })
+                    url: `${VPS_HOST}/queue/join`,
+                    headers: {
+                        "Content-Type": "application/json",
+                        "Authorization": `Bearer ${deviceSecret}`
+                    },
+                    data: JSON.stringify({ browser_id: browserId, tab_id, req_id })
                 });
-                return new Response(JSON.stringify({ statusCode: 502, message: "Queue processing aborted" }), { status: 502 });
-            }
-        }
 
-        const originalUrlObj = new URL(url);
-        // Extract subdomain dynamically (e.g., 'image' or 'text' or 'api') to support flexible routing across multiple NovelAI subdomains.
-        const subdomain = originalUrlObj.hostname.split('.')[0];
-        const proxyUrl = `${VPS_HOST}/proxy/${subdomain}${originalUrlObj.pathname}${originalUrlObj.search}`;
-
-        const updatedHeaders = new Map();
-        if (config.headers) {
-            if (config.headers instanceof Headers) {
-                for (let [k, v] of config.headers.entries()) {
-                    updatedHeaders.set(k.toLowerCase(), v);
+                if (joinRes.status === 401) {
+                    console.warn("Nai-Guest: Server returned 401 on queue join. Re-registering silently...");
+                    GM_setValue("approved", false);
+                    const nickname = GM_getValue("device_nickname", "Guest");
+                    backgroundRequest({
+                        method: "POST",
+                        url: `${VPS_HOST}/auth/register`,
+                        headers: { "Content-Type": "application/json" },
+                        data: JSON.stringify({ browser_id: browserId, device_secret: deviceSecret, label: nickname })
+                    }).finally(() => {
+                        window.location.reload();
+                    });
+                    return new Response(JSON.stringify({ statusCode: 401, message: "Device revoked." }), { status: 401 });
                 }
-            } else {
-                Object.keys(config.headers).forEach(k => {
-                    updatedHeaders.set(k.toLowerCase(), config.headers[k]);
-                });
+
+                if (joinRes.status === 403) {
+                    let errorDetails = {};
+                    try {
+                        errorDetails = JSON.parse(joinRes.responseText);
+                    } catch (e) {
+                        console.error("Nai-Guest: Failed to parse error response text safely", e);
+                    }
+
+                    if (errorDetails.error === 'SESSION_REQUIRED') {
+                        // Interactive Session Guard Intercepted: Display manual prompt banner
+                        hideQueueStatusBanner();
+                        showStartSessionBanner(errorDetails.remaining, () => { //TODO: Parsing and passing the remaining count from an error message is a Rube Goldberg approach.
+                            // Recursively execute queue joining when session is explicitly approved
+                            handleGenerationIntercept(url, config).then(resolveOuter, rejectOuter);
+                        });
+                        return new Promise(() => {}); // Defer outer Promise permanently; handled by recurse branch
+                    }
+                }
+
+                if (joinRes.status !== 200) throw new Error("Join rejection");
+            } catch (e) {
+                return new Response(JSON.stringify({ statusCode: 502, message: "Queue allocation failure" }), { status: 502 });
             }
-        }
 
-        updatedHeaders.set("x-browser-id", browserId);
-        updatedHeaders.set("x-request-id", req_id);
-        updatedHeaders.set("x-gen-width", imgParams.width.toString());
-        updatedHeaders.set("x-gen-height", imgParams.height.toString());
-        updatedHeaders.set("x-gen-steps", imgParams.steps.toString());
-        updatedHeaders.set("x-gen-samples", imgParams.n_samples.toString());
-        updatedHeaders.set("authorization", `Bearer ${deviceSecret}`);
-        updatedHeaders.set("x-script-version", GM_info.script.version); // Dyn Version Injection
-        if (GM_getValue("debug_mode", false)) {
-            updatedHeaders.set("x-debug-mode", "true");
-            console.log(`[VPS Debug Mode] Outbound image generation details:`, originalBody);
-        }
+            let turnAcquired = false;
+            showQueueStatusBanner("Acquiring channel slot...");
 
-        updatedHeaders.delete("host");
-        updatedHeaders.delete("content-length"); // Prevent boundary mismatches from desynchronizing streams
-
-        if (originalBody instanceof FormData) {
-            updatedHeaders.delete("content-type");
-        }
-
-        let hasResolved = false;
-        console.log(`[Nai-Guest] Intercepting fetch targeting VPS rewrite URL: ${proxyUrl}`);
-
-        return new Promise((resolve, reject) => {
-            GM_xmlhttpRequest({
-                method: config.method || "POST",
-                url: proxyUrl,
-                headers: Object.fromEntries(updatedHeaders.entries()),
-                data: originalBody,
-                responseType: "stream",
-                onloadstart: async function(responseDetails) {
-                    console.log(`[Nai-Guest] Telemetry: onloadstart fired. ReadyState: ${responseDetails.readyState}, Status: ${extractStatusCode(responseDetails)}`);
-                    if (hasResolved) return;
-                    // Resolve immediately on stream header initiation to preserve live piping features.
-                    if (await tryResolveProxyResponse(responseDetails, resolve, true, false)) {
-                        hasResolved = true;
-                    }
-                },
-                onreadystatechange: async function(responseDetails) {
-                    console.log(`[Nai-Guest] Telemetry: onreadystatechange fired. ReadyState: ${responseDetails.readyState}, ExtractedStatus: ${extractStatusCode(responseDetails)}`);
-                    if (hasResolved) return;
-                    // Fallback evaluation for legacy engines
-                    if (responseDetails.readyState >= 2) {
-                        if (await tryResolveProxyResponse(responseDetails, resolve, true, false)) {
-                            hasResolved = true;
+            while (!turnAcquired) {
+                // Reduced to 1000ms to completely eliminate dead-time gaps between generations
+                await new Promise(r => setTimeout(r, 1000));
+                try {
+                    const statusRes = await backgroundRequest({
+                        method: "GET",
+                        url: `${VPS_HOST}/queue/status?req_id=${req_id}`
+                    });
+                    if (statusRes.status === 200) {
+                        const sData = JSON.parse(statusRes.responseText);
+                        if (sData.status === 'your_turn') {
+                            turnAcquired = true;
+                            hideQueueStatusBanner();
+                        } else if (sData.status === 'waiting') {
+                            showQueueStatusBanner(`Queue Position: ${sData.position}`);
                         }
+                    } else {
+                        throw new Error("Expired state");
                     }
-                },
-                onload: async function(responseDetails) {
-                    console.log(`[Nai-Guest] Telemetry: onload fired. Status: ${extractStatusCode(responseDetails)}. Socket download complete.`);
-                    if (hasResolved) return;
-                    if (await tryResolveProxyResponse(responseDetails, resolve, true, false)) {
-                        hasResolved = true;
-                    }
-                },
-                onerror: (err) => {
-                    console.error("[Nai-Guest] Telemetry: Fatal network transport crash during GM_xmlhttpRequest transmission.", err);
-
+                } catch (e) {
+                    hideQueueStatusBanner();
                     backgroundRequest({
                         method: "POST",
                         url: `${VPS_HOST}/queue/complete`,
                         headers: { "Content-Type": "application/json" },
                         data: JSON.stringify({ req_id })
                     });
-
-                    if (!hasResolved) {
-                        hasResolved = true;
-                        reject(err);
-                    }
+                    return new Response(JSON.stringify({ statusCode: 502, message: "Queue processing aborted" }), { status: 502 });
                 }
+            }
+
+            const originalUrlObj = new URL(url);
+            // Extract subdomain dynamically (e.g., 'image' or 'text' or 'api') to support flexible routing across multiple NovelAI subdomains.
+            const subdomain = originalUrlObj.hostname.split('.')[0];
+            const proxyUrl = `${VPS_HOST}/proxy/${subdomain}${originalUrlObj.pathname}${originalUrlObj.search}`;
+
+            const updatedHeaders = new Map();
+            if (config.headers) {
+                if (config.headers instanceof Headers) {
+                    for (let [k, v] of config.headers.entries()) {
+                        updatedHeaders.set(k.toLowerCase(), v);
+                    }
+                } else {
+                    Object.keys(config.headers).forEach(k => {
+                        updatedHeaders.set(k.toLowerCase(), config.headers[k]);
+                    });
+                }
+            }
+
+            updatedHeaders.set("x-browser-id", browserId);
+            updatedHeaders.set("x-request-id", req_id);
+            updatedHeaders.set("x-gen-width", imgParams.width.toString());
+            updatedHeaders.set("x-gen-height", imgParams.height.toString());
+            updatedHeaders.set("x-gen-steps", imgParams.steps.toString());
+            updatedHeaders.set("x-gen-samples", imgParams.n_samples.toString());
+            updatedHeaders.set("x-precise-refs", imgParams.precise_refs.toString());
+            updatedHeaders.set("authorization", `Bearer ${deviceSecret}`);
+            updatedHeaders.set("x-script-version", GM_info.script.version); // Dyn Version Injection
+            if (GM_getValue("debug_mode", false)) {
+                updatedHeaders.set("x-debug-mode", "true");
+                console.log(`[VPS Debug Mode] Outbound image generation details:`, originalBody);
+            }
+
+            updatedHeaders.delete("host");
+            updatedHeaders.delete("content-length"); // Prevent boundary mismatches from desynchronizing streams
+
+            if (originalBody instanceof FormData) {
+                updatedHeaders.delete("content-type");
+            }
+
+            let hasResolved = false;
+            console.log(`[Nai-Guest] Intercepting fetch targeting VPS rewrite URL: ${proxyUrl}`);
+
+            return new Promise((resolve, reject) => {
+                GM_xmlhttpRequest({
+                    method: config.method || "POST",
+                    url: proxyUrl,
+                    headers: Object.fromEntries(updatedHeaders.entries()),
+                    data: originalBody,
+                    responseType: "stream",
+                    onloadstart: async function(responseDetails) {
+                        console.log(`[Nai-Guest] Telemetry: onloadstart fired. ReadyState: ${responseDetails.readyState}, Status: ${extractStatusCode(responseDetails)}`);
+                        if (hasResolved) return;
+                        // Resolve immediately on stream header initiation to preserve live piping features.
+                        if (await tryResolveProxyResponse(responseDetails, resolve, true, false)) {
+                            hasResolved = true;
+                        }
+                    },
+                    onreadystatechange: async function(responseDetails) {
+                        console.log(`[Nai-Guest] Telemetry: onreadystatechange fired. ReadyState: ${responseDetails.readyState}, ExtractedStatus: ${extractStatusCode(responseDetails)}`);
+                        if (hasResolved) return;
+                        // Fallback evaluation for legacy engines
+                        if (responseDetails.readyState >= 2) {
+                            if (await tryResolveProxyResponse(responseDetails, resolve, true, false)) {
+                                            hasResolved = true;
+                            }
+                        }
+                    },
+                    onload: async function(responseDetails) {
+                        console.log(`[Nai-Guest] Telemetry: onload fired. Status: ${extractStatusCode(responseDetails)}. Socket download complete.`);
+                        if (hasResolved) return;
+                        if (await tryResolveProxyResponse(responseDetails, resolve, true, false)) {
+                            hasResolved = true;
+                        }
+                    },
+                    onerror: (err) => {
+                        console.error("[Nai-Guest] Telemetry: Fatal network transport crash during GM_xmlhttpRequest transmission.", err);
+
+                        backgroundRequest({
+                            method: "POST",
+                            url: `${VPS_HOST}/queue/complete`,
+                            headers: { "Content-Type": "application/json" },
+                            data: JSON.stringify({ req_id })
+                        });
+
+                        if (!hasResolved) {
+                            hasResolved = true;
+                            reject(err);
+                        }
+                    }
+                });
             });
+        };
+
+        // Leverage outer scoping references to handle clean recursion parameters
+        let resolveOuter, rejectOuter;
+        const outerPromise = new Promise((res, rej) => {
+            resolveOuter = res;
+            rejectOuter = rej;
         });
+
+        executeQueueJoin().then(resolveOuter, rejectOuter);
+        return outerPromise;
     }
 
-    /**
-     * Intercepts and routes text generation requests directly to the VPS 
-     * bypassing the heavy FIFO image generation channel lock (Channel B).
-     */
     async function handleTextGenerationIntercept(url, config) {
         const originalUrlObj = new URL(url);
         // Extract subdomain dynamically (e.g., 'image' or 'text' or 'api') to support flexible routing across multiple NovelAI subdomains.

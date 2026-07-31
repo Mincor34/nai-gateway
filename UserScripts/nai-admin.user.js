@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         NovelAI Split-Token Gateway Coordinator (Admin Panel)
 // @namespace    http://tampermonkey.net/
-// @version      3.0.4.1
+// @version      3.1.4
 // @description  Secure administration panel and session token injector
 // @author       Minco
 // @match        https://novelai.net/*
@@ -338,7 +338,7 @@
             </div>
 
             <div>
-                <label style="display:block;font-size:11px;color:#888;margin-bottom:8px;">VERIFIED CLIENT RECORDS</label>
+                <label style="display:block;font-size:11px;color:#888;margin-bottom:8px;">VERIFIED CLIENT RECORDS (CONSOLIDATED)</label>
                 <div id="vps-client-list" style="font-size:11px;display:flex;flex-direction:column;gap:10px;">
                     Loading system records...
                 </div>
@@ -369,54 +369,102 @@
                 headers: { "Authorization": `Bearer ${deviceSecret}` }
             });
             if (res.status === 200) {
-                const devices = JSON.parse(res.responseText);
+                const groups = JSON.parse(res.responseText);
                 const container = document.getElementById("vps-client-list");
-                if (devices.length === 0) {
+                if (groups.length === 0) {
                     container.innerHTML = "No clients pending registration.";
                     return;
                 }
                 container.innerHTML = "";
-                devices.forEach(dev => {
+                groups.forEach(group => {
                     const el = document.createElement("div");
-                    el.style = "background:#222;padding:10px;border-radius:3px;border-left:3px solid " + (dev.approved ? '#27ae60' : '#f39c12');
+                    const isLinked = !!group.discord_id;
+                    const title = isLinked ? `Discord ID: <strong>${group.discord_id}</strong>` : `Unlinked Device`;
+                    el.style = "background:#222;padding:10px;border-radius:3px;border-left:3px solid " + (group.approved ? '#27ae60' : '#f39c12');
+                    
+                    let devicesHtml = '';
+                    group.devices.forEach(d => {
+                        devicesHtml += `
+                            <div style="font-size:10px;color:#ccc;padding:4px 0;border-bottom:1px solid #333;display:flex;justify-content:space-between;align-items:center;gap:4px;">
+                                <span style="word-break:break-all;">↳ <strong>${d.label}</strong> <code style="color:#777;">(${d.browser_id.substring(0,8)}...)</code></span>
+                                <button class="btn-prune-dev" data-id="${d.browser_id}" style="background:#8e44ad;border:none;color:#fff;padding:2px 6px;font-size:9px;cursor:pointer;border-radius:2px;font-weight:bold;margin-left:auto;white-space:nowrap;">PRUNE</button>
+                            </div>
+                        `;
+                    });
+
+                    const selectorId = isLinked ? group.discord_id : group.devices[0].browser_id;
+
                     el.innerHTML = `
-                        <div style="font-weight:bold;margin-bottom:3px;">${dev.label}</div>
-                        <div style="font-size:10px;color:#777;word-break:break-all;">ID: ${dev.browser_id}</div>
-                        <div style="font-size:10px;color:#999;margin-top:3px;">Tier: <span style="color:#00bc8c;">${dev.priority_tier}</span></div>
+                        <div style="font-weight:bold;margin-bottom:3px;color:#00bc8c;">${title}</div>
+                        <div style="font-size:10px;color:#999;margin-top:3px;">
+                            Priority: <span style="color:#3498db;font-weight:bold;">${group.priority_tier}</span> | 
+                            Cumulative Ledger: <span style="color:#e74c3c;font-weight:bold;">${group.anlas_consumed} Anlas</span>
+                        </div>
+                        <div style="margin: 8px 0; padding: 4px; background:#151515; border-radius:2px;">
+                            ${devicesHtml}
+                        </div>
                         <div style="display:flex;gap:5px;margin-top:8px;">
-                            <select id="tier-select-${dev.browser_id}" style="background:#111;border:1px solid #444;color:#fff;font-size:10px;padding:3px;">
-                                <option value="Low" ${dev.priority_tier === 'Low' ? 'selected' : ''}>Low</option>
-                                <option value="Normal" ${dev.priority_tier === 'Normal' ? 'selected' : ''}>Normal</option>
-                                <option value="High" ${dev.priority_tier === 'High' ? 'selected' : ''}>High</option>
-                                <option value="Admin" ${dev.priority_tier === 'Admin' ? 'selected' : ''}>Admin</option>
+                            <select id="tier-select-${selectorId}" style="background:#111;border:1px solid #444;color:#fff;font-size:10px;padding:3px;">
+                                <option value="Metered" ${group.priority_tier === 'Metered' ? 'selected' : ''}>Metered</option>
+                                <option value="Low" ${group.priority_tier === 'Low' ? 'selected' : ''}>Low</option>
+                                <option value="Normal" ${group.priority_tier === 'Normal' ? 'selected' : ''}>Normal</option>
+                                <option value="High" ${group.priority_tier === 'High' ? 'selected' : ''}>High</option>
+                                <option value="Admin" ${group.priority_tier === 'Admin' ? 'selected' : ''}>Admin</option>
                             </select>
-                            <button class="btn-approve-dev" data-id="${dev.browser_id}" style="background:#27ae60;border:none;color:#fff;padding:4px 8px;font-size:10px;cursor:pointer;border-radius:2px;font-weight:bold;">APPROVE</button>
-                            <button class="btn-revoke-dev" data-id="${dev.browser_id}" style="background:#c0392b;border:none;color:#fff;padding:4px 8px;font-size:10px;cursor:pointer;border-radius:2px;font-weight:bold;">REVOKE</button>
+                            <button class="btn-approve-group" data-key="${selectorId}" data-is-discord="${isLinked}" style="background:#27ae60;border:none;color:#fff;padding:4px 8px;font-size:10px;cursor:pointer;border-radius:2px;font-weight:bold;">APPROVE ALL</button>
+                            <button class="btn-revoke-group" data-key="${selectorId}" data-is-discord="${isLinked}" style="background:#c0392b;border:none;color:#fff;padding:4px 8px;font-size:10px;cursor:pointer;border-radius:2px;font-weight:bold;">REVOKE ALL</button>
                         </div>
                     `;
                     container.appendChild(el);
                 });
 
-                container.querySelectorAll(".btn-approve-dev").forEach(b => {
+                container.querySelectorAll(".btn-approve-group").forEach(b => {
                     b.onclick = async (e) => {
-                        const bid = e.target.getAttribute("data-id");
-                        const tier = document.getElementById(`tier-select-${bid}`).value;
+                        const target = e.target;
+                        const key = target.getAttribute("data-key");
+                        const isDiscord = target.getAttribute("data-is-discord") === "true";
+                        const tier = document.getElementById(`tier-select-${key}`).value;
+                        
+                        const payload = isDiscord 
+                            ? { discord_id: key, priority_tier: tier } 
+                            : { browser_id: key, priority_tier: tier };
+
                         const actionRes = await backgroundRequest({
                             method: "POST",
                             url: `${VPS_HOST}/admin/approve`,
                             headers: { "Content-Type": "application/json", "Authorization": `Bearer ${deviceSecret}` },
-                            data: JSON.stringify({ browser_id: bid, priority_tier: tier })
+                            data: JSON.stringify(payload)
                         });
                         if (actionRes.status === 200) renderAdminUI();
                     };
                 });
 
-                container.querySelectorAll(".btn-revoke-dev").forEach(b => {
+                container.querySelectorAll(".btn-revoke-group").forEach(b => {
+                    b.onclick = async (e) => {
+                        const target = e.target;
+                        const key = target.getAttribute("data-key");
+                        const isDiscord = target.getAttribute("data-is-discord") === "true";
+                        
+                        const payload = isDiscord 
+                            ? { discord_id: key } 
+                            : { browser_id: key };
+
+                        const actionRes = await backgroundRequest({
+                            method: "POST",
+                            url: `${VPS_HOST}/admin/revoke`,
+                            headers: { "Content-Type": "application/json", "Authorization": `Bearer ${deviceSecret}` },
+                            data: JSON.stringify(payload)
+                        });
+                        if (actionRes.status === 200) renderAdminUI();
+                    };
+                });
+
+                container.querySelectorAll(".btn-prune-dev").forEach(b => {
                     b.onclick = async (e) => {
                         const bid = e.target.getAttribute("data-id");
                         const actionRes = await backgroundRequest({
                             method: "POST",
-                            url: `${VPS_HOST}/admin/revoke`,
+                            url: `${VPS_HOST}/admin/prune-device`,
                             headers: { "Content-Type": "application/json", "Authorization": `Bearer ${deviceSecret}` },
                             data: JSON.stringify({ browser_id: bid })
                         });
@@ -481,7 +529,7 @@
 
         modal = document.createElement("div");
         modal.id = "vps-settings-modal";
-        modal.style.cssText = "position:fixed; top:50%; left:50%; transform:translate(-50%, -50%); width:90vw; max-width:400px; background:#1c1c1c; border:1px solid #c0392b; border-radius:6px; z-index:99999; color:#fff; padding:20px; font-family:sans-serif; box-shadow:0 10px 40px rgba(0,0,0,0.6); max-height:90vh; overflow-y:auto;";
+        modal.style.cssText = "position:fixed; top:50%; left:50%; transform:translate(-50%, -50%); width:90vw; max-width:420px; background:#1c1c1c; border:1px solid #c0392b; border-radius:6px; z-index:99999; color:#fff; padding:25px; font-family:sans-serif; box-shadow:0 10px 40px rgba(0,0,0,0.6); max-height:90vh; overflow-y:auto; box-sizing:border-box;";
         
         const nickname = GM_getValue("device_nickname", "Admin");
         const domain = GM_getValue("vps_host", "");
@@ -489,9 +537,43 @@
         const imageCount = GM_getValue("count_image_gens", 0);
         const textCount = GM_getValue("count_text_gens", 0);
 
+        let preciseLimit = "Unlimited";
+        let anlasConsumed = 0;
+        let linkedDevicesList = '';
+
+        try {
+            const res = await backgroundRequest({
+                method: "GET",
+                url: `${domain}/auth/status?browser_id=${browserId}`,
+                headers: { "Authorization": `Bearer ${deviceSecret}` }
+            });
+            if (res.status === 200) {
+                const data = JSON.parse(res.responseText);
+                anlasConsumed = data.anlas_consumed || 0;
+                preciseLimit = `${data.precise_limit} Refs`;
+                if (data.linked_devices && data.linked_devices.length > 0) {
+                    linkedDevicesList = data.linked_devices.map(d => `- \`${d.id.substring(0, 10)}...\` (${d.label})`).join('<br>');
+                } else {
+                    linkedDevicesList = 'No other active links.';
+                }
+            }
+        } catch (e) {}
+
         modal.innerHTML = `
             <h4 style="margin:0 0 15px 0; color:#00bc8c; border-bottom:1px solid #333; padding-bottom:8px; font-size:16px;">GATEWAY SETTINGS</h4>
             
+            <div style="background:#111; padding:15px; border-radius:4px; margin-bottom:15px; border:1px solid #333; font-size:12px; line-height:1.6;">
+                <label style="display:block; font-size:10px; color:#888; font-weight:bold; margin-bottom:6px; text-transform:uppercase; letter-spacing:0.5px;">Telemetry Stats & Profile</label>
+                <div style="display:grid; grid-template-columns:1fr 1fr; gap:10px;">
+                    <div>Assigned Tier: <span style="color:#00bc8c; font-weight:bold;">Admin</span></div>
+                    <div>Precise Ref Limit: <span style="color:#f39c12; font-weight:bold;">${preciseLimit}</span></div>
+                    <div>Anlas Consumed: <span style="color:#e74c3c; font-weight:bold;">${anlasConsumed} Anlas</span></div>
+                    <div>Daily Sessions: <span style="font-weight:bold;">Unlimited (Admin)</span></div>
+                    <div>Image Gens: <span style="font-weight:bold;">${imageCount}</span></div>
+                    <div>Text Gens: <span style="font-weight:bold;">${textCount}</span></div>
+                </div>
+            </div>
+
             <div style="margin-bottom:15px;">
                 <label style="display:block; font-size:11px; color:#aaa; margin-bottom:5px;">NICKNAME</label>
                 <div style="display:flex; gap:10px;">
@@ -509,15 +591,12 @@
                 </div>
             </div>
 
-            <div style="background:#111; padding:12px; border-radius:4px; margin-bottom:15px; border:1px solid #333;">
-                <label style="display:block; font-size:10px; color:#888; font-weight:bold; margin-bottom:6px; text-transform:uppercase;">Usage Stats & Information</label>
-                <div style="display:grid; grid-template-columns:1fr 1fr; gap:8px; font-size:12px;">
-                    <div>Tier: <span style="color:#00bc8c; font-weight:bold;">Admin</span></div>
-                    <div>Anlas Spent: <span style="color:#f39c12; font-weight:bold;">0 Anlas</span></div>
-                    <div>Image Gens: <span style="font-weight:bold;">${imageCount}</span></div>
-                    <div>Text Gens: <span style="font-weight:bold;">${textCount}</span></div>
+            <div style="background:#111; padding:12px; border-radius:4px; margin-bottom:15px; border:1px solid #333; font-size:11px;">
+                <label style="display:block; font-size:10px; color:#888; font-weight:bold; margin-bottom:6px; text-transform:uppercase;">Hardware Footprints Linked (Max 3)</label>
+                <div style="color:#ccc; font-family:monospace; line-height:1.4;">
+                    ${linkedDevicesList}
                 </div>
-                <div style="font-size:10px; color:#666; margin-top:6px; text-align:center;">Unlimited high priority execution.</div>
+                <div style="font-size:10px; color:#666; margin-top:6px;">Prune unneeded profiles natively inside Discord using \`/mygateway unlink\`.</div>
             </div>
 
             <div style="border-top:1px solid #333; padding-top:12px; margin-top:12px;">
@@ -662,10 +741,10 @@
 
         if (status === 200) {
             if (!responseDetails.response) {
-                console.error("[Nai-Admin] Telemetry: Success code detected, but readable response stream was empty.");
+                console.error("[VPS Gateway] Telemetry: Success code detected, but readable response stream was empty.");
                 return false; // Wait for response body context to bind
             }
-            console.log("[Nai-Admin] Telemetry: Stream successfully acquired. Piping stream response directly to web page fetch promise.");
+            console.log("[VPS Gateway] Telemetry: Stream successfully acquired. Piping stream response directly to fetch promise.");
             
             // Increment telemetry variables on validation success
             if (isImageGen) {
@@ -680,13 +759,34 @@
             }));
             return true;
         } else {
-            console.error(`[Nai-Admin] Telemetry: Proxy returned exception status code: ${status}`);
+            // For error responses, defer resolution until the request has fully completed (readyState 4)
+            // so we can read the fully buffered error body.
+            if (responseDetails.readyState !== 4 && responseDetails.readyState !== undefined) {
+                return false;
+            }
 
-            // Forcefully wipe the approved flag and reload the tab to mount the setup overlay
+            console.error("[VPS Gateway] Telemetry: Proxy returned exception status code:", status);
+
+            // Self-Healing Hook for Admin/Guest
             if (status === 401) {
-                console.warn("[Nai-Admin] Revocation signature caught. Restoring setup lock.");
+                console.warn("[VPS Gateway] Revocation signature caught. Restoring setup lock.");
                 GM_setValue("approved", false);
-                setTimeout(() => window.location.reload(), 500);
+                if (typeof browserId !== 'undefined' && typeof deviceSecret !== 'undefined') {
+                    // Guest self-healing
+                    const nickname = GM_getValue("device_nickname", "Guest");
+                    backgroundRequest({
+                        method: "POST",
+                        url: `${VPS_HOST}/auth/register`,
+                        headers: { "Content-Type": "application/json" },
+                        data: JSON.stringify({ browser_id: browserId, device_secret: deviceSecret, label: nickname })
+                    }).finally(() => {
+                        window.location.reload();
+                    });
+                } else {
+                    // Admin self-healing
+                    setTimeout(() => window.location.reload(), 500);
+                }
+                return true;
             }
 
             let errorText = "";
@@ -698,11 +798,15 @@
                         errorText = responseDetails.response;
                     }
                 }
+                // Fallback to text representation if stream parsing yielded nothing
+                if (!errorText && responseDetails.responseText) {
+                    errorText = responseDetails.responseText;
+                }
             } catch (e) {
-                console.error("[Nai-Admin] Error: Failed to extract string from raw exception stream:", e);
+                console.error("[VPS Gateway] Error: Failed to extract string from raw exception stream:", e);
             }
 
-            console.log(`[Nai-Admin] Telemetry: Received raw error text: "${errorText}"`);
+            console.log(`[VPS Gateway] Telemetry: Received raw error text: "${errorText}"`);
 
             // Standardize raw anomalies into correct structured exception parameters for SPA parsing
             let parsedError = null;
@@ -728,6 +832,11 @@
         }
     }
 
+    /**
+     * Extracts and validates parameters from incoming client payloads.
+     * Isolates precise character reference arrays (character_reference) to 
+     * accurately compute 5 Anlas per-generation billing metrics.
+     */
     async function extractImageParams(body) {
         if (!body) return null;
         try {
@@ -743,16 +852,25 @@
                 payload = JSON.parse(body);
             }
 
-            if (payload && payload.parameters) {
+            if (payload) {
+                const params = payload.parameters || payload || {};
+                
+                // Aggregates legacy and modern NAI reference structures to secure admin-side checks
+                const preciseRefs = 
+                    (Array.isArray(params.director_reference_images_cached) ? params.director_reference_images_cached.length : 0) +
+                    (Array.isArray(params.director_reference_images) ? params.director_reference_images.length : 0) +
+                    (Array.isArray(params.reference_image_multiple) ? params.reference_image_multiple.length : 0);
+
                 return {
-                    width: parseInt(payload.parameters.width, 10) || 1024,
-                    height: parseInt(payload.parameters.height, 10) || 1024,
-                    steps: parseInt(payload.parameters.steps, 10) || 28,
-                    n_samples: parseInt(payload.parameters.n_samples, 10) || 1
+                    width: parseInt(params.width || payload.width, 10) || 1024,
+                    height: parseInt(params.height || payload.height, 10) || 1024,
+                    steps: parseInt(params.steps || payload.steps, 10) || 28,
+                    n_samples: parseInt(params.n_samples || payload.n_samples, 10) || 1,
+                    precise_refs: preciseRefs
                 };
             }
         } catch (e) {
-            console.error("Nai-Admin: Parameter extraction failed:", e);
+            console.error("Parameter extraction failed:", e);
         }
         return null;
     }
@@ -815,7 +933,7 @@
         showQueueStatusBanner("Acquiring channel slot...");
 
         while (!turnAcquired) {
-            // Reduced to 1000ms to completely eliminate dead-time gaps between generations
+            // Reduced to 1000ms to eliminate dead-time gaps between generations
             await new Promise(r => setTimeout(r, 1000));
             try {
                 const statusRes = await backgroundRequest({
@@ -869,6 +987,7 @@
         updatedHeaders.set("x-gen-height", imgParams.height.toString());
         updatedHeaders.set("x-gen-steps", imgParams.steps.toString());
         updatedHeaders.set("x-gen-samples", imgParams.n_samples.toString());
+        updatedHeaders.set("x-precise-refs", imgParams.precise_refs.toString());
         updatedHeaders.set("authorization", `Bearer ${deviceSecret}`);
         updatedHeaders.set("x-script-version", GM_info.script.version); // Dyn Version Injection
         if (GM_getValue("debug_mode", false)) {
