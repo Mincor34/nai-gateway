@@ -1,47 +1,88 @@
 /**
  * DATABASE CONTROLLER (database.js)
  *
- * This module manages persistent device registration, approval states, and 
- * encrypted master configuration tokens using an embedded SQLite database.
- * 
- * Safety Mechanisms:
- * - Table configurations use strict schema typing.
- * - Transactions and run/get utilities are wrapped in Promises to ensure clean 
- *   asynchronous control flow without blocking the Express event loop.
+ * Manages persistent device registrations, approval states, blacklists,
+ * and configurations. Uses promise boundaries to guarantee schemas are fully
+ * prepared prior to mounting Express listeners.
  */
 
 const sqlite3 = require('sqlite3').verbose();
 const path = require('path');
 
-// Allow the database file path to be set via environment variable with a default fallback
-const dbFilename = process.env.DATABASE_PATH || 'data.db';
+const dbFilename = process.env.DATABASE_PATH || 'staging_data.db';
 const dbPath = path.isAbsolute(dbFilename) 
   ? dbFilename 
   : path.join(__dirname, dbFilename);
 
 const db = new sqlite3.Database(dbPath);
 
-// Synchronously initialize required schema definitions
-db.serialize(() => {
-  // Device registrations
-  db.run(`CREATE TABLE IF NOT EXISTS devices (
-    browser_id TEXT PRIMARY KEY,
-    device_secret TEXT NOT NULL,
-    label TEXT,
-    priority_tier TEXT NOT NULL DEFAULT 'Normal',
-    approved INTEGER NOT NULL DEFAULT 0
-  )`);
-  
-  // Encrypted or sensitive master session configurations
-  db.run(`CREATE TABLE IF NOT EXISTS config (
-    key TEXT PRIMARY KEY,
-    value TEXT NOT NULL
-  )`);
-});
-
 /**
- * Execute SQL query with no return value (INSERT, UPDATE, DELETE).
+ * Ensures schemas and migrations are fully executed sequentially.
+ * Blocks server startup on failure.
  */
+const initDatabase = () => {
+  return new Promise((resolve, reject) => {
+    db.serialize(() => {
+      // Initial Table Setup
+      db.run(`CREATE TABLE IF NOT EXISTS devices (
+        browser_id TEXT PRIMARY KEY,
+        device_secret TEXT NOT NULL,
+        label TEXT,
+        priority_tier TEXT NOT NULL DEFAULT 'Normal',
+        approved INTEGER NOT NULL DEFAULT 0,
+        discord_id TEXT,
+        anlas_consumed INTEGER NOT NULL DEFAULT 0
+      )`, (err) => { if (err) return reject(err); });
+      
+      db.run(`CREATE TABLE IF NOT EXISTS banned_discords (
+        discord_id TEXT PRIMARY KEY,
+        banned_at INTEGER NOT NULL,
+        reason TEXT,
+        is_notified INTEGER NOT NULL DEFAULT 0
+      )`, (err) => { if (err) return reject(err); });
+      
+      db.run(`CREATE TABLE IF NOT EXISTS config (
+        key TEXT PRIMARY KEY,
+        value TEXT NOT NULL
+      )`, (err) => { if (err) return reject(err); });
+
+      // Daily Session Tracker: Enforces the 6 x 30-minute daily constraints for Metered tiers
+      db.run(`CREATE TABLE IF NOT EXISTS device_sessions (
+        browser_id TEXT NOT NULL,
+        session_date TEXT NOT NULL,
+        session_count INTEGER NOT NULL DEFAULT 0,
+        last_session_at INTEGER NOT NULL,
+        PRIMARY KEY (browser_id, session_date)
+      )`, (err) => { if (err) return reject(err); });
+
+      // Schema Migration Check
+      db.all("PRAGMA table_info(devices)", (err, rows) => {
+        if (err) return reject(err);
+        
+        const hasDiscordId = rows.some(row => row.name === 'discord_id');
+        const hasAnlas = rows.some(row => row.name === 'anlas_consumed');
+        
+        if (!hasDiscordId) {
+          db.run("ALTER TABLE devices ADD COLUMN discord_id TEXT");
+        }
+        if (!hasAnlas) {
+          db.run("ALTER TABLE devices ADD COLUMN anlas_consumed INTEGER NOT NULL DEFAULT 0");
+        }
+        
+        // Audit banned_discords column extensions
+        db.all("PRAGMA table_info(banned_discords)", (banErr, banRows) => {
+          if (banErr) return reject(banErr);
+          const hasNotified = banRows.some(row => row.name === 'is_notified');
+          if (!hasNotified) {
+            db.run("ALTER TABLE banned_discords ADD COLUMN is_notified INTEGER NOT NULL DEFAULT 0");
+          }
+          resolve();
+        });
+      });
+    });
+  });
+};
+
 const run = (sql, params = []) => new Promise((resolve, reject) => {
   db.run(sql, params, function(err) {
     if (err) reject(err);
@@ -69,4 +110,4 @@ const all = (sql, params = []) => new Promise((resolve, reject) => {
   });
 });
 
-module.exports = { db, run, get, all };
+module.exports = { db, initDatabase, run, get, all };
