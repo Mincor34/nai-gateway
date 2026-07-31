@@ -1,12 +1,15 @@
 /**
  * COORDINATOR GATEWAY CORE (server.js)
+ * This monolith is bigger than a Wailord's cock!
  *
  * Implements:
  * - Sequential Promise DB Startup Guard
  * - Preserved Fractional Token Accumulation (RAM-bound)
  * - Safe Boundary-Sliced Multipart JSON Parser for Background Post-Audits
  * - Dual-Rate Dynamic Queue Aging with 120s AUTO Promotion
- * - Sliding-Window Daily Session Enforcement on Queue Entry
+ * - Explicit Session Authorization on Queue Entry
+ * - Identity-Bound Concurrency Queue Management (Discord-ID Locked)
+ * - Decoupled REST interfaces for Discord Bot integrations
  */
 
 const express = require('express');
@@ -89,6 +92,82 @@ function getOrInitBucket(browserId, tier) {
     }
   }
   return bucket;
+}
+
+// ----------------- SECURE PAYLOAD TELEMETRY UTILITIES -----------------
+
+/**
+ * Recursively inspects a JSON payload and replaces massive Base64 strings
+ * with compact metadata placeholders to prevent terminal locking and log bloat.
+ */
+function sanitizeObjectForLogging(obj) {
+  if (obj === null || obj === undefined) return obj;
+  
+  if (Array.isArray(obj)) {
+    return obj.map(item => sanitizeObjectForLogging(item));
+  }
+  
+  if (typeof obj === 'object') {
+    const cleaned = {};
+    for (const [key, val] of Object.entries(obj)) {
+      cleaned[key] = sanitizeObjectForLogging(val);
+    }
+    return cleaned;
+  }
+  
+  if (typeof obj === 'string') {
+    if (obj.length > 500) {
+      const mimeType = obj.startsWith('data:') ? obj.split(';')[0] : 'Base64/Binary';
+      return `[Truncated ${mimeType}, Length: ${obj.length} chars]`;
+    }
+  }
+  
+  return obj;
+}
+
+/**
+ * Formats both raw JSON and Multipart/FormData payloads into a clean, readable, 
+ * and untruncated structured string for secure VPS telemetry.
+ */
+function formatPayloadForLogging(buffer) {
+  try {
+    if (!buffer || buffer.length === 0) return "{ empty payload }";
+
+    const bodyStr = buffer.toString('utf8');
+
+    if (buffer[0] === 0x2d && buffer[1] === 0x2d) { // Starts with "--" boundary marker
+      const firstLineEnd = bodyStr.indexOf('\n');
+      const boundary = firstLineEnd !== -1 ? bodyStr.slice(0, firstLineEnd).trim() : '';
+      const requestIndex = bodyStr.indexOf('name="request"');
+      
+      if (requestIndex !== -1 && boundary) {
+        const startIdx = bodyStr.indexOf('{', requestIndex);
+        if (startIdx !== -1) {
+          const nextBoundary = bodyStr.indexOf(boundary, startIdx);
+          const endIdx = nextBoundary !== -1 ? nextBoundary : bodyStr.length;
+
+          let jsonCandidate = bodyStr.slice(startIdx, endIdx).trim();
+          const lastBrace = jsonCandidate.lastIndexOf('}');
+          if (lastBrace !== -1) {
+            jsonCandidate = jsonCandidate.slice(0, lastBrace + 1);
+          }
+          
+          const parsed = JSON.parse(jsonCandidate);
+          return JSON.stringify(sanitizeObjectForLogging(parsed), null, 2);
+        }
+      }
+      return `[Multipart Payload - Boundary: ${boundary}, Length: ${buffer.length} bytes]`;
+    }
+
+    if (bodyStr.trim().startsWith('{')) {
+      const parsed = JSON.parse(bodyStr);
+      return JSON.stringify(sanitizeObjectForLogging(parsed), null, 2);
+    }
+
+    return bodyStr.substring(0, 1000) + `... [Truncated raw data, Total: ${buffer.length} bytes]`;
+  } catch (err) {
+    return `[Logger Error] Parsing failure: ${err.message}. Raw payload size: ${buffer.length} bytes.`;
+  }
 }
 
 // ----------------- CENTRAL TELEMETRY MIDDLEWARE -----------------
@@ -254,16 +333,35 @@ app.all('/proxy/:subdomain/{*splat}', async (req, res) => {
       const height = parseInt(req.headers['x-gen-height'], 10) || 0;
       const steps = parseInt(req.headers['x-gen-steps'], 10) || 0;
       const samples = parseInt(req.headers['x-gen-samples'], 10) || 1;
+      const preciseRefs = parseInt(req.headers['x-precise-refs'], 10) || 0;
 
-      if ((width * height) > 1048576) {
-        return res.status(400).json({ statusCode: 400, message: 'Anlas Protection: Max 1MP resolution limits exceeded.' });
+      const config = TIER_CONFIGS[device.priority_tier] || TIER_CONFIGS['Normal'];
+      const totalPixels = width * height;
+      const violations = [];
+
+      if (totalPixels > 1048576) {
+        violations.push(`Resolution of ${width}x${height} (${totalPixels}px) exceeds the maximum limit of 1,048,576px (1MP)`);
       }
       if (steps > 28) {
-        return res.status(400).json({ statusCode: 400, message: 'Anlas Protection: Max 28 steps exceeded.' });
+        violations.push(`Steps count of ${steps} exceeds the maximum limit of 28 steps`);
       }
       if (samples !== 1) {
-        return res.status(400).json({ statusCode: 400, message: 'Anlas Protection: Single-image generation only.' });
+        violations.push(`Samples count of ${samples} exceeds the maximum limit of 1 sample (single-image generation only)`);
       }
+      if (preciseRefs > config.preciseLimit) {
+        violations.push(`Precise references count of ${preciseRefs} exceeds your max limit of ${config.preciseLimit}`);
+      }
+
+    if (violations.length > 0) {
+      const combinedMessage = `\n\nAnlas Protection Limit Violations:\n` + 
+                              violations.map(v => `• ${v}`).join('\n');
+                              
+      return res.status(400).json({
+        statusCode: 400,
+        message: combinedMessage,
+        violations: violations
+      });
+    }
     } else if (isTextGen) {
       // Channel B Fast-Track Concurrency Limit Execution
       if (activeTextGenerations >= MAX_CONCURRENT_TEXT_GENS) {
@@ -301,11 +399,12 @@ app.all('/proxy/:subdomain/{*splat}', async (req, res) => {
         });
       }
 
-      // Handle Client Debug Flag: Dumps full payload metrics without exposing tokens.
+      // Uses the sanitizer to output the untruncated parameter schema 
+      // without flooding PM2 logs with binary image strings.
       if (req.headers['x-debug-mode'] === 'true') {
-        console.log(`\n--- [VPS Debug Telemetry] Payload from client: "${browserId}" ---`);
-        console.log(payloadBuffer.toString('utf8').substring(0, 1500));
-        console.log("-------------------------------------------------------------\n");
+        console.log(`\n--- [VPS Debug Telemetry] Untruncated Structured Payload (Client: "${browserId}") ---`);
+        console.log(formatPayloadForLogging(payloadBuffer));
+        console.log("------------------------------------------------------------------------------------\n");
       }
 
       const headers = { ...req.headers };
@@ -395,7 +494,7 @@ app.post('/auth/register', async (req, res) => {
   if (!browser_id || !device_secret) return res.status(400).json({ error: 'Bad parameters' });
   try {
     await run(
-      'INSERT OR IGNORE INTO devices (browser_id, device_secret, label, priority_tier, approved) VALUES (?, ?, ?, ?, 0)',
+      'INSERT OR IGNORE INTO devices (browser_id, device_secret, label, priority_tier, approved, anlas_consumed) VALUES (?, ?, ?, ?, 0, 0)',
       [browser_id, device_secret, label || 'Guest Instance', 'Normal']
     );
     res.json({ success: true });
@@ -452,18 +551,124 @@ app.get('/auth/status', async (req, res) => {
   try {
     let row;
     if (device_secret === ADMIN_SECRET_KEY) {
-      row = { approved: 1, priority_tier: 'Admin' };
+      row = { approved: 1, priority_tier: 'Admin', anlas_consumed: 0, discord_id: 'admin' };
     } else {
       row = await get(
-        'SELECT approved, priority_tier FROM devices WHERE browser_id = ? AND device_secret = ?', 
+        'SELECT approved, priority_tier, discord_id, anlas_consumed FROM devices WHERE browser_id = ? AND device_secret = ?', 
         [browser_id, device_secret]
       );
     }
     if (!row) return res.status(401).json({ error: 'Invalid device credentials' });
-    res.json({ approved: !!row.approved, tier: row.priority_tier });
+
+    let sessionInfo = null;
+    if (row.priority_tier === 'Metered') {
+      const today = new Date().toISOString().split('T')[0];
+      const session = await get(
+        'SELECT session_count, last_session_at FROM device_sessions WHERE browser_id = ? AND session_date = ?',
+        [browser_id, today]
+      );
+      const now = Date.now();
+      const count = session ? session.session_count : 0;
+      const lastSessionAt = session ? session.last_session_at : 0;
+      const elapsed = now - lastSessionAt;
+      const active = elapsed < 30 * 60 * 1000 && count > 0;
+      sessionInfo = {
+        count: count,
+        remaining: 6 - count,
+        active: active,
+        time_remaining: active ? (30 * 60 * 1000 - elapsed) : 0
+      };
+    }
+
+    // Retrieve other approved browser IDs registered under the same Discord user
+    let linkedDevices = [];
+    if (row.discord_id && row.discord_id !== 'admin') {
+      const devices = await all('SELECT browser_id, label FROM devices WHERE discord_id = ? AND approved = 1', [row.discord_id]);
+      linkedDevices = devices.map(d => ({ id: d.browser_id, label: d.label }));
+    }
+
+    res.json({ 
+      approved: !!row.approved, 
+      tier: row.priority_tier,
+      anlas_consumed: row.anlas_consumed || 0,
+      precise_limit: TIER_CONFIGS[row.priority_tier]?.preciseLimit ?? 0,
+      session: sessionInfo,
+      linked_devices: linkedDevices
+    });
   } catch (err) {
     console.error('[VPS Telemetry] Authentication verification query failure:', err);
     res.status(500).json({ error: err.message });
+  }
+});
+
+/**
+ * Initiates an explicit temporal session for Metered tier users.
+ */
+app.post('/queue/start-session', async (req, res) => {
+  const { browser_id } = req.body;
+  const authHeader = req.headers['authorization'];
+  if (!authHeader || !authHeader.startsWith('Bearer ')) {
+    return res.status(401).json({ error: 'Missing authentication context.' });
+  }
+  const deviceSecret = authHeader.split(' ')[1];
+
+  try {
+    const device = await get(
+      'SELECT approved, priority_tier FROM devices WHERE browser_id = ? AND device_secret = ? AND approved = 1',
+      [browser_id, deviceSecret]
+    );
+
+    if (!device) {
+      return res.status(401).json({ error: 'Device unapproved or credentials rejected.' });
+    }
+
+    if (device.priority_tier !== 'Metered') {
+      return res.status(400).json({ error: 'Only Metered accounts manage temporal sessions.' });
+    }
+
+    const today = new Date().toISOString().split('T')[0];
+    const session = await get(
+      'SELECT session_count, last_session_at FROM device_sessions WHERE browser_id = ? AND session_date = ?',
+      [browser_id, today]
+    );
+
+    const now = Date.now();
+    let currentCount = session ? session.session_count : 0;
+
+    if (currentCount >= 6) {
+      return res.status(403).json({
+        statusCode: 403,
+        error: 'DAILY_SESSIONS_EXHAUSTED'
+      });
+    }
+
+    if (!session) {
+      await run(
+        'INSERT INTO device_sessions (browser_id, session_date, session_count, last_session_at) VALUES (?, ?, 1, ?)',
+        [browser_id, today, now]
+      );
+      currentCount = 1;
+    } else {
+      await run(
+        'UPDATE device_sessions SET session_count = session_count + 1, last_session_at = ? WHERE browser_id = ? AND session_date = ?',
+        [now, browser_id, today]
+      );
+      currentCount += 1;
+    }
+
+    console.log(`[VPS Sessions] Metered browser ${browser_id} explicitly started session #${currentCount}`);
+    res.json({
+      success: true,
+      session: {
+        count: currentCount,
+        remaining: 6 - currentCount,
+        active: true,
+        time_remaining: 30 * 60 * 1000
+      }
+    });
+  } catch (err) {
+    console.error('[VPS Sessions] Error starting session:', err);
+    res.status(500).json({ error: 'Internal server error.' });
   }
 });
 
@@ -475,10 +680,10 @@ app.post('/queue/join', async (req, res) => {
   try {
     let device;
     if (device_secret === ADMIN_SECRET_KEY) {
-      device = { approved: 1, priority_tier: 'Admin' };
+      device = { approved: 1, priority_tier: 'Admin', discord_id: 'admin' };
     } else {
       device = await get(
-        'SELECT approved, priority_tier FROM devices WHERE browser_id = ? AND device_secret = ? AND approved = 1',
+        'SELECT approved, priority_tier, discord_id FROM devices WHERE browser_id = ? AND device_secret = ? AND approved = 1',
         [browser_id, device_secret]
       );
     }
@@ -495,42 +700,33 @@ app.post('/queue/join', async (req, res) => {
       const now = Date.now();
       const SESSION_WINDOW_MS = 30 * 60 * 1000; // Hard 30 minutes allocation limit
 
-      if (!session) {
-        // Initiating first dynamic session of the day
-        await run(
-          'INSERT INTO device_sessions (browser_id, session_date, session_count, last_session_at) VALUES (?, ?, 1, ?)',
-          [browser_id, today, now]
-        );
-        console.log(`[VPS Session Allocation] Initialized first daily session window for Metered browser: ${browser_id}`);
-      } else {
-        const elapsed = now - session.last_session_at;
-        if (elapsed > SESSION_WINDOW_MS) {
-          // Current session window has elapsed; attempting to open a new sliding window
-          if (session.session_count >= 6) {
-            console.warn(`[VPS Session Block] Metered browser ${browser_id} rejected. 6 daily sessions exhausted.`);
-            return res.status(403).json({
-              statusCode: 403,
-              message: 'Session Limit Exceeded: Metered users are restricted to a maximum of 6 x 30m sessions per day.'
-            });
-          }
-          await run(
-            'UPDATE device_sessions SET session_count = session_count + 1, last_session_at = ? WHERE browser_id = ? AND session_date = ?',
-            [now, browser_id, today]
-          );
-          console.log(`[VPS Session Allocation] Allocated session window #${session.session_count + 1} for Metered browser: ${browser_id}`);
-        } else {
-          // Client is within their active, paid 30-minute sliding window; pass through cleanly
-          const remainingMinutes = ((SESSION_WINDOW_MS - elapsed) / 1000 / 60).toFixed(1);
-          console.log(`[VPS Session Check] Metered browser ${browser_id} within active window. ${remainingMinutes}m remaining.`);
-        }
+      if (!session || (now - session.last_session_at > SESSION_WINDOW_MS)) {
+        // No active session window found. Reject join with session_required status so client prompts user.
+        const count = session ? session.session_count : 0;
+        console.warn(`[VPS Session Guard] Metered user ${browser_id} lacks active session window. Refusing entry.`);
+        return res.status(403).json({
+          statusCode: 403,
+          error: 'SESSION_REQUIRED',
+          remaining: 6 - count
+        });
       }
+      
+      const elapsed = now - session.last_session_at;
+      const remainingMinutes = ((SESSION_WINDOW_MS - elapsed) / 1000 / 60).toFixed(1);
+      console.log(`[VPS Session Check] Metered browser ${browser_id} within active window. ${remainingMinutes}m remaining.`);
     }
 
-    const existingIdx = queue.findIndex(t => t.browser_id === browser_id);
+    // 1-request-per-user limit: Enforce queue concurrency check on discord_id, NOT browser_id
+    const existingIdx = queue.findIndex(t => {
+      if (device.discord_id && device.discord_id !== 'admin' && t.discord_id === device.discord_id) return true;
+      return t.browser_id === browser_id;
+    });
+
     if (existingIdx !== -1) {
       if (queue[existingIdx].upstreamReq) queue[existingIdx].upstreamReq.destroy();
+      const evictedTarget = queue[existingIdx].discord_id || queue[existingIdx].browser_id;
       queue.splice(existingIdx, 1);
-      console.log(`[VPS Telemetry] Ghost session evicted for: ${browser_id}`);
+      console.log(`[VPS Telemetry] Concurrency eviction: Terminated active lock for user/device: ${evictedTarget}`);
     }
 
     let hasBurstBoost = false;
@@ -554,6 +750,7 @@ app.post('/queue/join', async (req, res) => {
       browser_id,
       tab_id,
       req_id,
+      discord_id: device.discord_id, // Lock queue item directly to Discord identity
       priority_tier: device.priority_tier,
       timestamp: Date.now(),
       last_polled_at: Date.now(),
@@ -563,7 +760,7 @@ app.post('/queue/join', async (req, res) => {
       has_burst_boost: hasBurstBoost
     });
 
-    console.log(`[VPS Telemetry] Device "${browser_id}" joined queue. ReqId: "${req_id}". Tier: "${device.priority_tier}"`);
+    console.log(`[VPS Telemetry] Device "${browser_id}" (User: "${device.discord_id}") joined queue. ReqId: "${req_id}". Tier: "${device.priority_tier}"`);
     processQueue();
     res.json({ success: true });
   } catch (err) {
@@ -620,25 +817,109 @@ app.post('/queue/complete', async (req, res) => {
   res.json({ success: true });
 });
 
-// Admin Interfaces
+// Admin Interfaces - Consolidating by Discord Account
 app.get('/admin/devices', verifyAdmin, async (req, res) => {
-  try { res.json(await all('SELECT * FROM devices')); } catch (err) { res.status(500).json({ error: err.message }); }
+  try { 
+    const rows = await all('SELECT * FROM devices');
+    const groups = {};
+    for (const row of rows) {
+      const key = row.discord_id || `unlinked:${row.browser_id}`;
+      if (!groups[key]) {
+        groups[key] = {
+          discord_id: row.discord_id || null,
+          priority_tier: row.priority_tier,
+          approved: row.approved,
+          anlas_consumed: 0,
+          devices: []
+        };
+      }
+      groups[key].devices.push({
+        browser_id: row.browser_id,
+        label: row.label,
+        approved: row.approved,
+        anlas_consumed: row.anlas_consumed
+      });
+      groups[key].anlas_consumed += row.anlas_consumed;
+    }
+    res.json(Object.values(groups));
+  } catch (err) { 
+    res.status(500).json({ error: err.message }); 
+  }
+});
+
+/**
+ * Decoupled endpoint to query linked footprints for a specific Discord user over HTTPS.
+ */
+app.get('/admin/user-devices', verifyAdmin, async (req, res) => {
+  const { discord_id } = req.query;
+  if (!discord_id) return res.status(400).json({ error: "Missing discord_id parameter" });
+  try {
+    const devices = await all('SELECT browser_id, label, approved, priority_tier, anlas_consumed FROM devices WHERE discord_id = ?', [discord_id]);
+    res.json(devices);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+/**
+ * Decoupled query to fetch unnotified bans from the gateway VPS over HTTPS.
+ */
+app.get('/admin/unnotified-bans', verifyAdmin, async (req, res) => {
+  try {
+    const bans = await all('SELECT discord_id, reason FROM banned_discords WHERE is_notified = 0');
+    res.json(bans);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+/**
+ * Decoupled command to mark a Discord user ban as DM-notified over HTTPS.
+ */
+app.post('/admin/mark-ban-notified', verifyAdmin, async (req, res) => {
+  const { discord_id } = req.body;
+  if (!discord_id) return res.status(400).json({ error: "Missing discord_id parameter" });
+  try {
+    await run('UPDATE banned_discords SET is_notified = 1 WHERE discord_id = ?', [discord_id]);
+    res.json({ success: true });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
 });
 
 app.post('/admin/approve', verifyAdmin, async (req, res) => {
-  const { browser_id, priority_tier } = req.body;
+  const { browser_id, discord_id, priority_tier } = req.body;
   try {
-    await run('UPDATE devices SET approved = 1, priority_tier = ? WHERE browser_id = ?', [priority_tier, browser_id]);
-    console.log(`[VPS Telemetry Admin] Approved client browser: "${browser_id}". Priority: "${priority_tier}"`);
+    if (discord_id) {
+      await run('UPDATE devices SET approved = 1, priority_tier = ? WHERE discord_id = ?', [priority_tier, discord_id]);
+      console.log(`[VPS Telemetry Admin] Approved Discord Account: "${discord_id}". Priority: "${priority_tier}"`);
+    } else {
+      await run('UPDATE devices SET approved = 1, priority_tier = ? WHERE browser_id = ?', [priority_tier, browser_id]);
+      console.log(`[VPS Telemetry Admin] Approved Unlinked Browser: "${browser_id}". Priority: "${priority_tier}"`);
+    }
     res.json({ success: true });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
 app.post('/admin/revoke', verifyAdmin, async (req, res) => {
+  const { browser_id, discord_id } = req.body;
   try {
-    // Retains hard DELETE schema to avoid control panel pollution
-    await run('DELETE FROM devices WHERE browser_id = ?', [req.body.browser_id]);
-    console.log(`[VPS Telemetry Admin] Revoked approval for browser: "${req.body.browser_id}"`);
+    if (discord_id) {
+      await run('UPDATE devices SET approved = 0 WHERE discord_id = ?', [discord_id]);
+      console.log(`[VPS Telemetry Admin] Revoked access for Discord Account: "${discord_id}"`);
+    } else {
+      await run('DELETE FROM devices WHERE browser_id = ?', [browser_id]);
+      console.log(`[VPS Telemetry Admin] Revoked Unlinked Browser: "${browser_id}"`);
+    }
+    res.json({ success: true });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.post('/admin/prune-device', verifyAdmin, async (req, res) => {
+  const { browser_id } = req.body;
+  try {
+    await run('DELETE FROM devices WHERE browser_id = ?', [browser_id]);
+    console.log(`[VPS Telemetry Admin] Pruned individual browser registration: "${browser_id}"`);
     res.json({ success: true });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
@@ -655,7 +936,7 @@ app.post('/admin/update-token', verifyAdmin, async (req, res) => {
  * @api {post} /admin/link Link Hardware Footprint
  * @apiGroup Admin
  * @apiDescription Links a registered device's browser footprint directly to a verified Discord ID.
- * Implements an automatic blacklist and physical device existence check.
+ * Implements an automatic blacklist, a maximum of 3 active linked devices, and oldest device pruning.
  */
 app.post('/admin/link', verifyAdmin, async (req, res) => {
   const { browser_id, discord_id, priority_tier } = req.body;
@@ -674,6 +955,22 @@ app.post('/admin/link', verifyAdmin, async (req, res) => {
     const device = await get('SELECT 1 FROM devices WHERE browser_id = ?', [browser_id]);
     if (!device) {
       return res.status(404).json({ error: "Device ID not recognized. Open NovelAI to register the client." });
+    }
+
+    // Limit Check: A single Discord account can have a maximum of 3 linked approved devices.
+    const existingLinks = await all(
+      'SELECT browser_id FROM devices WHERE discord_id = ? AND approved = 1 ORDER BY ROWID ASC',
+      [discord_id]
+    );
+
+    if (existingLinks.length >= 3) {
+      const oldestDevice = existingLinks[0].browser_id;
+      // Automatically prune the oldest linked device
+      await run(
+        'UPDATE devices SET approved = 0, discord_id = NULL WHERE browser_id = ?',
+        [oldestDevice]
+      );
+      console.log(`[VPS Admin API] Automatically pruned oldest linked browser ID: ${oldestDevice} for user ${discord_id}`);
     }
 
     // Atomically link discord context and approve device
@@ -728,7 +1025,7 @@ app.post('/admin/revoke-discord', verifyAdmin, async (req, res) => {
   }
 
   try {
-    await run('UPDATE devices SET approved = 0 WHERE discord_id = ?', [discord_id]);
+    await run('UPDATE devices SET approved = 0, discord_id = NULL WHERE discord_id = ?', [discord_id]);
     console.log(`[VPS Admin API] Deauthorized all devices registered to Discord ID ${discord_id}`);
     res.json({ success: true });
   } catch (err) {
@@ -736,7 +1033,7 @@ app.post('/admin/revoke-discord', verifyAdmin, async (req, res) => {
   }
 });
 
-// Scavenger Loop (TTL Maintenance - Fixed O(N) Mutation Implementation)
+// Scavenger Loop (TTL Maintenance)
 setInterval(() => {
   const now = Date.now();
   let stateChanged = false;
@@ -765,16 +1062,17 @@ setInterval(() => {
 
 /**
  * Format-agnostic parameters extractor. 
- * Extracts the request form part from a multipart body using actual boundaries 
- * before converting binary segments to UTF-8. Operates at the raw string level.
+ * Safely parses both direct JSON and multipart form-data streams, extracting 
+ * precise reference counts strictly from active production character_reference objects.
  */
 function extractParametersFromRawBody(buffer) {
   try {
     if (!buffer || buffer.length === 0) return null;
 
-    // Clean out massive Base64 strings to make the payload safely-parsable
     const bodyStr = buffer.toString('utf8');
     const cleanedStr = bodyStr.replace(/"(?:data:image\/[^"]+|[A-Za-z0-9+/=]{1000,})"/g, '""');
+
+    let parsed = null;
 
     // Multipart/FormData JSON Extraction
     if (buffer[0] === 0x2d && buffer[1] === 0x2d) { // "--"
@@ -785,7 +1083,6 @@ function extractParametersFromRawBody(buffer) {
       if (requestIndex !== -1 && boundary) {
         const startIdx = cleanedStr.indexOf('{', requestIndex);
         if (startIdx !== -1) {
-          // Robust exact boundary search (prevents prompt-injection dashes "--" from truncating JSON)
           const nextBoundary = cleanedStr.indexOf(boundary, startIdx);
           const endIdx = nextBoundary !== -1 ? nextBoundary : cleanedStr.length;
 
@@ -794,39 +1091,32 @@ function extractParametersFromRawBody(buffer) {
           if (lastBrace !== -1) {
             jsonCandidate = jsonCandidate.slice(0, lastBrace + 1);
           }
-
-          const parsed = JSON.parse(jsonCandidate);
-          const params = parsed.parameters || {};
-          const totalRefs = (Array.isArray(params.reference_image_multiple) ? params.reference_image_multiple.length : 0) +
-                            (Array.isArray(params.character_reference) ? params.character_reference.length : 0) +
-                            (Array.isArray(params.vibe_transfer) ? params.vibe_transfer.length : 0);
-
-          return {
-            width: params.width || null,
-            height: params.height || null,
-            steps: params.steps || null,
-            n_samples: params.n_samples || null,
-            precise_ref_count: totalRefs
-          };
+          parsed = JSON.parse(jsonCandidate);
         }
       }
     } else {
       // Direct JSON Payload Parsing
       if (cleanedStr.trim().startsWith('{')) {
-        const parsed = JSON.parse(cleanedStr);
-        const params = parsed.parameters || {};
-        const totalRefs = (Array.isArray(params.reference_image_multiple) ? params.reference_image_multiple.length : 0) +
-                          (Array.isArray(params.character_reference) ? params.character_reference.length : 0) +
-                          (Array.isArray(params.vibe_transfer) ? params.vibe_transfer.length : 0);
-
-        return {
-          width: params.width || parsed.width || null,
-          height: params.height || parsed.height || null,
-          steps: params.steps || parsed.steps || null,
-          n_samples: params.n_samples || parsed.n_samples || null,
-          precise_ref_count: totalRefs
-        };
+        parsed = JSON.parse(cleanedStr);
       }
+    }
+
+    if (parsed) {
+      const params = parsed.parameters || parsed || {};
+      
+      // Multi-schema safety fallback: scan legacy, current, and alternative reference schemas
+      const preciseRefs = 
+        (Array.isArray(params.director_reference_images_cached) ? params.director_reference_images_cached.length : 0) +
+        (Array.isArray(params.director_reference_images) ? params.director_reference_images.length : 0) +
+        (Array.isArray(params.reference_image_multiple) ? params.reference_image_multiple.length : 0);
+
+      return {
+        width: params.width || parsed.width || null,
+        height: params.height || parsed.height || null,
+        steps: params.steps || parsed.steps || null,
+        n_samples: params.n_samples || parsed.n_samples || null,
+        precise_ref_count: preciseRefs
+      };
     }
   } catch (err) {
     console.error('[VPS Audit] Error extracting parameters:', err);
@@ -863,6 +1153,13 @@ async function runBackgroundAudit(browserId, payloadBuffer) {
                       (actualSamples !== 1) || 
                       (actualRefs > config.preciseLimit);
 
+  // Accounting Ledger Integration: Tracks master Anlas consumption (5 per precise reference)
+  const anlasSpent = actualRefs * 5;
+  if (anlasSpent > 0) {
+    await run('UPDATE devices SET anlas_consumed = anlas_consumed + ? WHERE browser_id = ?', [anlasSpent, browserId]);
+    console.log(`[VPS Audit Ledger] Deducted ${anlasSpent} Anlas on user profile ${device.discord_id || browserId} (refs used: ${actualRefs})`);
+  }
+
   if (isViolation) {
     console.warn(`\x1b[31m[VPS SECURITY AUDIT] !!! VIOLATION DETECTED !!!\x1b[0m`);
     console.warn(`[VPS Security Audit] Device: "${browserId}", Tier: "${device.priority_tier}"`);
@@ -871,12 +1168,12 @@ async function runBackgroundAudit(browserId, payloadBuffer) {
     try {
       if (device.discord_id) {
         console.warn(`[VPS Security Audit] Revoking all devices linked to Discord ID: "${device.discord_id}"`);
-        await run('INSERT OR REPLACE INTO banned_discords (discord_id, banned_at, reason) VALUES (?, ?, ?)', [
+        await run('INSERT OR REPLACE INTO banned_discords (discord_id, banned_at, reason, is_notified) VALUES (?, ?, ?, 0)', [
           device.discord_id,
           Date.now(),
-          `Firewall Violation: ${width}x${height}, steps: ${actualSteps}, refs: ${actualRefs} on device ${browserId}`
+          `Firewall Violation: Max Steps=${maxSteps}, Max Refs=${config.preciseLimit}. Attempted: Steps=${actualSteps}, Refs=${actualRefs} on device ${browserId}`
         ]);
-        await run('UPDATE devices SET approved = 0 WHERE discord_id = ?', [device.discord_id]);
+        await run('UPDATE devices SET approved = 0, discord_id = NULL WHERE discord_id = ?', [device.discord_id]);
       } else {
         console.warn(`[VPS Security Audit] Revoking browser_id directly: "${browserId}"`);
         await run('UPDATE devices SET approved = 0 WHERE browser_id = ?', [browserId]);

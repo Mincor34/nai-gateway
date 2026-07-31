@@ -30,13 +30,15 @@ const initDatabase = () => {
         label TEXT,
         priority_tier TEXT NOT NULL DEFAULT 'Normal',
         approved INTEGER NOT NULL DEFAULT 0,
-        discord_id TEXT
+        discord_id TEXT,
+        anlas_consumed INTEGER NOT NULL DEFAULT 0
       )`, (err) => { if (err) return reject(err); });
       
       db.run(`CREATE TABLE IF NOT EXISTS banned_discords (
         discord_id TEXT PRIMARY KEY,
         banned_at INTEGER NOT NULL,
-        reason TEXT
+        reason TEXT,
+        is_notified INTEGER NOT NULL DEFAULT 0
       )`, (err) => { if (err) return reject(err); });
       
       db.run(`CREATE TABLE IF NOT EXISTS config (
@@ -58,15 +60,24 @@ const initDatabase = () => {
         if (err) return reject(err);
         
         const hasDiscordId = rows.some(row => row.name === 'discord_id');
+        const hasAnlas = rows.some(row => row.name === 'anlas_consumed');
+        
         if (!hasDiscordId) {
-          db.run("ALTER TABLE devices ADD COLUMN discord_id TEXT", (alterErr) => {
-            if (alterErr) return reject(alterErr);
-            console.log("[Database] Migration complete: 'discord_id' column appended.");
-            resolve();
-          });
-        } else {
-          resolve();
+          db.run("ALTER TABLE devices ADD COLUMN discord_id TEXT");
         }
+        if (!hasAnlas) {
+          db.run("ALTER TABLE devices ADD COLUMN anlas_consumed INTEGER NOT NULL DEFAULT 0");
+        }
+        
+        // Audit banned_discords column extensions
+        db.all("PRAGMA table_info(banned_discords)", (banErr, banRows) => {
+          if (banErr) return reject(banErr);
+          const hasNotified = banRows.some(row => row.name === 'is_notified');
+          if (!hasNotified) {
+            db.run("ALTER TABLE banned_discords ADD COLUMN is_notified INTEGER NOT NULL DEFAULT 0");
+          }
+          resolve();
+        });
       });
     });
   });
