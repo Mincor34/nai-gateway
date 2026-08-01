@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         NovelAI Split-Token Gateway Coordinator (Admin Panel)
 // @namespace    http://tampermonkey.net/
-// @version      3.1.4
-// @description  Secure administration panel and session token injector
+// @version      3.1.5
+// @description  Secure administration panel, telemetry dashboard, and session token injector
 // @author       Minco
 // @match        https://novelai.net/*
 // @match        https://*.novelai.net/*
@@ -18,19 +18,25 @@
 /**
  * ADMINISTRATIVE UTILITY (nai-admin.user.js)
  *
- * Implements a secure control layer on top of the NovelAI site UI.
- * Connects directly to the VPS using privileged background XMLHttpRequest tasks 
- * to bypass browser-level CSP (Content Security Policy) protections.
+ * Implements a high-security control and telemetry layout on top of the NovelAI Single Page App (SPA).
+ * Intercepts outbound generation requests, manages dynamic FIFO queuing, and executes secure token swaps
+ * over the VPS gateway while preserving local cryptographic database keystores.
  *
- * Key Operations:
- * - Manage and approve device registrations.
- * - Set queue priority tiers on active devices.
- * - Extract and push active tokens securely to SQLite storage on the VPS.
+ * SECURITY DESIGN PRINCIPLE:
+ * Outbound requests targeting the VPS `/proxy/` and `/queue/` endpoints are routed using Tampermonkey's
+ * privileged background XMLHttpRequests (`GM_xmlhttpRequest`) [Plan.md]. This breaks through local Content
+ * Security Policy (CSP) headers served by novelai.net that would otherwise block connection sockets to
+ * your external gateway domain.
  */
 
 (function() {
     'use strict';
 
+    /**
+     * Generates a cryptographically random RFC4122 UUID.
+     *
+     * @returns {string} Clean RFC4122 UUID.
+     */
     function generateUUID() {
         let d = new Date().getTime();
         let d2 = ((typeof performance !== 'undefined') && performance.now && (performance.now() * 1000)) || 0;
@@ -51,6 +57,8 @@
     let deviceSecret = GM_getValue("admin_token"); // Admin uses system key directly as secret
     let approved = GM_getValue("approved", false);
     let VPS_HOST = GM_getValue("vps_host", "");
+    let currentSort = GM_getValue("admin_sort_mode", "anlas"); // Persistence across browser refreshes
+    const expandedKeys = new Set(); // Stores collapsible states of client groups (RAM-only)
 
     try {
         if (!browserId) {
@@ -61,28 +69,37 @@
         console.error("Nai-Admin: Storage initialization crash:", err);
     }
 
+    /**
+     * Executes a network call in the privileged background context of the extension.
+     *
+     * @param {object} details - Request properties dictionary.
+     * @returns {Promise<object>} Resolves with response context.
+     */
     function backgroundRequest(details) {
+        const headers = details.headers || {};
+        headers["x-script-version"] = GM_info.script.version; // Dynamically inject version metadata
+
         return new Promise((resolve, reject) => {
             GM_xmlhttpRequest({
                 ...details,
+                headers,
                 onload: (r) => resolve(r),
                 onerror: (e) => reject(e)
             });
         });
     }
 
-    // High-frequency UI enforcement loop (forces UI overlay to stay mounted and visible)
+    // High-frequency UI enforcement loop (forces UI overlay to stay mounted and visible during initial config)
     let enforcementInterval = null;
 
     function startUIEnforcement() {
         if (enforcementInterval) return;
         console.log("Nai-Admin: Starting high-frequency UI enforcement loop...");
         enforcementInterval = setInterval(() => {
-            if (!document.body) return; // Wait for body to be constructed
+            if (!document.body) return; // Wait for document body to construct
 
             let overlay = document.getElementById("vps-approval-overlay");
             if (!overlay) {
-                console.log("Nai-Admin: UI overlay was missing or deleted by React. Re-injecting...");
                 overlay = document.createElement("div");
                 overlay.id = "vps-approval-overlay";
                 overlay.style.cssText = "position:fixed !important; top:0 !important; left:0 !important; width:100vw !important; height:100vh !important; background:#121212 !important; color:#fff !important; z-index:2147483647 !important; display:flex !important; flex-direction:column !important; align-items:center !important; justify-content:center !important; font-family:sans-serif !important;";
@@ -93,8 +110,9 @@
     }
 
     /**
-     * Renders the sequential admin setup wizard.
-     * Step 3 prompts for the master ADMIN_SECRET_KEY to verify the device directly.
+     * Renders the administrative setup configuration wizard.
+     *
+     * @param {HTMLElement} container - Outer viewport mount target.
      */
     function renderSetupWizard(container) {
         if (container.querySelector(".setup-wizard-card")) return;
@@ -163,7 +181,7 @@
             step1Status.innerHTML = "Connecting to server...";
 
             try {
-                // Connection evaluation ping targeting gateway authorization endpoint
+                // Verification ping to confirm domain connection path is alive
                 const res = await backgroundRequest({
                     method: "GET",
                     url: `${val}/auth/status?browser_id=ping`
@@ -226,7 +244,7 @@
 
         function showStep3() {
             step3Content.innerHTML = `
-                <div style="margin-bottom:10px;">Your device is registered! Enter your Admin Passkey to authenticate this admin terminal:</div>
+                <div style="margin-bottom:10px; font-family:sans-serif;">Your device is registered! Enter your Admin Passkey to authenticate this admin terminal:</div>
                 <div style="display:flex; gap:10px; margin-bottom:10px;">
                     <input type="password" id="setup-admin-key" placeholder="Enter admin passkey..." style="flex:1; background:#111; border:1px solid #444; color:#fff; padding:8px; font-size:12px; border-radius:3px;">
                     <button id="btn-verify-admin" style="background:#e74c3c; border:none; color:#fff; padding:8px 15px; font-size:11px; font-weight:bold; cursor:pointer; border-radius:3px; font-family:sans-serif;">Verify</button>
@@ -299,7 +317,7 @@
 
     if (!approved || !VPS_HOST || !deviceSecret) {
         startUIEnforcement();
-        return; // Halt loading sequence
+        return; // Halt script parsing and bypass loading overlays
     }
 
     // Build float controller button interface
@@ -318,35 +336,50 @@
 
         modal = document.createElement("div");
         modal.id = "vps-admin-panel";
-        modal.style = "position:fixed;top:60px;right:15px;width:350px;background:#1a1a1a;border:1px solid #c0392b;border-radius:4px;z-index:99997;color:#fff;padding:20px;font-family:sans-serif;box-shadow:0 10px 30px rgba(0,0,0,0.5);max-height:80vh;overflow-y:auto;";
+        modal.style = "position:fixed;top:60px;right:15px;width:380px;background:#1a1a1a;border:1px solid #c0392b;border-radius:4px;z-index:99997;color:#fff;padding:20px;font-family:sans-serif;box-shadow:0 10px 30px rgba(0,0,0,0.5);max-height:80vh;overflow-y:auto;";
         document.documentElement.appendChild(modal);
 
         renderAdminUI();
     }
 
+    /**
+     * Renders the administrative dashboard interface.
+     * Evaluates grouping and sorting sequences, and handles collapsible card transitions.
+     */
     async function renderAdminUI() {
         const modal = document.getElementById("vps-admin-panel");
         if (!modal) return;
 
         modal.innerHTML = `
-            <h4 style="margin:0 0 15px 0;border-bottom:1px solid #333;padding-bottom:5px;color:#c0392b;">COORDINATOR ADMINISTRATION</h4>
+            <h4 style="margin:0 0 15px 0;border-bottom:1px solid #333;padding-bottom:5px;color:#c0392b;font-weight:bold;font-family:sans-serif;">COORDINATOR ADMINISTRATION</h4>
             
-            <div style="margin-bottom:20px;">
-                <label style="display:block;font-size:11px;color:#888;margin-bottom:5px;">MASTER NOVELAI SESSION TOKEN</label>
+            <div style="margin-bottom:15px;">
+                <label style="display:block;font-size:11px;color:#888;margin-bottom:5px;font-family:sans-serif;">MASTER NOVELAI SESSION TOKEN</label>
                 <input type="password" id="vps-master-token-input" placeholder="Bearer jti_..." style="width:100%;background:#111;border:1px solid #444;color:#fff;padding:8px;font-size:11px;border-radius:3px;box-sizing:border-box;">
-                <button id="vps-btn-push-token" style="background:#27ae60;border:none;color:#fff;padding:8px 12px;margin-top:8px;font-size:11px;font-weight:bold;cursor:pointer;border-radius:3px;width:100%;">PUSH TO VPS STORAGE</button>
+                <button id="vps-btn-push-token" style="background:#27ae60;border:none;color:#fff;padding:8px 12px;margin-top:8px;font-size:11px;font-weight:bold;cursor:pointer;border-radius:3px;width:100%;font-family:sans-serif;">PUSH TO VPS STORAGE</button>
             </div>
 
-            <div>
-                <label style="display:block;font-size:11px;color:#888;margin-bottom:8px;">VERIFIED CLIENT RECORDS (CONSOLIDATED)</label>
-                <div id="vps-client-list" style="font-size:11px;display:flex;flex-direction:column;gap:10px;">
+            <div style="border-top:1px solid #333;padding-top:15px;">
+                <label style="display:block;font-size:11px;color:#888;margin-bottom:8px;font-family:sans-serif;">VERIFIED SYSTEM ACCOUNTS</label>
+                
+                <!-- Advanced sorting navigation header -->
+                <div style="display:flex; justify-content:space-between; margin-bottom:12px; font-size:10px; background:#111; padding:6px; border-radius:3px; border:1px solid #222; font-family:sans-serif;">
+                    <span style="color:#666;">Sort by:</span>
+                    <a href="#" class="sort-trigger" data-sort="anlas" style="color: ${currentSort === 'anlas' ? '#00bc8c; font-weight:bold' : '#999'}; text-decoration:none;">Anlas</a> |
+                    <a href="#" class="sort-trigger" data-sort="reqs" style="color: ${currentSort === 'reqs' ? '#00bc8c; font-weight:bold' : '#999'}; text-decoration:none;">Reqs</a> |
+                    <a href="#" class="sort-trigger" data-sort="active" style="color: ${currentSort === 'active' ? '#00bc8c; font-weight:bold' : '#999'}; text-decoration:none;">Active</a> |
+                    <a href="#" class="sort-trigger" data-sort="status" style="color: ${currentSort === 'status' ? '#00bc8c; font-weight:bold' : '#999'}; text-decoration:none;">Status</a>
+                </div>
+
+                <div id="vps-client-list" style="font-size:11px;display:flex;flex-direction:column;gap:8px;">
                     Loading system records...
                 </div>
             </div>
         `;
 
+        // Handle master session token submission
         document.getElementById("vps-btn-push-token").onclick = async () => {
-            const tk = document.getElementById("vps-master-token-input").value;
+            const tk = document.getElementById("vps-master-token-input").value.trim();
             if (!tk) return;
             try {
                 const res = await backgroundRequest({
@@ -362,6 +395,17 @@
             }
         };
 
+        // Attach event listeners for sort operations
+        modal.querySelectorAll(".sort-trigger").forEach(el => {
+            el.onclick = (e) => {
+                e.preventDefault();
+                const targetSort = e.currentTarget.getAttribute("data-sort");
+                currentSort = targetSort;
+                GM_setValue("admin_sort_mode", targetSort);
+                renderAdminUI();
+            };
+        });
+
         try {
             const res = await backgroundRequest({
                 method: "GET",
@@ -369,58 +413,138 @@
                 headers: { "Authorization": `Bearer ${deviceSecret}` }
             });
             if (res.status === 200) {
-                const groups = JSON.parse(res.responseText);
+                let groups = JSON.parse(res.responseText);
                 const container = document.getElementById("vps-client-list");
                 if (groups.length === 0) {
                     container.innerHTML = "No clients pending registration.";
                     return;
                 }
+
+                // Execute selected sort criteria
+                groups.sort((a, b) => {
+                    if (currentSort === "anlas") {
+                        return b.anlas_consumed - a.anlas_consumed;
+                    } else if (currentSort === "reqs") {
+                        return b.total_requests - a.total_requests;
+                    } else if (currentSort === "active") {
+                        return b.last_active_at - a.last_active_at;
+                    } else if (currentSort === "status") {
+                        return (b.is_online ? 1 : 0) - (a.is_online ? 1 : 0);
+                    }
+                    return 0;
+                });
+
                 container.innerHTML = "";
                 groups.forEach(group => {
-                    const el = document.createElement("div");
+                    const selectorId = group.discord_id || group.devices[0].browser_id;
                     const isLinked = !!group.discord_id;
-                    const title = isLinked ? `Discord ID: <strong>${group.discord_id}</strong>` : `Unlinked Device`;
-                    el.style = "background:#222;padding:10px;border-radius:3px;border-left:3px solid " + (group.approved ? '#27ae60' : '#f39c12');
+                    const isExpanded = expandedKeys.has(selectorId);
                     
-                    let devicesHtml = '';
-                    group.devices.forEach(d => {
-                        devicesHtml += `
-                            <div style="font-size:10px;color:#ccc;padding:4px 0;border-bottom:1px solid #333;display:flex;justify-content:space-between;align-items:center;gap:4px;">
-                                <span style="word-break:break-all;">↳ <strong>${d.label}</strong> <code style="color:#777;">(${d.browser_id.substring(0,8)}...)</code></span>
-                                <button class="btn-prune-dev" data-id="${d.browser_id}" style="background:#8e44ad;border:none;color:#fff;padding:2px 6px;font-size:9px;cursor:pointer;border-radius:2px;font-weight:bold;margin-left:auto;white-space:nowrap;">PRUNE</button>
-                            </div>
-                        `;
-                    });
+                    const el = document.createElement("div");
+                    el.style.cssText = "background:#222; border-radius:4px; border:1px solid #333; overflow:hidden; display:flex; flex-direction:column; transition: border-color 0.2s;";
+                    if (group.banned === 1) {
+                        el.style.borderColor = "#c0392b"; // Render critical red borders on banned accounts
+                    }
 
-                    const selectorId = isLinked ? group.discord_id : group.devices[0].browser_id;
+                    // Online/Offline & Status tags
+                    const statusDotColor = group.is_online ? "#2ecc71" : "#7f8c8d";
+                    const statusTitle = group.is_online ? "Online" : "Offline";
+                    const bannedBadge = group.banned === 1 
+                        ? `<span style="background:#c0392b; color:#fff; font-size:8px; padding:1px 4px; border-radius:2px; font-weight:bold; margin-left:6px; letter-spacing:0.5px;">BANNED</span>` 
+                        : '';
 
+                    // Collapsed condensed header markup
                     el.innerHTML = `
-                        <div style="font-weight:bold;margin-bottom:3px;color:#00bc8c;">${title}</div>
-                        <div style="font-size:10px;color:#999;margin-top:3px;">
-                            Priority: <span style="color:#3498db;font-weight:bold;">${group.priority_tier}</span> | 
-                            Cumulative Ledger: <span style="color:#e74c3c;font-weight:bold;">${group.anlas_consumed} Anlas</span>
-                        </div>
-                        <div style="margin: 8px 0; padding: 4px; background:#151515; border-radius:2px;">
-                            ${devicesHtml}
-                        </div>
-                        <div style="display:flex;gap:5px;margin-top:8px;">
-                            <select id="tier-select-${selectorId}" style="background:#111;border:1px solid #444;color:#fff;font-size:10px;padding:3px;">
-                                <option value="Metered" ${group.priority_tier === 'Metered' ? 'selected' : ''}>Metered</option>
-                                <option value="Low" ${group.priority_tier === 'Low' ? 'selected' : ''}>Low</option>
-                                <option value="Normal" ${group.priority_tier === 'Normal' ? 'selected' : ''}>Normal</option>
-                                <option value="High" ${group.priority_tier === 'High' ? 'selected' : ''}>High</option>
-                                <option value="Admin" ${group.priority_tier === 'Admin' ? 'selected' : ''}>Admin</option>
-                            </select>
-                            <button class="btn-approve-group" data-key="${selectorId}" data-is-discord="${isLinked}" style="background:#27ae60;border:none;color:#fff;padding:4px 8px;font-size:10px;cursor:pointer;border-radius:2px;font-weight:bold;">APPROVE ALL</button>
-                            <button class="btn-revoke-group" data-key="${selectorId}" data-is-discord="${isLinked}" style="background:#c0392b;border:none;color:#fff;padding:4px 8px;font-size:10px;cursor:pointer;border-radius:2px;font-weight:bold;">REVOKE ALL</button>
+                        <div class="client-card-header" data-key="${selectorId}" style="padding:12px; cursor:pointer; display:flex; align-items:center; justify-content:space-between; background:#1e1e1e; user-select:none;">
+                            <div style="display:flex; align-items:center; gap:8px; max-width:60%;">
+                                <div style="width:7px; height:7px; border-radius:50%; background:${statusDotColor};" title="${statusTitle}"></div>
+                                <span style="font-weight:bold; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; color:#fff;">${group.discord_username}</span>
+                                ${bannedBadge}
+                            </div>
+                            <div style="font-size:10px; color:#aaa; display:flex; gap:10px; align-items:center;">
+                                <span style="color:#00bc8c; font-weight:bold;">${group.anlas_consumed}A</span>
+                                <span style="color:#3498db; font-weight:bold;">${group.total_requests}R</span>
+                                <span style="font-size:8px; color:#555;">${isExpanded ? '▲' : '▼'}</span>
+                            </div>
                         </div>
                     `;
+
+                    // Expanded detailed view panel
+                    if (isExpanded) {
+                        const body = document.createElement("div");
+                        body.style.cssText = "padding:12px; border-top:1px solid #333; background:#252525; display:flex; flex-direction:column; gap:10px;";
+                        
+                        let devicesHtml = '';
+                        group.devices.forEach(d => {
+                            const devOnlineColor = d.is_online ? "#2ecc71" : "#7f8c8d";
+                            const devBannedBadge = d.banned === 1 ? `<span style="color:#e74c3c; font-weight:bold; margin-left:4px;">(BANNED)</span>` : '';
+                            devicesHtml += `
+                                <div style="font-size:10px; color:#ccc; padding:6px 0; border-bottom:1px solid #444; display:flex; justify-content:space-between; align-items:center; gap:10px;">
+                                    <div style="display:flex; align-items:center; gap:6px; min-width:0; flex:1;">
+                                        <div style="width:5px; height:5px; border-radius:50%; background:${devOnlineColor};"></div>
+                                        <span style="overflow:hidden; text-overflow:ellipsis; white-space:nowrap;"><strong>${d.label}</strong> ${devBannedBadge} <code style="color:#666;">(${d.browser_id.substring(0,8)}...)</code></span>
+                                    </div>
+                                    <button class="btn-prune-dev" data-id="${d.browser_id}" style="background:#8e44ad; border:none; color:#fff; padding:2px 6px; font-size:9px; cursor:pointer; border-radius:2px; font-weight:bold; flex-shrink:0;">PRUNE</button>
+                                </div>
+                            `;
+                        });
+
+                        const lastActiveDate = group.last_active_at > 0 
+                            ? new Date(group.last_active_at).toLocaleTimeString() 
+                            : 'Never';
+
+                        const banToggleBtn = group.banned === 1
+                            ? `<button class="btn-unban-group" data-key="${selectorId}" data-is-discord="${isLinked}" style="background:#27ae60; border:none; color:#fff; padding:5px 10px; font-size:10px; cursor:pointer; border-radius:3px; font-weight:bold; flex:1;">UNBAN USER</button>`
+                            : `<button class="btn-ban-group" data-key="${selectorId}" data-is-discord="${isLinked}" style="background:#c0392b; border:none; color:#fff; padding:5px 10px; font-size:10px; cursor:pointer; border-radius:3px; font-weight:bold; flex:1;">BAN USER</button>`;
+
+                        body.innerHTML = `
+                            <div style="display:grid; grid-template-columns:1fr 1fr; gap:6px; font-size:10px; color:#aaa; margin-bottom:4px;">
+                                <div>Tier: <strong style="color:#00bc8c;">${group.priority_tier}</strong></div>
+                                <div>Last Active: <strong style="color:#fff;">${lastActiveDate}</strong></div>
+                                <div style="grid-column: span 2;">Discord ID: <code style="background:#111; padding:2px 4px; border-radius:2px; color:#888;">${group.discord_id || 'Unlinked'}</code></div>
+                            </div>
+
+                            <div style="background:#1a1a1a; padding:8px; border-radius:3px; border:1px solid #333;">
+                                <div style="font-weight:bold; font-size:9px; color:#555; text-transform:uppercase; margin-bottom:5px;">Hardware Footprints</div>
+                                ${devicesHtml || '<div style="color:#666; font-style:italic; font-size:10px;">No hardware linked.</div>'}
+                            </div>
+
+                            <div style="display:flex; gap:6px; margin-top:4px;">
+                                <select id="tier-select-${selectorId}" style="background:#111; border:1px solid #444; color:#fff; font-size:10px; padding:4px 6px; border-radius:3px;">
+                                    <option value="Metered" ${group.priority_tier === 'Metered' ? 'selected' : ''}>Metered</option>
+                                    <option value="Low" ${group.priority_tier === 'Low' ? 'selected' : ''}>Low</option>
+                                    <option value="Normal" ${group.priority_tier === 'Normal' ? 'selected' : ''}>Normal</option>
+                                    <option value="High" ${group.priority_tier === 'High' ? 'selected' : ''}>High</option>
+                                    <option value="Admin" ${group.priority_tier === 'Admin' ? 'selected' : ''}>Admin</option>
+                                </select>
+                                <button class="btn-approve-group" data-key="${selectorId}" data-is-discord="${isLinked}" style="background:#2980b9; border:none; color:#fff; padding:5px 10px; font-size:10px; cursor:pointer; border-radius:3px; font-weight:bold; flex:1;">APPROVE & SET</button>
+                                <button class="btn-revoke-group" data-key="${selectorId}" data-is-discord="${isLinked}" style="background:#7f8c8d; border:none; color:#fff; padding:5px 10px; font-size:10px; cursor:pointer; border-radius:3px; font-weight:bold; flex:1;">REVOKE</button>
+                                ${banToggleBtn}
+                            </div>
+                        `;
+                        el.appendChild(body);
+                    }
+
                     container.appendChild(el);
                 });
 
+                // Expand/collapse click events
+                container.querySelectorAll(".client-card-header").forEach(h => {
+                    h.onclick = (e) => {
+                        const key = e.currentTarget.getAttribute("data-key");
+                        if (expandedKeys.has(key)) {
+                            expandedKeys.delete(key);
+                        } else {
+                            expandedKeys.add(key);
+                        }
+                        renderAdminUI();
+                    };
+                });
+
+                // Hardened action buttons utilizing e.currentTarget to bypass inner-node click tracking anomalies
                 container.querySelectorAll(".btn-approve-group").forEach(b => {
                     b.onclick = async (e) => {
-                        const target = e.target;
+                        const target = e.currentTarget;
                         const key = target.getAttribute("data-key");
                         const isDiscord = target.getAttribute("data-is-discord") === "true";
                         const tier = document.getElementById(`tier-select-${key}`).value;
@@ -441,10 +565,12 @@
 
                 container.querySelectorAll(".btn-revoke-group").forEach(b => {
                     b.onclick = async (e) => {
-                        const target = e.target;
+                        const target = e.currentTarget;
                         const key = target.getAttribute("data-key");
                         const isDiscord = target.getAttribute("data-is-discord") === "true";
                         
+                        if (!confirm(`Are you sure you want to revoke authorization for ${key}?`)) return;
+
                         const payload = isDiscord 
                             ? { discord_id: key } 
                             : { browser_id: key };
@@ -459,9 +585,54 @@
                     };
                 });
 
+                container.querySelectorAll(".btn-ban-group").forEach(b => {
+                    b.onclick = async (e) => {
+                        const target = e.currentTarget;
+                        const key = target.getAttribute("data-key");
+                        const isDiscord = target.getAttribute("data-is-discord") === "true";
+                        
+                        const reason = prompt("Enter a reason for banning this client:");
+                        if (reason === null) return; // Terminate early on cancellation
+
+                        const payload = isDiscord 
+                            ? { discord_id: key, reason } 
+                            : { browser_id: key, reason };
+
+                        const actionRes = await backgroundRequest({
+                            method: "POST",
+                            url: `${VPS_HOST}/admin/ban`,
+                            headers: { "Content-Type": "application/json", "Authorization": `Bearer ${deviceSecret}` },
+                            data: JSON.stringify(payload)
+                        });
+                        if (actionRes.status === 200) renderAdminUI();
+                    };
+                });
+
+                container.querySelectorAll(".btn-unban-group").forEach(b => {
+                    b.onclick = async (e) => {
+                        const target = e.currentTarget;
+                        const key = target.getAttribute("data-key");
+                        const isDiscord = target.getAttribute("data-is-discord") === "true";
+                        
+                        const payload = isDiscord 
+                            ? { discord_id: key } 
+                            : { browser_id: key };
+
+                        const actionRes = await backgroundRequest({
+                            method: "POST",
+                            url: `${VPS_HOST}/admin/unban`,
+                            headers: { "Content-Type": "application/json", "Authorization": `Bearer ${deviceSecret}` },
+                            data: JSON.stringify(payload)
+                        });
+                        if (actionRes.status === 200) renderAdminUI();
+                    };
+                });
+
                 container.querySelectorAll(".btn-prune-dev").forEach(b => {
                     b.onclick = async (e) => {
-                        const bid = e.target.getAttribute("data-id");
+                        const bid = e.currentTarget.getAttribute("data-id");
+                        if (!confirm(`Are you sure you want to permanently delete device registration: ${bid}?`)) return;
+
                         const actionRes = await backgroundRequest({
                             method: "POST",
                             url: `${VPS_HOST}/admin/prune-device`,
@@ -560,9 +731,9 @@
         } catch (e) {}
 
         modal.innerHTML = `
-            <h4 style="margin:0 0 15px 0; color:#00bc8c; border-bottom:1px solid #333; padding-bottom:8px; font-size:16px;">GATEWAY SETTINGS</h4>
+            <h4 style="margin:0 0 15px 0; color:#00bc8c; border-bottom:1px solid #333; padding-bottom:8px; font-size:16px; font-family:sans-serif;">GATEWAY SETTINGS</h4>
             
-            <div style="background:#111; padding:15px; border-radius:4px; margin-bottom:15px; border:1px solid #333; font-size:12px; line-height:1.6;">
+            <div style="background:#111; padding:15px; border-radius:4px; margin-bottom:15px; border:1px solid #333; font-size:12px; line-height:1.6; font-family:sans-serif;">
                 <label style="display:block; font-size:10px; color:#888; font-weight:bold; margin-bottom:6px; text-transform:uppercase; letter-spacing:0.5px;">Telemetry Stats & Profile</label>
                 <div style="display:grid; grid-template-columns:1fr 1fr; gap:10px;">
                     <div>Assigned Tier: <span style="color:#00bc8c; font-weight:bold;">Admin</span></div>
@@ -575,37 +746,36 @@
             </div>
 
             <div style="margin-bottom:15px;">
-                <label style="display:block; font-size:11px; color:#aaa; margin-bottom:5px;">NICKNAME</label>
+                <label style="display:block; font-size:11px; color:#aaa; margin-bottom:5px; font-family:sans-serif;">NICKNAME</label>
                 <div style="display:flex; gap:10px;">
                     <input type="text" id="settings-nickname" value="${nickname}" style="flex:1; background:#111; border:1px solid #444; color:#fff; padding:6px; font-size:12px; border-radius:3px;">
-                    <button id="btn-save-nickname" style="background:#27ae60; border:none; color:#fff; padding:6px 12px; font-size:11px; font-weight:bold; cursor:pointer; border-radius:3px;">Save</button>
+                    <button id="btn-save-nickname" style="background:#27ae60; border:none; color:#fff; padding:6px 12px; font-size:11px; font-weight:bold; cursor:pointer; border-radius:3px; font-family:sans-serif;">Save</button>
                 </div>
-                <div id="settings-nickname-status" style="font-size:10px; margin-top:3px; display:none;"></div>
+                <div id="settings-nickname-status" style="font-size:10px; margin-top:3px; display:none; font-family:sans-serif;"></div>
             </div>
 
             <div style="margin-bottom:15px;">
-                <label style="display:block; font-size:11px; color:#aaa; margin-bottom:5px;">VPS DOMAIN</label>
+                <label style="display:block; font-size:11px; color:#aaa; margin-bottom:5px; font-family:sans-serif;">VPS DOMAIN</label>
                 <div style="display:flex; gap:10px;">
                     <input type="text" id="settings-domain" value="${domain}" style="flex:1; background:#111; border:1px solid #444; color:#fff; padding:6px; font-size:12px; border-radius:3px;">
-                    <button id="btn-save-domain" style="background:#2980b9; border:none; color:#fff; padding:6px 12px; font-size:11px; font-weight:bold; cursor:pointer; border-radius:3px; white-space:nowrap;">Save & Reset</button>
+                    <button id="btn-save-domain" style="background:#2980b9; border:none; color:#fff; padding:6px 12px; font-size:11px; font-weight:bold; cursor:pointer; border-radius:3px; white-space:nowrap; font-family:sans-serif;">Save & Reset</button>
                 </div>
             </div>
 
-            <div style="background:#111; padding:12px; border-radius:4px; margin-bottom:15px; border:1px solid #333; font-size:11px;">
-                <label style="display:block; font-size:10px; color:#888; font-weight:bold; margin-bottom:6px; text-transform:uppercase;">Hardware Footprints Linked (Max 3)</label>
+            <div style="background:#111; padding:12px; border-radius:4px; margin-bottom:15px; border:1px solid #333; font-size:11px; font-family:sans-serif;">
+                <label style="display:block; font-size:10px; color:#888; font-weight:bold; margin-bottom:6px; text-transform:uppercase; letter-spacing:0.5px;">Hardware Footprints Linked (Max 3)</label>
                 <div style="color:#ccc; font-family:monospace; line-height:1.4;">
                     ${linkedDevicesList}
                 </div>
-                <div style="font-size:10px; color:#666; margin-top:6px;">Prune unneeded profiles natively inside Discord using \`/mygateway unlink\`.</div>
             </div>
 
-            <div style="border-top:1px solid #333; padding-top:12px; margin-top:12px;">
+            <div style="border-top:1px solid #333; padding-top:12px; margin-top:12px; font-family:sans-serif;">
                 <label style="display:flex; align-items:center; gap:8px; font-size:12px; cursor:pointer; font-weight:bold; color:#f39c12;">
                     <input type="checkbox" id="settings-debug" ${debugActive ? 'checked' : ''} style="cursor:pointer;">
                     ENABLE DEBUG MODE
                 </label>
                 <div id="debug-consent" style="font-size:11px; color:#999; margin-top:6px; line-height:1.4; background:#222; padding:8px; border-radius:4px; border-left:2px solid #f39c12;">
-                    <strong>Consent Form:</strong> Enabling Debug Mode will log full API request payloads (including prompt texts and image inputs such as image-to-image, vibe transfer, and precise reference) to the VPS log telemetry. Your NovelAI authorization token and personal account credentials will <strong>NOT</strong> be logged.
+                    <strong>Consent Form:</strong> Enabling Debug Mode will log full API request payloads (including prompt texts and image inputs) to the VPS log telemetry. Your NovelAI authorization token and personal account credentials will <strong>NOT</strong> be logged.
                 </div>
             </div>
         `;
@@ -654,9 +824,7 @@
         saveDomBtn.onclick = () => {
             let val = domInput.value.trim().replace(/\/+$/, "");
             if (!val) return;
-            if (!/^https?:\/\//i.test(val)) {
-                val = "https://" + val;
-            }
+            if (!/^https?:\/\//i.test(val)) val = "https://" + val;
             GM_setValue("vps_host", val);
             GM_setValue("approved", false);
             modal.remove();
@@ -712,9 +880,7 @@
         }
         if (responseDetails.responseHeaders) {
             const match = responseDetails.responseHeaders.match(/^HTTP\/[0-9.]+\s+(\d+)/i);
-            if (match) {
-                return parseInt(match[1], 10);
-            }
+            if (match) return parseInt(match[1], 10);
         }
         return 0; // Return 0 to indicate status code could not be resolved yet
     }
