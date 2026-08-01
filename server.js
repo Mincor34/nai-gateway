@@ -1123,6 +1123,35 @@ app.post('/admin/link', verifyAdmin, async (req, res) => {
 });
 
 /**
+ * @api {post} /admin/sync-usernames Batch Sync Discord Usernames
+ * @apiGroup Admin
+ * @apiDescription Restores and updates missing discord_username metadata on legacy database records.
+ */
+app.post('/admin/sync-usernames', verifyAdmin, async (req, res) => {
+  const { mappings } = req.body;
+  if (!mappings || !Array.isArray(mappings)) {
+    return res.status(400).json({ error: "Missing or invalid mappings payload array." });
+  }
+
+  try {
+    // Execute all updates inside sequential queries to maintain SQLite integrity
+    const promises = mappings.map(m => 
+      run(
+        'UPDATE devices SET discord_username = ? WHERE discord_id = ? AND (discord_username IS NULL OR discord_username LIKE "User (%")',
+        [m.discord_username, m.discord_id]
+      )
+    );
+    await Promise.all(promises);
+    
+    console.log(`[VPS Admin] Successfully batch synced usernames for ${mappings.length} legacy Discord profiles.`);
+    res.json({ success: true });
+  } catch (err) {
+    console.error('[VPS Admin] Failed to process batch username sync:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+/**
  * @api {post} /admin/sync-tier Synchronize Discord User Tiers
  * @apiGroup Admin
  * @apiDescription Updates priority tiers for all approved devices matched to a specific Discord identity.
