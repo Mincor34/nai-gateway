@@ -529,6 +529,10 @@ app.all('/proxy/:subdomain/{*splat}', async (req, res) => {
 });
 
 // ----------------- STANDARD API ENDPOINTS -----------------
+// Mount global body parsers to satisfy standard payload endpoints [database.js]
+app.use(express.json());
+app.use(express.urlencoded({ extended: true }));
+
 const verifyAdmin = (req, res, next) => {
   const authHeader = req.headers['authorization'];
   if (!authHeader || !authHeader.startsWith('Bearer ')) {
@@ -1134,20 +1138,26 @@ app.post('/admin/sync-usernames', verifyAdmin, async (req, res) => {
   }
 
   try {
-    // Execute all updates inside sequential queries to maintain SQLite integrity
-    const promises = mappings.map(m => 
-      run(
-        'UPDATE devices SET discord_username = ? WHERE discord_id = ? AND (discord_username IS NULL OR discord_username LIKE "User (%")',
-        [m.discord_username, m.discord_id]
-      )
-    );
-    await Promise.all(promises);
+    console.log(`[VPS Admin] Received sync payload for ${mappings.length} accounts.`);
     
-    console.log(`[VPS Admin] Successfully batch synced usernames for ${mappings.length} legacy Discord profiles.`);
+    for (const m of mappings) {
+      console.log(`[VPS Admin] Attempting write: User ID ${m.discord_id} -> Username ${m.discord_username}`);
+      await run(
+        'UPDATE devices SET discord_username = ? WHERE discord_id = ?',
+        [m.discord_username, m.discord_id]
+      );
+    }
+    
+    console.log(`[VPS Admin] Successfully batch synced usernames for ${mappings.length} Discord accounts.`);
     res.json({ success: true });
   } catch (err) {
-    console.error('[VPS Admin] Failed to process batch username sync:', err);
-    res.status(500).json({ error: err.message });
+    // Log the raw stack trace to standard error on the VPS console
+    console.error('❌ [VPS Admin] CRITICAL USERNAME SYNC FAILURE:\n', err);
+    
+    // Transmit the complete stack trace back to the bot so it can be read remotely
+    res.status(500).json({ 
+      error: `VPS_SQLITE_EXEC_ERROR: ${err.message}\nStack: ${err.stack}` 
+    });
   }
 });
 
