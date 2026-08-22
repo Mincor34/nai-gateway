@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         NovelAI Split-Token Gateway Coordinator (Guest)
 // @namespace    http://tampermonkey.net/
-// @version      3.1.4
+// @version      3.1.6
 // @description  FIFO queue coordination, metadata spoofing, and background stream proxy pipeline
 // @author       Minco
 // @match        https://novelai.net/*
@@ -124,7 +124,7 @@
             <div class="setup-wizard-card" style="background:#1c1c1c; padding:35px; border-radius:6px; border:1px solid #c0392b; box-shadow:0 8px 30px rgba(0,0,0,0.6); max-width:90vw; width:420px; box-sizing:border-box;">
                 <h3 style="margin:0 0 15px 0; color:#00bc8c; text-align:center; letter-spacing:1px; font-size:18px; font-family:sans-serif;">GATEWAY COORDINATOR SETUP</h3>
                 
-                <!-- Step 1: Gateway Domain Configuration -->
+                <!-- Gateway Domain Configuration -->
                 <div id="step-1-container" style="margin-bottom:20px;">
                     <label style="display:block; font-size:12px; color:#aaa; margin-bottom:5px; font-weight:bold; font-family:sans-serif;">STEP 1: ENTER GATEWAY DOMAIN</label>
                     <div style="display:flex; gap:10px;">
@@ -134,7 +134,7 @@
                     <div id="step-1-status" style="margin-top:5px; font-size:11px; font-family:sans-serif; display:none;"></div>
                 </div>
 
-                <!-- Step 2: Nickname Configuration -->
+                <!-- Nickname Configuration -->
                 <div id="step-2-container" style="margin-bottom:20px; display:none;">
                     <label style="display:block; font-size:12px; color:#aaa; margin-bottom:5px; font-weight:bold; font-family:sans-serif;">STEP 2: ENTER NICKNAME</label>
                     <div style="display:flex; gap:10px;">
@@ -144,7 +144,7 @@
                     <div id="step-2-status" style="margin-top:5px; font-size:11px; font-family:sans-serif; display:none;"></div>
                 </div>
 
-                <!-- Step 3: Instructions & Background Verification -->
+                <!-- Instructions & Background Verification -->
                 <div id="step-3-container" style="display:none; border-top:1px solid #333; padding-top:15px; margin-top:15px;">
                     <label style="display:block; font-size:12px; color:#aaa; margin-bottom:5px; font-weight:bold; font-family:sans-serif;">STEP 3: CONFIGURATION COMPLETE</label>
                     <div id="step-3-content" style="font-size:12px; color:#bbb; line-height:1.5; font-family:sans-serif;"></div>
@@ -355,7 +355,7 @@
         svgRing.appendChild(circle);
         container.appendChild(gearBtn);
         container.appendChild(svgRing);
-
+        
         const banner = document.getElementById("vps-queue-banner");
         if (banner) {
             banner.style.bottom = "175px"; // Adjust banner to sit stacked cleanly above the gear
@@ -862,7 +862,8 @@
                     height: parseInt(params.height || payload.height, 10) || 1024,
                     steps: parseInt(params.steps || payload.steps, 10) || 28,
                     n_samples: parseInt(params.n_samples || payload.n_samples, 10) || 1,
-                    precise_refs: preciseRefs
+                    precise_refs: preciseRefs,
+                    model: payload.model || params.model || ""
                 };
             }
         } catch (e) {
@@ -946,7 +947,7 @@
         })();
 
         const originalBody = config.body;
-        let imgParams = { width: 1024, height: 1024, steps: 28, n_samples: 1 };
+        let imgParams = { width: 1024, height: 1024, steps: 28, n_samples: 1, precise_refs: 0, model: "" };
 
         const extracted = await extractImageParams(originalBody);
         if (extracted) imgParams = extracted;
@@ -1053,6 +1054,8 @@
                     });
                 }
             }
+            // v5 Safeguard: Explicitly mark v5 generations to prevent legacy false-positive bans on VPS
+            const isV5 = typeof imgParams.model === 'string' && /[-_]5[-_]/i.test(imgParams.model);
 
             updatedHeaders.set("x-browser-id", browserId);
             updatedHeaders.set("x-request-id", req_id);
@@ -1061,6 +1064,14 @@
             updatedHeaders.set("x-gen-steps", imgParams.steps.toString());
             updatedHeaders.set("x-gen-samples", imgParams.n_samples.toString());
             updatedHeaders.set("x-precise-refs", imgParams.precise_refs.toString());
+            
+            // Enforce explicit model headers for all generations to prevent legacy false-positive bans
+            if (isV5) {
+                updatedHeaders.set("x-gen-model", "V5");
+            } else {
+                updatedHeaders.set("x-gen-model", "legacy");
+            }
+
             updatedHeaders.set("authorization", `Bearer ${deviceSecret}`);
             updatedHeaders.set("x-script-version", GM_info.script.version); // Dyn Version Injection
             if (GM_getValue("debug_mode", false)) {
@@ -1283,6 +1294,11 @@
                     status: 200,
                     headers: { 'Content-Type': 'application/json' }
                 });
+            }
+
+            // Intercept subscription telemetry to return the master account's real metrics natively
+            if (urlString.includes('/user/subscription')) {
+                return handleTextGenerationIntercept(urlString, config);
             }
 
             // Generation Interceptions (Explicitly bypass tag suggestions autocomplete to keep autocomplete functional)
