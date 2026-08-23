@@ -1149,7 +1149,7 @@
         }
 
         // Determine if the model is a V5 variant based on naming conventions
-        const isV5 = typeof imgParams.model === 'string' && /[-_]5[-_]/i.test(imgParams.model);
+        const isV5 = typeof imgParams.model === 'string' && /[-_]5[-_]/i.test(imgParams.model) && !imgParams.model.includes('4-5');
 
         updatedHeaders.set("x-browser-id", browserId);
         updatedHeaders.set("x-request-id", req_id);

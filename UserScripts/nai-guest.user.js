@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         NovelAI Split-Token Gateway Coordinator (Guest)
 // @namespace    http://tampermonkey.net/
-// @version      3.1.6
+// @version      3.1.7
 // @description  FIFO queue coordination, metadata spoofing, and background stream proxy pipeline
 // @author       Minco
 // @match        https://novelai.net/*
@@ -1055,7 +1055,7 @@
                 }
             }
             // v5 Safeguard: Explicitly mark v5 generations to prevent legacy false-positive bans on VPS
-            const isV5 = typeof imgParams.model === 'string' && /[-_]5[-_]/i.test(imgParams.model);
+            const isV5 = typeof imgParams.model === 'string' && /[-_]5[-_]/i.test(imgParams.model) && !imgParams.model.includes('4-5');
 
             updatedHeaders.set("x-browser-id", browserId);
             updatedHeaders.set("x-request-id", req_id);
