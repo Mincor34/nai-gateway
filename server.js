@@ -132,16 +132,19 @@ function getOrInitBucket(browserId, tier) {
  */
 async function syncTelemetry() {
   if (is_fetching) return;
+  
+  // Set lock state at entry point before crossing any asynchronous await boundaries
+  is_fetching = true;
 
   try {
     const configRecord = await get('SELECT value FROM config WHERE key = ?', ['master_token']);
     if (!configRecord || !configRecord.value) {
       console.warn("[VPS Harvester] Telemetry sync skipped: No master_token configured in database yet.");
+      is_fetching = false; // Release lock on early return
       return;
     }
     const masterToken = configRecord.value;
 
-    is_fetching = true;
     console.log("[VPS Harvester] Fetching master subscription telemetry from image.novelai.net...");
 
     await new Promise((resolve, reject) => {
@@ -198,7 +201,7 @@ async function syncTelemetry() {
     console.error("[VPS Harvester] Critical exception thrown in telemetry harvester sync:", err);
     throw err; // Rethrow to let the boot sequence handle warm boot failures explicitly
   } finally {
-    is_fetching = false;
+    is_fetching = false; // Release the lock on operational exit
   }
 }
 
