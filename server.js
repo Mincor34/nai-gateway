@@ -3,7 +3,8 @@
  * A monolith to surpass Wailord's cock!
  *
  * Implements:
- * - Sequential Promise DB Startup Guard
+ * - Sequential Promise DB Startup Guard with Resilient Warm-Boot Sync
+ * - Event-Driven Master Account V5 Protection Layer
  * - Preserved Fractional Token Accumulation (RAM-bound)
  * - Safe Boundary-Sliced Multipart JSON Parser for Background Post-Audits
  * - Dual-Rate Dynamic Queue Aging with 120s AUTO Promotion
@@ -27,6 +28,12 @@ if (!ADMIN_SECRET_KEY) {
   process.exit(1);
 }
 
+// v5 Protection Layer State (RAM Cache Registry)
+let master_v5_percent = 100;
+let last_fetched_at = 0;
+let is_hard_locked = false;
+let is_fetching = false;
+
 // Config metrics establishing system-wide rate bounds
 const TIER_CONFIGS = {
   'Admin':   { basePriority: 30, slope: 'fast', maxBurst: Infinity,  refillRate: 0,      preciseLimit: Infinity },
@@ -41,7 +48,8 @@ const PROXY_PATH_WHITELIST = new Set([
   'ai/generate-image-stream',
   'ai/encode-vibe',      // Whitelisted path to support vibe transfer pre-processing via master token
   'ai/generate-stream',  // Legacy Text/story Generation API endpoint
-  'oa/v1/completions'    // New OpenAI-compatible Text Generation API endpoint (GLM-4, Erato, Xialong, etc.)
+  'oa/v1/completions',   // New OpenAI-compatible Text Generation API endpoint (GLM-4, Erato, Xialong, etc.)
+  'user/subscription'    // Allow proxying of read-only subscription telemetry to spoof native UI meters
 ]);
 
 // Volatile token buckets and queues (RAM-bound to maximize throughput and avoid I/O bottlenecks)
@@ -116,6 +124,85 @@ function getOrInitBucket(browserId, tier) {
     }
   }
   return bucket;
+}
+
+/**
+ * Asynchronously synchronizes master account subscription telemetry.
+ * Traps runtime exceptions to prevent process crashes and cache stampede memory leaks.
+ */
+async function syncTelemetry() {
+  if (is_fetching) return;
+  
+  // Set lock state at entry point before crossing any asynchronous await boundaries
+  is_fetching = true;
+
+  try {
+    const configRecord = await get('SELECT value FROM config WHERE key = ?', ['master_token']);
+    if (!configRecord || !configRecord.value) {
+      console.warn("[VPS Harvester] Telemetry sync skipped: No master_token configured in database yet.");
+      is_fetching = false; // Release lock on early return
+      return;
+    }
+    const masterToken = configRecord.value;
+
+    console.log("[VPS Harvester] Fetching master subscription telemetry from image.novelai.net...");
+
+    await new Promise((resolve, reject) => {
+      const options = {
+        hostname: 'image.novelai.net',
+        path: '/user/subscription',
+        method: 'GET',
+        headers: {
+          'Authorization': `Bearer ${masterToken}`,
+          'User-Agent': 'nai-gateway-v5-harvester/1.0'
+        },
+        timeout: 8000
+      };
+
+      const req = https.request(options, (res) => {
+        let rawData = '';
+        res.on('data', chunk => rawData += chunk);
+        res.on('end', () => {
+          try {
+            if (res.statusCode === 200) {
+              const payload = JSON.parse(rawData);
+              const percent = payload.usage?.percent;
+              if (typeof percent === 'number') {
+                master_v5_percent = percent;
+                last_fetched_at = Date.now();
+                is_hard_locked = (percent < 10);
+                console.log(`[VPS Harvester] Telemetry sync successful. Capacity: ${master_v5_percent}%, Locked: ${is_hard_locked}`);
+                resolve();
+              } else {
+                reject(new Error("Malformed subscription response payload: usage.percent missing."));
+              }
+            } else {
+              reject(new Error(`Upstream returned error status code: ${res.statusCode}`));
+            }
+          } catch (parseErr) {
+            reject(parseErr);
+          }
+        });
+      });
+
+      req.on('error', (err) => {
+        reject(err);
+      });
+
+      req.on('timeout', () => {
+        req.destroy();
+        reject(new Error("Upstream fetch timed out after 8000ms."));
+      });
+
+      req.end();
+    });
+
+  } catch (err) {
+    console.error("[VPS Harvester] Critical exception thrown in telemetry harvester sync:", err);
+    throw err; // Rethrow to let the boot sequence handle warm boot failures explicitly
+  } finally {
+    is_fetching = false; // Release the lock on operational exit
+  }
 }
 
 // ----------------- SECURE PAYLOAD TELEMETRY UTILITIES -----------------
@@ -288,12 +375,14 @@ app.all('/proxy/:subdomain/{*splat}', async (req, res) => {
 
   pingDevice(browserId);
 
+  const isImageGen = pathPart === 'ai/generate-image' || pathPart === 'ai/generate-image-stream';
+  const genModelHeader = req.headers['x-gen-model'];
+
   // Declare variables in the parent scope to prevent resource leakage on aborted uploads
   let activeTask = null;
   let upstreamReq = null;
   let cleanupExecuted = false;
   let isTextGenClaimed = false;
-  let isImageGen = false;
   let isTextGen = false;
 
   // Single-Path Resource Cleanup logic to mitigate duplicate execution and race conditions.
@@ -316,6 +405,23 @@ app.all('/proxy/:subdomain/{*splat}', async (req, res) => {
         queue.splice(idx, 1);
         console.log(`[VPS Telemetry] Stream cleaned up. Slot released for request: "${activeTask.req_id}"`);
         processQueue();
+      }
+    }
+
+    // v5 Protection Layer: Trigger Telemetry Harvester on natural V5 completion
+    const isV5Request = genModelHeader === 'V5';
+    if (isImageGen && isV5Request) {
+      const now = Date.now();
+      // Harvester Cooldown Throttling: 30-second minimum rate-limit boundary
+      if (!is_fetching && (now - last_fetched_at > 30000)) {
+        console.log("[VPS Telemetry] V5 generation concluded. Initiating background capacity harvest...");
+        setImmediate(() => {
+          syncTelemetry().catch(err => console.error("[VPS Telemetry] Out-of-band telemetry sync aborted:", err.message));
+        });
+      } else if (is_fetching) {
+        console.log("[VPS Telemetry] Telemetry Harvester is currently active. Skipping overlapping harvest.");
+      } else {
+        console.log("[VPS Telemetry] Telemetry Harvester cooldown in effect. Skipping harvest trigger.");
       }
     }
   };
@@ -359,7 +465,44 @@ app.all('/proxy/:subdomain/{*splat}', async (req, res) => {
       return res.status(401).json({ error: 'Access Denied: Device pending registration approval.' });
     }
 
-    isImageGen = pathPart === 'ai/generate-image' || pathPart === 'ai/generate-image-stream';
+    // Run selective V5 check AFTER authentication.
+    if (isImageGen) {
+      // Reject missing model headers to prevent accidental bans on outdated clients
+      if (!genModelHeader) {
+        console.warn(`[VPS Gatekeeper] Rejected image gen request from browser "${browserId}" due to missing model validation header (outdated script).`);
+        return res.status(426).json({
+          statusCode: 426,
+          error: 'SCRIPT_UPDATE_REQUIRED',
+          message: 'Your NovelAI Gateway Tampermonkey userscript is outdated. Please update to the latest version to proceed.'
+        });
+      }
+
+      const isV5Request = genModelHeader === 'V5';
+      if (isV5Request) {
+        const now = Date.now();
+        const isStale = last_fetched_at > 0 && (now - last_fetched_at > 1800000); // 30-minute staleness
+        const isUninitialized = last_fetched_at === 0;
+
+        // Fail-Closed Safeguard: lock V5 on uninitialized or stale state & trigger self-healing sync
+        if (isStale || isUninitialized) {
+          is_hard_locked = true;
+          console.warn(`[VPS Gatekeeper] Telemetry state is ${isUninitialized ? 'uninitialized' : 'stale'}. Forcing V5 lockout & triggering out-of-band refresh.`);
+          setImmediate(() => {
+            syncTelemetry().catch(err => console.error("[VPS Gatekeeper] Self-healing background sync failed:", err.message));
+          });
+        }
+
+        if (is_hard_locked) {
+          console.warn(`[VPS Gatekeeper] V5 generation rejected for browser "${browserId}". V5 Percent: ${master_v5_percent}%, Last Fetched Age: ${isUninitialized ? 'never' : ((now - last_fetched_at) / 1000).toFixed(1) + 's'}`);
+          return res.status(429).json({
+            statusCode: 429,
+            error: 'V5_CAPACITY_DEPLETED',
+            message: 'v5 generation is temporarily disabled due to low master account capacity (<10%). Try again in a few minutes, or switch to an older model.'
+          });
+        }
+      }
+    }
+
     isTextGen = pathPart === 'ai/generate-stream' || pathPart === 'oa/v1/completions';
 
     if (isImageGen) {
@@ -446,7 +589,9 @@ app.all('/proxy/:subdomain/{*splat}', async (req, res) => {
             [Date.now(), browserId]
           );
           if (isImageGen && deviceSecret !== ADMIN_SECRET_KEY) {
-            await runBackgroundAudit(browserId, payloadBuffer);
+            // Background parameters and model spoof manipulation validation audit
+            const isV5Request = genModelHeader === 'V5';
+            await runBackgroundAudit(browserId, payloadBuffer, isV5Request);
           }
         } catch (err) {
           console.error('[VPS Audit] Session tracking error:', err);
@@ -469,7 +614,7 @@ app.all('/proxy/:subdomain/{*splat}', async (req, res) => {
       // Strip 'content-length' and 'transfer-encoding' to re-calculate them dynamically.
       const stripHeaders = [
         'x-browser-id', 'x-request-id', 'x-gen-width', 'x-gen-height', 'x-gen-steps', 'x-gen-samples', 'x-debug-mode', 'x-script-version',
-        'connection', 'content-length', 'transfer-encoding'
+        'x-gen-model', 'connection', 'content-length', 'transfer-encoding'
       ];
       stripHeaders.forEach(h => delete headers[h]);
 
@@ -651,7 +796,8 @@ app.get('/auth/status', async (req, res) => {
       anlas_consumed: row.anlas_consumed || 0,
       precise_limit: TIER_CONFIGS[row.priority_tier]?.preciseLimit ?? 0,
       session: sessionInfo,
-      linked_devices: linkedDevices
+      linked_devices: linkedDevices,
+      master_v5_percent: master_v5_percent // Synchronized with frontend visual status gauges
     });
   } catch (err) {
     console.error('[VPS Telemetry] Authentication verification query failure:', err);
@@ -1322,7 +1468,8 @@ function extractParametersFromRawBody(buffer) {
         height: params.height || parsed.height || null,
         steps: params.steps || parsed.steps || null,
         n_samples: params.n_samples || parsed.n_samples || null,
-        precise_ref_count: preciseRefs
+        precise_ref_count: preciseRefs,
+        model: parsed.model || params.model || null
       };
     }
   } catch (err) {
@@ -1337,12 +1484,13 @@ function extractParametersFromRawBody(buffer) {
  *
  * @param {string} browserId - Unique device key.
  * @param {Buffer} payloadBuffer - Outbound parameters buffer.
+ * @param {boolean} clientReportedV5 - Model validation flag received in header.
  */
-async function runBackgroundAudit(browserId, payloadBuffer) {
+async function runBackgroundAudit(browserId, payloadBuffer, clientReportedV5) {
   const actualParams = extractParametersFromRawBody(payloadBuffer);
   if (!actualParams) return;
 
-  const { width, height, steps, n_samples, precise_ref_count } = actualParams;
+  const { width, height, steps, n_samples, precise_ref_count, model } = actualParams;
   
   const actualPixels = (width && height) ? (width * height) : 0;
   const actualSteps = steps || 0;
@@ -1358,10 +1506,16 @@ async function runBackgroundAudit(browserId, payloadBuffer) {
 
   const config = TIER_CONFIGS[device.priority_tier] || TIER_CONFIGS['Normal'];
   
+  // Firewall Parametric Rule Validation
   const isViolation = (actualPixels > maxPixels) || 
                       (actualSteps > maxSteps) || 
                       (actualSamples !== 1) || 
                       (actualRefs > config.preciseLimit);
+
+  // Post-Gen Audit: validation against model-spoofing bypass attempts
+  // Match V5 identifier patterns
+  const isV5Model = typeof model === 'string' && /[-_]5[-_]/i.test(model);
+  const bypassViolation = isV5Model && !clientReportedV5;
 
   // Accounting Ledger Integration: Tracks master Anlas consumption (5 per precise reference)
   const anlasSpent = actualRefs * 5;
@@ -1370,18 +1524,28 @@ async function runBackgroundAudit(browserId, payloadBuffer) {
     console.log(`[VPS Audit Ledger] Deducted ${anlasSpent} Anlas on user profile ${device.discord_id || browserId} (refs used: ${actualRefs})`);
   }
 
-  if (isViolation) {
+  if (isViolation || bypassViolation) {
     console.warn(`\x1b[31m[VPS SECURITY AUDIT] !!! VIOLATION DETECTED !!!\x1b[0m`);
     console.warn(`[VPS Security Audit] Device: "${browserId}", Tier: "${device.priority_tier}"`);
-    console.warn(`[VPS Security Audit] Params: ${width}x${height} (${actualPixels} px), Steps: ${actualSteps}, Refs: ${actualRefs} (Limit: ${config.preciseLimit})`);
+    
+    if (isViolation) {
+      console.warn(`[VPS Security Audit] Params: ${width}x${height} (${actualPixels} px), Steps: ${actualSteps}, Refs: ${actualRefs} (Limit: ${config.preciseLimit})`);
+    }
+    if (bypassViolation) {
+      console.warn(`[VPS Security Audit] Bypass violation: Real model is V5 ("${model}"), but client omitted the X-Gen-Model: V5 header.`);
+    }
 
     try {
+      const banReason = bypassViolation 
+        ? `Firewall Bypass Violation: Client generated with V5 model ("${model}") but suppressed X-Gen-Model: V5 header.`
+        : `Firewall Violation: Max Steps=${maxSteps}, Max Refs=${config.preciseLimit}. Attempted: Steps=${actualSteps}, Refs=${actualRefs} on device ${browserId}`;
+
       if (device.discord_id) {
         console.warn(`[VPS Security Audit] Revoking all devices linked to Discord ID: "${device.discord_id}"`);
         await run('INSERT OR REPLACE INTO banned_discords (discord_id, banned_at, reason, is_notified) VALUES (?, ?, ?, 0)', [
           device.discord_id,
           Date.now(),
-          `Firewall Violation: Max Steps=${maxSteps}, Max Refs=${config.preciseLimit}. Attempted: Steps=${actualSteps}, Refs=${actualRefs} on device ${browserId}`
+          banReason
         ]);
         await run('UPDATE devices SET banned = 1 WHERE discord_id = ?', [device.discord_id]);
       } else {
@@ -1395,9 +1559,16 @@ async function runBackgroundAudit(browserId, payloadBuffer) {
   }
 }
 
-// Sequential Promise DB Bootstrapper
+// Sequential Promise DB Bootstrapper with Resilient warm boot telemetry synchronizer
 initDatabase()
-  .then(() => {
+  .then(async () => {
+    try {
+      console.log("[VPS Boot] Executing warm boot subscription sync...");
+      await syncTelemetry();
+    } catch (warmBootErr) {
+      console.warn("[VPS Boot] Warm boot telemetry pull failed. Initializing with default failsafe metrics:", warmBootErr.message);
+    }
+    
     app.listen(PORT, '127.0.0.1', () => console.log(`Gateway coordinator running on port ${PORT}`));
   })
   .catch((err) => {
