@@ -1514,7 +1514,7 @@ async function runBackgroundAudit(browserId, payloadBuffer, clientReportedV5) {
 
   // Post-Gen Audit: validation against model-spoofing bypass attempts
   // Match V5 identifier patterns
-  const isV5Model = typeof model === 'string' && /[-_]5[-_]/i.test(model);
+  const isV5Model = typeof model === 'string' && /[-_]5[-_]/i.test(model) && !model.includes('4-5');
   const bypassViolation = isV5Model && !clientReportedV5;
 
   // Accounting Ledger Integration: Tracks master Anlas consumption (5 per precise reference)
