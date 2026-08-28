@@ -8,7 +8,7 @@
  * - Preserved Fractional Token Accumulation (RAM-bound)
  * - Safe Boundary-Sliced Multipart JSON Parser for Background Post-Audits
  * - Dual-Rate Dynamic Queue Aging with 120s AUTO Promotion
- * - Explicit Session Authorization on Queue Entry
+ * - Explicit Dynamic Allowance Validation on Queue Entry
  * - Identity-Bound Concurrency Queue Management (Discord-ID Locked)
  * - Decoupled REST interfaces for Discord Bot integrations
  */
@@ -69,6 +69,66 @@ const IP_SALT = crypto.randomBytes(16).toString('hex');
 
 // Stateful ephemeral in-memory RAM cache to track device online/offline status (no I/O strain)
 const activeSessions = new Map(); // browserId -> lastActiveTimestamp
+
+/**
+ * Lazy-refills and updates the database-backed metered image generation token bucket.
+ * Mathematically accounts for elapsed time while preserving the current timing remainder.
+ *
+ * @param {string} browserId - Unique device browser footprint.
+ * @param {boolean} deduct - True if 1 token should be consumed atomically.
+ * @returns {Promise<number>} Evaluated current metered token balance.
+ */
+async function getOrUpdateMeteredTokens(browserId, deduct = false) {
+  const row = await get('SELECT metered_allowance, last_allowance_update_at FROM devices WHERE browser_id = ?', [browserId]);
+  if (!row) return 0;
+
+  let allowance = row.metered_allowance;
+  let lastUpdate = row.last_allowance_update_at;
+  const now = Date.now();
+
+  // Handle migration initialization boundaries
+  if (allowance === null || lastUpdate === null) {
+    allowance = 100;
+    lastUpdate = now;
+    await run('UPDATE devices SET metered_allowance = 100, last_allowance_update_at = ? WHERE browser_id = ?', [now, browserId]);
+  }
+
+  const elapsed = Math.max(0, now - lastUpdate);
+  const refillRate = 1800000; // 30 minutes in milliseconds
+  const gained = Math.floor(elapsed / refillRate);
+
+  if (gained > 0) {
+    allowance = Math.min(100, allowance + gained);
+    lastUpdate = lastUpdate + (gained * refillRate); // Preserves fractional timing drift down to the millisecond
+  }
+
+  if (deduct) {
+    if (allowance >= 1) {
+      allowance -= 1;
+      await run('UPDATE devices SET metered_allowance = ?, last_allowance_update_at = ? WHERE browser_id = ?', [allowance, lastUpdate, browserId]);
+    } else {
+      return -1; // Exhausted state sentinel
+    }
+  } else if (gained > 0) {
+    // Save-on-read: Only hit SQLite when an active refill block transitions
+    await run('UPDATE devices SET metered_allowance = ?, last_allowance_update_at = ? WHERE browser_id = ?', [allowance, lastUpdate, browserId]);
+  }
+
+  return allowance;
+}
+
+/**
+ * Calculates the exact millisecond epoch for the user's next rolling allowance refill.
+ *
+ * @param {string} browserId - Unique device browser footprint.
+ * @returns {Promise<number|null>} Refill epoch or null if already capped at 100.
+ */
+async function getNextRefillTime(browserId) {
+  const row = await get('SELECT metered_allowance, last_allowance_update_at FROM devices WHERE browser_id = ?', [browserId]);
+  if (!row || row.metered_allowance === null || row.last_allowance_update_at === null) return null;
+  if (row.metered_allowance >= 100) return null;
+  return row.last_allowance_update_at + 1800000;
+}
 
 /**
  * Registers device pings in RAM to avoid database I/O bottlenecks.
@@ -628,6 +688,18 @@ app.all('/proxy/:subdomain/{*splat}', async (req, res) => {
       upstreamReq = https.request(upstreamUrl, { method: req.method, headers }, (upstreamRes) => {
         console.log(`[VPS Telemetry] Received upstream headers. Status: ${upstreamRes.statusCode}`);
         
+        // Deduct metered tier token asynchronously upon successful completion
+        if (upstreamRes.statusCode === 200 && isImageGen && device.priority_tier === 'Metered') {
+          setImmediate(async () => {
+            try {
+              const remaining = await getOrUpdateMeteredTokens(browserId, true);
+              console.log(`[VPS Audit Ledger] Deducted 1 Metered image token for "${browserId}". Remaining balance: ${remaining}`);
+            } catch (err) {
+              console.error('[VPS Audit] Failed to deduct metered token:', err);
+            }
+          });
+        }
+
         // Disable Nagle's algorithm on response socket to flush streaming progress chunks instantly.
         // Prevents TCP stream chunk buffering delays over VPN connections.
         req.socket.setNoDelay(true);
@@ -674,7 +746,7 @@ app.all('/proxy/:subdomain/{*splat}', async (req, res) => {
 });
 
 // ----------------- STANDARD API ENDPOINTS -----------------
-// Mount global body parsers to satisfy standard payload endpoints [database.js]
+// Mount global body parsers to satisfy standard payload endpoints
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
@@ -694,8 +766,8 @@ app.post('/auth/register', async (req, res) => {
   if (!browser_id || !device_secret) return res.status(400).json({ error: 'Bad parameters' });
   try {
     await run(
-      'INSERT OR IGNORE INTO devices (browser_id, device_secret, label, priority_tier, approved, banned, anlas_consumed, total_requests, last_active_at) VALUES (?, ?, ?, ?, 0, 0, 0, 0, ?)',
-      [browser_id, device_secret, label || 'Guest Instance', 'Normal', Date.now()]
+      'INSERT OR IGNORE INTO devices (browser_id, device_secret, label, priority_tier, approved, banned, anlas_consumed, total_requests, last_active_at, metered_allowance, last_allowance_update_at) VALUES (?, ?, ?, ?, 0, 0, 0, 0, ?, 100, ?)',
+      [browser_id, device_secret, label || 'Guest Instance', 'Normal', Date.now(), Date.now()]
     );
     res.json({ success: true });
   } catch (err) {
@@ -763,23 +835,14 @@ app.get('/auth/status', async (req, res) => {
     if (!row) return res.status(401).json({ error: 'Invalid device credentials' });
     if (row.banned === 1) return res.status(403).json({ error: 'Device is permanently banned.' });
 
-    let sessionInfo = null;
+    let allowanceInfo = null;
     if (row.priority_tier === 'Metered') {
-      const today = new Date().toISOString().split('T')[0];
-      const session = await get(
-        'SELECT session_count, last_session_at FROM device_sessions WHERE browser_id = ? AND session_date = ?',
-        [browser_id, today]
-      );
-      const now = Date.now();
-      const count = session ? session.session_count : 0;
-      const lastSessionAt = session ? session.last_session_at : 0;
-      const elapsed = now - lastSessionAt;
-      const active = elapsed < 30 * 60 * 1000 && count > 0;
-      sessionInfo = {
-        count: count,
-        remaining: 6 - count,
-        active: active,
-        time_remaining: active ? (30 * 60 * 1000 - elapsed) : 0
+      const allowance = await getOrUpdateMeteredTokens(browser_id, false);
+      const nextRefillAt = await getNextRefillTime(browser_id);
+      allowanceInfo = {
+        allowance: allowance,
+        max: 100,
+        next_refill_in: nextRefillAt ? Math.max(0, nextRefillAt - Date.now()) : 0
       };
     }
 
@@ -795,85 +858,13 @@ app.get('/auth/status', async (req, res) => {
       tier: row.priority_tier,
       anlas_consumed: row.anlas_consumed || 0,
       precise_limit: TIER_CONFIGS[row.priority_tier]?.preciseLimit ?? 0,
-      session: sessionInfo,
+      session: allowanceInfo, // Remains key-mapped as "session" to prevent serialization breakages
       linked_devices: linkedDevices,
       master_v5_percent: master_v5_percent // Synchronized with frontend visual status gauges
     });
   } catch (err) {
     console.error('[VPS Telemetry] Authentication verification query failure:', err);
     res.status(500).json({ error: err.message });
-  }
-});
-
-/**
- * Initiates an explicit temporal session for Metered tier users.
- */
-app.post('/queue/start-session', async (req, res) => {
-  const { browser_id } = req.body;
-  const authHeader = req.headers['authorization'];
-  if (!authHeader || !authHeader.startsWith('Bearer ')) {
-    return res.status(401).json({ error: 'Missing authentication context.' });
-  }
-  const deviceSecret = authHeader.split(' ')[1];
-
-  pingDevice(browser_id);
-
-  try {
-    const device = await get(
-      'SELECT approved, banned, priority_tier FROM devices WHERE browser_id = ? AND device_secret = ? AND approved = 1',
-      [browser_id, deviceSecret]
-    );
-
-    if (!device) return res.status(401).json({ error: 'Device unapproved or credentials rejected.' });
-    if (device.banned === 1) return res.status(403).json({ error: 'Your device is permanently banned.' });
-
-    if (device.priority_tier !== 'Metered') {
-      return res.status(400).json({ error: 'Only Metered accounts manage temporal sessions.' });
-    }
-
-    const today = new Date().toISOString().split('T')[0];
-    const session = await get(
-      'SELECT session_count, last_session_at FROM device_sessions WHERE browser_id = ? AND session_date = ?',
-      [browser_id, today]
-    );
-
-    const now = Date.now();
-    let currentCount = session ? session.session_count : 0;
-
-    if (currentCount >= 6) {
-      return res.status(403).json({
-        statusCode: 403,
-        error: 'DAILY_SESSIONS_EXHAUSTED'
-      });
-    }
-
-    if (!session) {
-      await run(
-        'INSERT INTO device_sessions (browser_id, session_date, session_count, last_session_at) VALUES (?, ?, 1, ?)',
-        [browser_id, today, now]
-      );
-      currentCount = 1;
-    } else {
-      await run(
-        'UPDATE device_sessions SET session_count = session_count + 1, last_session_at = ? WHERE browser_id = ? AND session_date = ?',
-        [now, browser_id, today]
-      );
-      currentCount += 1;
-    }
-
-    console.log(`[VPS Sessions] Metered browser ${browser_id} explicitly started session #${currentCount}`);
-    res.json({
-      success: true,
-      session: {
-        count: currentCount,
-        remaining: 6 - currentCount,
-        active: true,
-        time_remaining: 30 * 60 * 1000
-      }
-    });
-  } catch (err) {
-    console.error('[VPS Sessions] Error starting session:', err);
-    res.status(500).json({ error: 'Internal server error.' });
   }
 });
 
@@ -898,31 +889,17 @@ app.post('/queue/join', async (req, res) => {
     if (device.banned === 1) return res.status(403).json({ error: 'Access Denied: Banned device.' });
     if (device.approved !== 1) return res.status(401).json({ error: 'Access Denied: Unapproved.' });
 
-    // Enforce sliding-window session controls exclusively for the Metered/lowest tier
+    // Enforce rolling token bucket checks for Metered tier
     if (device.priority_tier === 'Metered') {
-      const today = new Date().toISOString().split('T')[0]; // YYYY-MM-DD (UTC aligned)
-      const session = await get(
-        'SELECT session_count, last_session_at FROM device_sessions WHERE browser_id = ? AND session_date = ?',
-        [browser_id, today]
-      );
-
-      const now = Date.now();
-      const SESSION_WINDOW_MS = 30 * 60 * 1000; // Hard 30 minutes allocation limit
-
-      if (!session || (now - session.last_session_at > SESSION_WINDOW_MS)) {
-        // No active session window found. Reject join with session_required status so client prompts user.
-        const count = session ? session.session_count : 0;
-        console.warn(`[VPS Session Guard] Metered user ${browser_id} lacks active session window. Refusing entry.`);
+      const allowance = await getOrUpdateMeteredTokens(browser_id, false);
+      if (allowance < 1) {
+        console.warn(`[VPS Session Guard] Metered user ${browser_id} allowance depleted.`);
         return res.status(403).json({
           statusCode: 403,
-          error: 'SESSION_REQUIRED',
-          remaining: 6 - count
+          error: 'ALLOWANCE_EXHAUSTED'
         });
       }
-      
-      const elapsed = now - session.last_session_at;
-      const remainingMinutes = ((SESSION_WINDOW_MS - elapsed) / 1000 / 60).toFixed(1);
-      console.log(`[VPS Session Check] Metered browser ${browser_id} within active window. ${remainingMinutes}m remaining.`);
+      console.log(`[VPS Session Check] Metered browser ${browser_id} verified with ${allowance} remaining tokens.`);
     }
 
     // 1-request-per-user limit: Enforce queue concurrency check on discord_id, NOT browser_id
@@ -1036,6 +1013,11 @@ app.get('/admin/devices', verifyAdmin, async (req, res) => {
       const lastActive = activeSessions.get(row.browser_id) || row.last_active_at || 0;
       const isOnline = (Date.now() - lastActive) < 30000; // 30 seconds threshold
       
+      let meteredAllowance = null;
+      if (row.priority_tier === 'Metered') {
+        meteredAllowance = await getOrUpdateMeteredTokens(row.browser_id, false);
+      }
+      
       if (!groups[key]) {
         groups[key] = {
           discord_id: row.discord_id || null,
@@ -1059,7 +1041,8 @@ app.get('/admin/devices', verifyAdmin, async (req, res) => {
         anlas_consumed: row.anlas_consumed,
         total_requests: row.total_requests || 0,
         last_active_at: lastActive,
-        is_online: isOnline
+        is_online: isOnline,
+        metered_allowance: meteredAllowance
       });
       
       groups[key].anlas_consumed += row.anlas_consumed;

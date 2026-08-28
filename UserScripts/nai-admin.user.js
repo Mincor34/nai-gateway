@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         NovelAI Split-Token Gateway Coordinator (Admin Panel)
 // @namespace    http://tampermonkey.net/
-// @version      3.1.7
+// @version      4.0.0
 // @description  Secure administration panel, telemetry dashboard, and session token injector
 // @author       Minco
 // @match        https://novelai.net/*
@@ -478,11 +478,12 @@
                         group.devices.forEach(d => {
                             const devOnlineColor = d.is_online ? "#2ecc71" : "#7f8c8d";
                             const devBannedBadge = d.banned === 1 ? `<span style="color:#e74c3c; font-weight:bold; margin-left:4px;">(BANNED)</span>` : '';
+                            const allowanceBadge = d.metered_allowance !== null ? `<span style="color:#f39c12; font-weight:bold; margin-left:6px;">[${d.metered_allowance}/100 Imgs]</span>` : '';
                             devicesHtml += `
                                 <div style="font-size:10px; color:#ccc; padding:6px 0; border-bottom:1px solid #444; display:flex; justify-content:space-between; align-items:center; gap:10px;">
                                     <div style="display:flex; align-items:center; gap:6px; min-width:0; flex:1;">
                                         <div style="width:5px; height:5px; border-radius:50%; background:${devOnlineColor};"></div>
-                                        <span style="overflow:hidden; text-overflow:ellipsis; white-space:nowrap;"><strong>${d.label}</strong> ${devBannedBadge} <code style="color:#666;">(${d.browser_id.substring(0,8)}...)</code></span>
+                                        <span style="overflow:hidden; text-overflow:ellipsis; white-space:nowrap;"><strong>${d.label}</strong> ${devBannedBadge}${allowanceBadge} <code style="color:#666;">(${d.browser_id.substring(0,8)}...)</code></span>
                                     </div>
                                     <button class="btn-prune-dev" data-id="${d.browser_id}" style="background:#8e44ad; border:none; color:#fff; padding:2px 6px; font-size:9px; cursor:pointer; border-radius:2px; font-weight:bold; flex-shrink:0;">PRUNE</button>
                                 </div>
@@ -711,6 +712,7 @@
         let preciseLimit = "Unlimited";
         let anlasConsumed = 0;
         let linkedDevicesList = '';
+        let sessionStatus = "Exempt (Unlimited)";
 
         try {
             const res = await backgroundRequest({
@@ -722,6 +724,14 @@
                 const data = JSON.parse(res.responseText);
                 anlasConsumed = data.anlas_consumed || 0;
                 preciseLimit = `${data.precise_limit} Refs`;
+                if (data.session) {
+                    const allowance = data.session.allowance;
+                    const refillInMins = (data.session.next_refill_in / 1000 / 60).toFixed(1);
+                    const refillText = allowance < 100 ? `(Next refill in ${refillInMins}m)` : '(Fully Charged)';
+                    sessionStatus = `<span style="color:#2ecc71; font-weight:bold;">${allowance}/100 Images</span> <span style="font-size:10px; color:#aaa;">${refillText}</span>`;
+                } else {
+                    sessionStatus = `<span style="color:#00bc8c; font-weight:bold;">Exempt (Unlimited)</span>`;
+                }
                 if (data.linked_devices && data.linked_devices.length > 0) {
                     linkedDevicesList = data.linked_devices.map(d => `- \`${d.id.substring(0, 10)}...\` (${d.label})`).join('<br>');
                 } else {
@@ -739,7 +749,7 @@
                     <div>Assigned Tier: <span style="color:#00bc8c; font-weight:bold;">Admin</span></div>
                     <div>Precise Ref Limit: <span style="color:#f39c12; font-weight:bold;">${preciseLimit}</span></div>
                     <div>Anlas Consumed: <span style="color:#e74c3c; font-weight:bold;">${anlasConsumed} Anlas</span></div>
-                    <div>Daily Sessions: <span style="font-weight:bold;">Unlimited (Admin)</span></div>
+                    <div>Rolling Allowance: <span style="font-weight:bold;">${sessionStatus}</span></div>
                     <div>Image Gens: <span style="font-weight:bold;">${imageCount}</span></div>
                     <div>Text Gens: <span style="font-weight:bold;">${textCount}</span></div>
                 </div>
@@ -902,7 +912,7 @@
     async function tryResolveProxyResponse(responseDetails, resolveObj, isImageGen, isTextGen) {
         const status = extractStatusCode(responseDetails);
         if (status === 0) {
-            return false; // Status code not yet populated; defer resolution
+            return false; // Defer until status parses
         }
 
         if (status === 200) {
@@ -925,8 +935,7 @@
             }));
             return true;
         } else {
-            // For error responses, defer resolution until the request has fully completed (readyState 4)
-            // so we can read the fully buffered error body.
+            // Wait for response body context to bind fully on readyState 4 errors
             if (responseDetails.readyState !== 4 && responseDetails.readyState !== undefined) {
                 return false;
             }
@@ -1100,7 +1109,7 @@
         showQueueStatusBanner("Acquiring channel slot...");
 
         while (!turnAcquired) {
-            // Reduced to 1000ms to eliminate dead-time gaps between generations
+            // Non-blocking wait step to eliminate dead-time gaps between generations
             await new Promise(r => setTimeout(r, 1000));
             try {
                 const statusRes = await backgroundRequest({
@@ -1174,7 +1183,7 @@
         }
 
         updatedHeaders.delete("host");
-        updatedHeaders.delete("content-length"); // Prevent boundary mismatches from desynchronizing streams
+        updatedHeaders.delete("content-length"); // Prevent dynamic framing corruption upstream
 
         if (originalBody instanceof FormData) {
             updatedHeaders.delete("content-type");
