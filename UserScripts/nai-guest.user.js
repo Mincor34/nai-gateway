@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         NovelAI Split-Token Gateway Coordinator (Guest)
 // @namespace    http://tampermonkey.net/
-// @version      3.1.7
-// @description  FIFO queue coordination, metadata spoofing, and background stream proxy pipeline
+// @version      4.0.0
+// @description  FIFO queue coordination, rolling allowance telemetry visualization, and background stream proxy pipeline
 // @author       Minco
 // @match        https://novelai.net/*
 // @match        https://*.novelai.net/*
@@ -399,12 +399,12 @@
                 if (res.status === 200) {
                     const data = JSON.parse(res.responseText);
                     if (data.session) {
-                        if (data.session.active) {
-                            const percent = (data.session.time_remaining / (30 * 60 * 1000)) * 100;
-                            updateProgressRing(percent, "#2ecc71", true);
-                        } else {
-                            updateProgressRing(100, "#e74c3c", true);
-                        }
+                        const allowance = data.session.allowance;
+                        const percent = allowance; // Raw tokens represent the visual percentage of 100
+                        let color = "#2ecc71"; // Green
+                        if (allowance < 20) color = "#e74c3c"; // Red
+                        else if (allowance < 50) color = "#f39c12"; // Orange
+                        updateProgressRing(percent, color, true);
                     } else {
                         updateProgressRing(0, "transparent", false);
                     }
@@ -461,8 +461,6 @@
         let preciseLimit = 0;
         let sessionStatus = "Loading...";
         let linkedDevicesList = '';
-        let showStartSessionBtn = false;
-        let sessionsLeft = 0;
 
         try {
             const res = await backgroundRequest({
@@ -477,14 +475,10 @@
                 preciseLimit = data.precise_limit ?? 0;
                 
                 if (data.session) {
-                    sessionsLeft = data.session.remaining;
-                    if (data.session.active) {
-                        const mins = (data.session.time_remaining / 1000 / 60).toFixed(1);
-                        sessionStatus = `<span style="color:#2ecc71; font-weight:bold;">Active Window (${mins}m left)</span> | ${data.session.remaining} sessions remaining`;
-                    } else {
-                        sessionStatus = `<span style="color:#e74c3c; font-weight:bold;">Expired / Idle</span> | ${data.session.remaining} sessions remaining`;
-                        if (data.session.remaining > 0) showStartSessionBtn = true;
-                    }
+                    const allowance = data.session.allowance;
+                    const refillInMins = (data.session.next_refill_in / 1000 / 60).toFixed(1);
+                    const refillText = allowance < 100 ? `(Next refill in ${refillInMins}m)` : '(Fully Charged)';
+                    sessionStatus = `<span style="color:#2ecc71; font-weight:bold;">${allowance}/100 Images</span> <span style="font-size:10px; color:#aaa;">${refillText}</span>`;
                 } else {
                     sessionStatus = `<span style="color:#00bc8c; font-weight:bold;">Exempt (Unlimited)</span>`;
                 }
@@ -508,20 +502,14 @@
             
             <div style="background:#111; padding:15px; border-radius:4px; margin-bottom:15px; border:1px solid #333; font-size:12px; line-height:1.6;">
                 <label style="display:block; font-size:10px; color:#888; font-weight:bold; margin-bottom:6px; text-transform:uppercase; letter-spacing:0.5px;">Telemetry Stats & Profile</label>
-                <div style="display:grid; grid-template-columns:1fr 1fr; gap:10px; margin-bottom:10px;">
+                <div style="display:grid; grid-template-columns:1fr 1fr; gap:10px;">
                     <div>Assigned Tier: <span style="color:#00bc8c; font-weight:bold;">${tier}</span></div>
                     <div>Precise Ref Limit: <span style="color:#f39c12; font-weight:bold;">${preciseLimit} Refs</span></div>
                     <div>Anlas Consumed: <span style="color:#e74c3c; font-weight:bold;">${anlasConsumed} Anlas</span></div>
-                    <div>Daily Sessions: <span style="font-weight:bold;">${sessionStatus}</span></div>
+                    <div>Rolling Allowance: <span style="font-weight:bold;">${sessionStatus}</span></div>
                     <div>Image Gens: <span style="font-weight:bold;">${imageCount}</span></div>
                     <div>Text Gens: <span style="font-weight:bold;">${textCount}</span></div>
                 </div>
-
-                ${showStartSessionBtn ? `
-                    <button id="btn-portal-start-session" style="background:#2ecc71; border:none; color:#111; font-weight:bold; font-size:11px; padding:8px 12px; border-radius:3px; cursor:pointer; width:100%; text-transform:uppercase; margin-top:5px; box-shadow:0 2px 6px rgba(46,204,113,0.3);">
-                        Start 30-Minute Generation Session (${sessionsLeft} Left)
-                    </button>
-                ` : ''}
             </div>
 
             <div style="margin-bottom:15px;">
@@ -568,27 +556,6 @@
         const domInput = modal.querySelector("#settings-domain");
         const saveDomBtn = modal.querySelector("#btn-save-domain");
         const debugCheckbox = modal.querySelector("#settings-debug");
-        const startSessionBtn = modal.querySelector("#btn-portal-start-session");
-
-        if (startSessionBtn) {
-            startSessionBtn.onclick = async () => {
-                startSessionBtn.disabled = true;
-                startSessionBtn.innerHTML = "Initializing connection...";
-                try {
-                    const result = await triggerStartSession();
-                    if (result.success) {
-                        modal.remove();
-                        backdrop.remove();
-                        openSettingsModal(); // Reload dynamically
-                    } else {
-                        startSessionBtn.innerHTML = `Rejection: ${result.error}`;
-                        setTimeout(() => { startSessionBtn.disabled = false; startSessionBtn.innerHTML = "Retry Session Start"; }, 2000);
-                    }
-                } catch (e) {
-                    startSessionBtn.innerHTML = "Execution Error.";
-                }
-            };
-        }
 
         saveNickBtn.onclick = async () => {
             const nickname = nickInput.value.trim();
@@ -701,32 +668,6 @@
         }
         result += decoder.decode(); // Flush stream buffer
         return result;
-    }
-
-    async function triggerStartSession() {
-        try {
-            const res = await backgroundRequest({
-                method: "POST",
-                url: `${VPS_HOST}/queue/start-session`,
-                headers: { 
-                    "Content-Type": "application/json", 
-                    "Authorization": `Bearer ${deviceSecret}` 
-                },
-                data: JSON.stringify({ browser_id: browserId })
-            });
-
-            if (res.status === 200) {
-                return { success: true };
-            } else {
-                let errData = {};
-                try {
-                    errData = JSON.parse(res.responseText);
-                } catch (e) {}
-                return { success: false, error: errData.error || `HTTP ${res.status}` };
-            }
-        } catch (e) {
-            return { success: false, error: "Network transport exception." };
-        }
     }
 
     async function tryResolveProxyResponse(responseDetails, resolveObj, isImageGen, isTextGen) {
@@ -890,54 +831,6 @@
         if (banner) banner.remove();
     }
 
-    /**
-     * Session Required Interactive Banner.
-     * Prevents passive drainage by forcing metered users to explicitly verify and allocate windows.
-     */
-    function showStartSessionBanner(remainingCount, onStartCallback) {
-        let banner = document.getElementById("vps-session-prompt-banner");
-        if (!banner) {
-            banner = document.createElement("div");
-            banner.id = "vps-session-prompt-banner";
-            banner.style = "position:fixed; bottom:175px; right:15px; background:#1b1b1b; color:#fff; padding:15px 20px; border:2px solid #e74c3c; border-radius:6px; z-index:99998; font-family:sans-serif; font-size:13px; box-shadow:0 6px 20px rgba(0,0,0,0.5); display:flex; flex-direction:column; gap:10px; width:300px; box-sizing:border-box;";
-            document.documentElement.appendChild(banner);
-        }
-
-        banner.innerHTML = `
-            <div style="font-weight:bold; color:#e74c3c; display:flex; align-items:center; gap:8px;">
-                <span style="font-size:16px;">⚠️</span> SESSION EXPIRED
-            </div>
-            <div style="color:#ddd; line-height:1.4; font-size:11px;">
-                An active generation session is required to continue. Starting a new session will consume <b>1</b> of your daily 30-minute allocations.
-            </div>
-            <div style="font-weight:bold; color:#f39c12; font-size:11px;">
-                Daily Sessions Remaining: ${remainingCount} Left
-            </div>
-            <button id="btn-banner-start-session" style="background:#2ecc71; border:none; color:#111; font-weight:bold; padding:8px 12px; border-radius:3px; cursor:pointer; font-size:11px; text-transform:uppercase; box-shadow:0 2px 8px rgba(46,204,113,0.3);">
-                Start 30-Minute Session
-            </button>
-        `;
-
-        const startBtn = banner.querySelector("#btn-banner-start-session");
-        startBtn.onclick = async () => {
-            startBtn.disabled = true;
-            startBtn.innerHTML = "Processing allocation...";
-            const result = await triggerStartSession();
-            if (result.success) {
-                banner.remove();
-                onStartCallback(); // Transparently trigger target queue join
-            } else {
-                startBtn.innerHTML = `Error: ${result.error}`;
-                setTimeout(() => { startBtn.disabled = false; startBtn.innerHTML = "Retry Session Start"; }, 2500);
-            }
-        };
-    }
-
-    function hideSessionPromptBanner() {
-        const banner = document.getElementById("vps-session-prompt-banner");
-        if (banner) banner.remove();
-    }
-
     async function handleGenerationIntercept(url, config) {
         const req_id = 'req_' + generateUUID();
         const tab_id = sessionStorage.getItem("vps_tab_id") || (() => {
@@ -987,14 +880,12 @@
                         console.error("Nai-Guest: Failed to parse error response text safely", e);
                     }
 
-                    if (errorDetails.error === 'SESSION_REQUIRED') {
-                        // Interactive Session Guard Intercepted: Display manual prompt banner
+                    if (errorDetails.error === 'ALLOWANCE_EXHAUSTED') {
                         hideQueueStatusBanner();
-                        showStartSessionBanner(errorDetails.remaining, () => { //TODO: Parsing and passing the remaining count from an error message is a Rube Goldberg approach.
-                            // Recursively execute queue joining when session is explicitly approved
-                            handleGenerationIntercept(url, config).then(resolveOuter, rejectOuter);
-                        });
-                        return new Promise(() => {}); // Defer outer Promise permanently; handled by recurse branch
+                        return new Response(JSON.stringify({
+                            statusCode: 403,
+                            message: "Allowance Exhausted: You have run out of image tokens. Allowance refills at a rate of 1 image per 30 minutes (max 100)."
+                        }), { status: 403 });
                     }
                 }
 
@@ -1007,7 +898,7 @@
             showQueueStatusBanner("Acquiring channel slot...");
 
             while (!turnAcquired) {
-                // Reduced to 1000ms to completely eliminate dead-time gaps between generations
+                // Reduced to 1000ms to reduce dead-time gaps between generations
                 await new Promise(r => setTimeout(r, 1000));
                 try {
                     const statusRes = await backgroundRequest({
