@@ -8,7 +8,15 @@ module.exports = {
       NODE_ENV: "production",
       PORT: 3000,
       DATABASE_PATH: "data.db",
-      ADMIN_SECRET_KEY: "YOUR_SUPER_SECRET_KEY_HERE"
+      ADMIN_SECRET_KEY: "YOUR_SUPER_SECRET_KEY_HERE",
+      // Harmonized Tier Settings: Use 'null' to denote unlimited parameters (mapped to Infinity on boot)
+      TIER_CONFIGS: JSON.stringify({
+        'Admin':   { "basePriority": 30, "preciseLimit": null, "maxBurst": null, "refillRate": 0,      "maxAllowance": null, "refillRateMs": 0 },
+        'High':    { "basePriority": 20, "preciseLimit": 3,    "maxBurst": null, "refillRate": 0,      "maxAllowance": null, "refillRateMs": 0 },
+        'Normal':  { "basePriority": 10, "preciseLimit": 2,    "maxBurst": 15,   "refillRate": 120000, "maxAllowance": null, "refillRateMs": 0 },
+        'Low':     { "basePriority": 0,  "preciseLimit": 1,    "maxBurst": 10,   "refillRate": 120000, "maxAllowance": null, "refillRateMs": 0 },
+        'Metered': { "basePriority": 0,  "preciseLimit": 0,    "maxBurst": 5,    "refillRate": 120000, "maxAllowance": 100,  "refillRateMs": 1800000 }
+      })
     }
   }]
 };
