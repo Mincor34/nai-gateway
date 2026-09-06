@@ -75,6 +75,8 @@ const initDatabase = () => {
         const hasTotalRequests = rows.some(row => row.name === 'total_requests');
         const hasLastActiveAt = rows.some(row => row.name === 'last_active_at');
         const hasDiscordUsername = rows.some(row => row.name === 'discord_username');
+        const hasMeteredAllowance = rows.some(row => row.name === 'metered_allowance');
+        const hasLastAllowanceUpdate = rows.some(row => row.name === 'last_allowance_update_at');
         
         // Purely additive alterations
         if (!hasDiscordId) {
@@ -94,6 +96,12 @@ const initDatabase = () => {
         }
         if (!hasDiscordUsername) {
           db.run("ALTER TABLE devices ADD COLUMN discord_username TEXT");
+        }
+        if (!hasMeteredAllowance) {
+          db.run("ALTER TABLE devices ADD COLUMN metered_allowance INTEGER DEFAULT 100");
+        }
+        if (!hasLastAllowanceUpdate) {
+          db.run("ALTER TABLE devices ADD COLUMN last_allowance_update_at INTEGER");
         }
         
         // Audit notification metrics inside block list table
