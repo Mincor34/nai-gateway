@@ -34,14 +34,58 @@ let last_fetched_at = 0;
 let is_hard_locked = false;
 let is_fetching = false;
 
-// Config metrics establishing system-wide rate bounds
-const TIER_CONFIGS = {
-  'Admin':   { basePriority: 30, slope: 'fast', maxBurst: Infinity,  refillRate: 0,      preciseLimit: Infinity },
-  'High':    { basePriority: 20, slope: 'fast', maxBurst: Infinity,  refillRate: 0,      preciseLimit: 3 },
-  'Normal':  { basePriority: 10, slope: 'base', maxBurst: 15,        refillRate: 120000, preciseLimit: 2 },
-  'Low':     { basePriority: 0,  slope: 'base', maxBurst: 10,        refillRate: 120000, preciseLimit: 1 },
-  'Metered': { basePriority: 0,  slope: 'base', maxBurst: 5,         refillRate: 120000, preciseLimit: 0 }
+// ----------------- CONFIGURATION HARMONIZATION & VALIDATION -----------------
+const DEFAULT_TIER_CONFIGS = {
+  'Admin':   { basePriority: 30, preciseLimit: Infinity, maxBurst: Infinity, refillRate: 0,      maxAllowance: Infinity, refillRateMs: 0 },
+  'High':    { basePriority: 20, preciseLimit: 3,        maxBurst: Infinity, refillRate: 0,      maxAllowance: Infinity, refillRateMs: 0 },
+  'Normal':  { basePriority: 10, preciseLimit: 2,        maxBurst: 15,       refillRate: 120000, maxAllowance: Infinity, refillRateMs: 0 },
+  'Low':     { basePriority: 0,  preciseLimit: 1,        maxBurst: 10,       refillRate: 120000, maxAllowance: Infinity, refillRateMs: 0 },
+  'Metered': { basePriority: 0,  preciseLimit: 0,        maxBurst: 5,        refillRate: 120000, maxAllowance: 100,      refillRateMs: 1800000 }
 };
+
+let TIER_CONFIGS = { ...DEFAULT_TIER_CONFIGS };
+
+if (process.env.TIER_CONFIGS) {
+  try {
+    const parsed = JSON.parse(process.env.TIER_CONFIGS);
+    for (const [tier, cfg] of Object.entries(parsed)) {
+      if (typeof cfg !== 'object' || cfg === null) {
+        throw new Error(`Tier "${tier}" configuration must be a valid JSON object.`);
+      }
+
+      // Enforce strict property validations
+      if (typeof cfg.basePriority !== 'number') throw new Error(`Tier "${tier}": basePriority must be a number.`);
+      if (typeof cfg.refillRate !== 'number') throw new Error(`Tier "${tier}": refillRate must be a number.`);
+      if (typeof cfg.refillRateMs !== 'number') throw new Error(`Tier "${tier}": refillRateMs must be a number.`);
+
+      // Convert JSON-safe null fields into internal Infinity representations
+      const preciseLimit = cfg.preciseLimit === null ? Infinity : cfg.preciseLimit;
+      const maxBurst = cfg.maxBurst === null ? Infinity : cfg.maxBurst;
+      const maxAllowance = cfg.maxAllowance === null ? Infinity : cfg.maxAllowance;
+
+      if (typeof preciseLimit !== 'number') throw new Error(`Tier "${tier}": preciseLimit must be a number or null.`);
+      if (typeof maxBurst !== 'number') throw new Error(`Tier "${tier}": maxBurst must be a number or null.`);
+      if (typeof maxAllowance !== 'number') throw new Error(`Tier "${tier}": maxAllowance must be a number or null.`);
+
+      parsed[tier] = {
+        basePriority: cfg.basePriority,
+        preciseLimit,
+        maxBurst,
+        refillRate: cfg.refillRate,
+        maxAllowance,
+        refillRateMs: cfg.refillRateMs
+      };
+    }
+    TIER_CONFIGS = parsed;
+    console.log("[VPS Config] Successfully parsed and validated customized dynamic tier configurations.");
+  } catch (err) {
+    console.error("❌ [VPS Critical] Fatal schema violation in TIER_CONFIGS environment variable:");
+    console.error(err.message);
+    process.exit(1);
+  }
+} else {
+  console.log("[VPS Config] No custom TIER_CONFIGS variable detected. Falling back to native system schemas.");
+}
 
 const PROXY_PATH_WHITELIST = new Set([
   'ai/generate-image',
@@ -71,14 +115,23 @@ const IP_SALT = crypto.randomBytes(16).toString('hex');
 const activeSessions = new Map(); // browserId -> lastActiveTimestamp
 
 /**
- * Lazy-refills and updates the database-backed metered image generation token bucket.
+ * Lazy-refills and updates the database-backed tier token bucket.
  * Mathematically accounts for elapsed time while preserving the current timing remainder.
  *
  * @param {string} browserId - Unique device browser footprint.
+ * @param {string} tier - Device priority tier mapping.
  * @param {boolean} deduct - True if 1 token should be consumed atomically.
  * @returns {Promise<number>} Evaluated current metered token balance.
  */
-async function getOrUpdateMeteredTokens(browserId, deduct = false) {
+async function getOrUpdateAllowance(browserId, tier, deduct = false) {
+  const config = TIER_CONFIGS[tier];
+  if (!config) return 0;
+
+  // Exempt unlimited/exempt priority levels completely
+  if (config.maxAllowance === Infinity) {
+    return Infinity;
+  }
+
   const row = await get('SELECT metered_allowance, last_allowance_update_at FROM devices WHERE browser_id = ?', [browserId]);
   if (!row) return 0;
 
@@ -86,19 +139,21 @@ async function getOrUpdateMeteredTokens(browserId, deduct = false) {
   let lastUpdate = row.last_allowance_update_at;
   const now = Date.now();
 
-  // Handle migration initialization boundaries
+  const maxAllowance = config.maxAllowance;
+  const refillRate = config.refillRateMs;
+
+  // Handle migration and initialization boundaries
   if (allowance === null || lastUpdate === null) {
-    allowance = 100;
+    allowance = maxAllowance;
     lastUpdate = now;
-    await run('UPDATE devices SET metered_allowance = 100, last_allowance_update_at = ? WHERE browser_id = ?', [now, browserId]);
+    await run('UPDATE devices SET metered_allowance = ?, last_allowance_update_at = ? WHERE browser_id = ?', [maxAllowance, now, browserId]);
   }
 
   const elapsed = Math.max(0, now - lastUpdate);
-  const refillRate = 1800000; // 30 minutes in milliseconds
-  const gained = Math.floor(elapsed / refillRate);
+  const gained = refillRate > 0 ? Math.floor(elapsed / refillRate) : 0;
 
   if (gained > 0) {
-    allowance = Math.min(100, allowance + gained);
+    allowance = Math.min(maxAllowance, allowance + gained);
     lastUpdate = lastUpdate + (gained * refillRate); // Preserves fractional timing drift down to the millisecond
   }
 
@@ -121,13 +176,17 @@ async function getOrUpdateMeteredTokens(browserId, deduct = false) {
  * Calculates the exact millisecond epoch for the user's next rolling allowance refill.
  *
  * @param {string} browserId - Unique device browser footprint.
- * @returns {Promise<number|null>} Refill epoch or null if already capped at 100.
+ * @param {string} tier - Device priority tier mapping.
+ * @returns {Promise<number|null>} Refill epoch or null if already capped.
  */
-async function getNextRefillTime(browserId) {
+async function getNextRefillTime(browserId, tier) {
+  const config = TIER_CONFIGS[tier];
+  if (!config || config.maxAllowance === Infinity) return null;
+
   const row = await get('SELECT metered_allowance, last_allowance_update_at FROM devices WHERE browser_id = ?', [browserId]);
   if (!row || row.metered_allowance === null || row.last_allowance_update_at === null) return null;
-  if (row.metered_allowance >= 100) return null;
-  return row.last_allowance_update_at + 1800000;
+  if (row.metered_allowance >= config.maxAllowance) return null;
+  return row.last_allowance_update_at + config.refillRateMs;
 }
 
 /**
@@ -689,11 +748,12 @@ app.all('/proxy/:subdomain/{*splat}', async (req, res) => {
         console.log(`[VPS Telemetry] Received upstream headers. Status: ${upstreamRes.statusCode}`);
         
         // Deduct metered tier token asynchronously upon successful completion
-        if (upstreamRes.statusCode === 200 && isImageGen && device.priority_tier === 'Metered') {
+        const tierConfig = TIER_CONFIGS[device.priority_tier];
+        if (upstreamRes.statusCode === 200 && isImageGen && tierConfig && tierConfig.maxAllowance !== Infinity) {
           setImmediate(async () => {
             try {
-              const remaining = await getOrUpdateMeteredTokens(browserId, true);
-              console.log(`[VPS Audit Ledger] Deducted 1 Metered image token for "${browserId}". Remaining balance: ${remaining}`);
+              const remaining = await getOrUpdateAllowance(browserId, device.priority_tier, true);
+              console.log(`[VPS Audit Ledger] Deducted 1 token for "${browserId}" (${device.priority_tier}). Remaining balance: ${remaining}`);
             } catch (err) {
               console.error('[VPS Audit] Failed to deduct metered token:', err);
             }
@@ -836,12 +896,13 @@ app.get('/auth/status', async (req, res) => {
     if (row.banned === 1) return res.status(403).json({ error: 'Device is permanently banned.' });
 
     let allowanceInfo = null;
-    if (row.priority_tier === 'Metered') {
-      const allowance = await getOrUpdateMeteredTokens(browser_id, false);
-      const nextRefillAt = await getNextRefillTime(browser_id);
+    const tierConfig = TIER_CONFIGS[row.priority_tier];
+    if (tierConfig && tierConfig.maxAllowance !== Infinity) {
+      const allowance = await getOrUpdateAllowance(browser_id, row.priority_tier, false);
+      const nextRefillAt = await getNextRefillTime(browser_id, row.priority_tier);
       allowanceInfo = {
         allowance: allowance,
-        max: 100,
+        max: tierConfig.maxAllowance,
         next_refill_in: nextRefillAt ? Math.max(0, nextRefillAt - Date.now()) : 0
       };
     }
@@ -889,17 +950,18 @@ app.post('/queue/join', async (req, res) => {
     if (device.banned === 1) return res.status(403).json({ error: 'Access Denied: Banned device.' });
     if (device.approved !== 1) return res.status(401).json({ error: 'Access Denied: Unapproved.' });
 
-    // Enforce rolling token bucket checks for Metered tier
-    if (device.priority_tier === 'Metered') {
-      const allowance = await getOrUpdateMeteredTokens(browser_id, false);
+    // Enforce rolling token bucket checks
+    const tierConfig = TIER_CONFIGS[device.priority_tier];
+    if (tierConfig && tierConfig.maxAllowance !== Infinity) {
+      const allowance = await getOrUpdateAllowance(browser_id, device.priority_tier, false);
       if (allowance < 1) {
-        console.warn(`[VPS Session Guard] Metered user ${browser_id} allowance depleted.`);
+        console.warn(`[VPS Session Guard] User ${browser_id} allowance depleted.`);
         return res.status(403).json({
           statusCode: 403,
           error: 'ALLOWANCE_EXHAUSTED'
         });
       }
-      console.log(`[VPS Session Check] Metered browser ${browser_id} verified with ${allowance} remaining tokens.`);
+      console.log(`[VPS Session Check] Browser ${browser_id} verified with ${allowance} remaining tokens.`);
     }
 
     // 1-request-per-user limit: Enforce queue concurrency check on discord_id, NOT browser_id
@@ -916,7 +978,6 @@ app.post('/queue/join', async (req, res) => {
     }
 
     let hasBurstBoost = false;
-    const tierConfig = TIER_CONFIGS[device.priority_tier] || TIER_CONFIGS['Normal'];
 
     if (tierConfig.maxBurst === Infinity) {
       hasBurstBoost = true;
@@ -1014,8 +1075,9 @@ app.get('/admin/devices', verifyAdmin, async (req, res) => {
       const isOnline = (Date.now() - lastActive) < 30000; // 30 seconds threshold
       
       let meteredAllowance = null;
-      if (row.priority_tier === 'Metered') {
-        meteredAllowance = await getOrUpdateMeteredTokens(row.browser_id, false);
+      const tierConfig = TIER_CONFIGS[row.priority_tier];
+      if (tierConfig && tierConfig.maxAllowance !== Infinity) {
+        meteredAllowance = await getOrUpdateAllowance(row.browser_id, row.priority_tier, false);
       }
       
       if (!groups[key]) {
