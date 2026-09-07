@@ -723,7 +723,8 @@
             if (res.status === 200) {
                 const data = JSON.parse(res.responseText);
                 anlasConsumed = data.anlas_consumed || 0;
-                preciseLimit = `${data.precise_limit} Refs`;
+                // Gracefully catch both the raw string token and explicit fallbacks
+                preciseLimit = data.precise_limit === "Unlimited" ? "Unlimited" : `${data.precise_limit} Refs`;
                 if (data.session) {
                     const allowance = data.session.allowance;
                     const maxAllowance = data.session.max || 100; // Safe dynamic denominator fallback

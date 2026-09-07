@@ -458,7 +458,7 @@
         
         let tier = "Loading...";
         let anlasConsumed = 0;
-        let preciseLimit = 0;
+        let preciseLimit = "Loading...";
         let sessionStatus = "Loading...";
         let linkedDevicesList = '';
 
@@ -472,7 +472,8 @@
                 const data = JSON.parse(res.responseText);
                 tier = data.tier || "Normal";
                 anlasConsumed = data.anlas_consumed || 0;
-                preciseLimit = data.precise_limit ?? 0;
+                // Map unlimited precise boundaries to display string
+                preciseLimit = data.precise_limit === "Unlimited" ? "Unlimited" : `${data.precise_limit} Refs`;
                 
                 if (data.session) {
                     const allowance = data.session.allowance;

@@ -918,7 +918,8 @@ app.get('/auth/status', async (req, res) => {
       approved: !!row.approved, 
       tier: row.priority_tier,
       anlas_consumed: row.anlas_consumed || 0,
-      precise_limit: TIER_CONFIGS[row.priority_tier]?.preciseLimit ?? 0,
+      // Transforms JSON-unfriendly Infinity to a standardized string token
+      precise_limit: TIER_CONFIGS[row.priority_tier]?.preciseLimit === Infinity ? "Unlimited" : (TIER_CONFIGS[row.priority_tier]?.preciseLimit ?? 0),
       session: allowanceInfo, // Remains key-mapped as "session" to prevent serialization breakages
       linked_devices: linkedDevices,
       master_v5_percent: master_v5_percent // Synchronized with frontend visual status gauges
