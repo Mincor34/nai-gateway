@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         NovelAI Split-Token Gateway Coordinator (Guest)
 // @namespace    http://tampermonkey.net/
-// @version      4.0.1
+// @version      4.0.2
 // @description  FIFO queue coordination, rolling allowance telemetry visualization, and background stream proxy pipeline
 // @author       Minco
 // @match        https://novelai.net/*
@@ -350,6 +350,7 @@
         circle.setAttribute("r", "23");
         circle.setAttribute("cx", "26");
         circle.setAttribute("cy", "26");
+        circle.setAttribute("pathLength", "100"); // Normalizes path length to exactly 100 units
         circle.style.cssText = "transition: stroke-dashoffset 0.35s; transform: rotate(-90deg); transform-origin: 50% 50%;";
 
         svgRing.appendChild(circle);
@@ -380,11 +381,12 @@
         }
 
         svg.style.display = "block";
-        const radius = 23;
-        const circumference = 2 * Math.PI * radius; // Circumference is approx 144.5
-        circle.style.strokeDasharray = `${circumference} ${circumference}`;
-        const offset = circumference - (percent / 100) * circumference;
-        circle.style.strokeDashoffset = offset;
+        // Clamp the percent to protect against rendering wrap-arounds
+        const clampedPercent = Math.min(100, Math.max(0, percent));
+        
+        // Manipulate attributes natively rather than risking CSS length unit issues
+        circle.setAttribute("stroke-dasharray", "100");
+        circle.setAttribute("stroke-dashoffset", (100 - clampedPercent).toString());
         circle.style.stroke = color;
     }
 
