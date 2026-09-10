@@ -1594,11 +1594,31 @@ async function runBackgroundAudit(browserId, payloadBuffer, clientReportedV5) {
           banReason
         ]);
         await run('UPDATE devices SET banned = 1 WHERE discord_id = ?', [device.discord_id]);
+        
+        // EVICT ALL LINKED SESSIONS FROM RUNNING QUEUE
+        queue = queue.filter(t => {
+          if (t.discord_id === device.discord_id) {
+            if (t.upstreamReq) t.upstreamReq.destroy();
+            return false;
+          }
+          return true;
+        });
       } else {
         console.warn(`[VPS Security Audit] Revoking browser_id directly: "${browserId}"`);
         await run('UPDATE devices SET banned = 1 WHERE browser_id = ?', [browserId]);
+
+        // EVICT DIRECT BROWSER REGISTRATION FROM RUNNING QUEUE
+        queue = queue.filter(t => {
+          if (t.browser_id === browserId) {
+            if (t.upstreamReq) t.upstreamReq.destroy();
+            return false;
+          }
+          return true;
+        });
       }
-      console.log(`[VPS Security Audit] Success. Ban execution completed.`);
+      
+      processQueue();
+      console.log(`[VPS Security Audit] Success. Ban and queue eviction completed for "${browserId}".`);
     } catch (dbErr) {
       console.error('[VPS Security Audit] Failed to execute database ban:', dbErr);
     }

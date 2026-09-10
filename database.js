@@ -31,6 +31,10 @@ const db = new sqlite3.Database(dbPath);
 const initDatabase = () => {
   return new Promise((resolve, reject) => {
     db.serialize(() => {
+      // Enforce WAL mode and a 5000ms busy timeout to prevent SQLITE_BUSY crashes under concurrency
+      db.run("PRAGMA journal_mode = WAL;");
+      db.run("PRAGMA busy_timeout = 5000;");
+
       // Devices Table: Primary registration map linking browser hardware to Discord accounts
       db.run(`CREATE TABLE IF NOT EXISTS devices (
         browser_id TEXT PRIMARY KEY,
