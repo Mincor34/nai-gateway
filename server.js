@@ -1,8 +1,9 @@
 /**
  * COORDINATOR GATEWAY CORE (server.js)
- * A monolith to surpass Wailord's cock!
+ * Architecture Level 5: Main Entrypoint & Service Orchestrator
  *
  * Implements:
+ * - Explicit Configuration Ingestion via Level 1 Engine
  * - Sequential Promise DB Startup Guard with Resilient Warm-Boot Sync
  * - Event-Driven Master Account V5 Protection Layer
  * - Preserved Fractional Token Accumulation (RAM-bound)
@@ -16,85 +17,25 @@
 const express = require('express');
 const https = require('https');
 const crypto = require('crypto');
-const { initDatabase, run, get, all } = require('./database');
+const { loadConfig } = require('./config');
+const { initDatabase, closeDatabase, run, get, all } = require('./database');
+
+// Explicit Configuration Bootstrap
+const config = loadConfig(process.env);
+const PORT = config.PORT;
+const ADMIN_SECRET_KEY = config.ADMIN_SECRET_KEY;
+const TIER_CONFIGS = config.TIER_CONFIGS;
+const PROXY_PATH_WHITELIST = config.PROXY_PATH_WHITELIST;
+const SUBDOMAIN_WHITELIST = config.SUBDOMAIN_WHITELIST;
+const MAX_CONCURRENT_TEXT_GENS = config.MAX_CONCURRENT_TEXT_GENS;
 
 const app = express();
-const PORT = process.env.PORT || 3000;
-const ADMIN_SECRET_KEY = process.env.ADMIN_SECRET_KEY; // Must be set in the VPS environment for admin endpoints to function
-
-// Critical Environment Validation: Enforces immediate crash-on-boot if admin credential context is absent.
-if (!ADMIN_SECRET_KEY) {
-  console.error("[VPS Critical] ADMIN_SECRET_KEY variable is unconfigured! Crashing boot sequence.");
-  process.exit(1);
-}
 
 // v5 Protection Layer State (RAM Cache Registry)
 let master_v5_percent = 100;
 let last_fetched_at = 0;
 let is_hard_locked = false;
 let is_fetching = false;
-
-// ----------------- CONFIGURATION HARMONIZATION & VALIDATION -----------------
-const DEFAULT_TIER_CONFIGS = {
-  'Admin':   { basePriority: 30, preciseLimit: Infinity, maxBurst: Infinity, refillRate: 0,      maxAllowance: Infinity, refillRateMs: 0 },
-  'High':    { basePriority: 20, preciseLimit: 3,        maxBurst: Infinity, refillRate: 0,      maxAllowance: Infinity, refillRateMs: 0 },
-  'Normal':  { basePriority: 10, preciseLimit: 2,        maxBurst: 15,       refillRate: 120000, maxAllowance: Infinity, refillRateMs: 0 },
-  'Low':     { basePriority: 0,  preciseLimit: 1,        maxBurst: 10,       refillRate: 120000, maxAllowance: Infinity, refillRateMs: 0 },
-  'Metered': { basePriority: 0,  preciseLimit: 0,        maxBurst: 5,        refillRate: 120000, maxAllowance: 100,      refillRateMs: 1800000 }
-};
-
-let TIER_CONFIGS = { ...DEFAULT_TIER_CONFIGS };
-
-if (process.env.TIER_CONFIGS) {
-  try {
-    const parsed = JSON.parse(process.env.TIER_CONFIGS);
-    for (const [tier, cfg] of Object.entries(parsed)) {
-      if (typeof cfg !== 'object' || cfg === null) {
-        throw new Error(`Tier "${tier}" configuration must be a valid JSON object.`);
-      }
-
-      // Enforce strict property validations
-      if (typeof cfg.basePriority !== 'number') throw new Error(`Tier "${tier}": basePriority must be a number.`);
-      if (typeof cfg.refillRate !== 'number') throw new Error(`Tier "${tier}": refillRate must be a number.`);
-      if (typeof cfg.refillRateMs !== 'number') throw new Error(`Tier "${tier}": refillRateMs must be a number.`);
-
-      // Convert JSON-safe null fields into internal Infinity representations
-      const preciseLimit = cfg.preciseLimit === null ? Infinity : cfg.preciseLimit;
-      const maxBurst = cfg.maxBurst === null ? Infinity : cfg.maxBurst;
-      const maxAllowance = cfg.maxAllowance === null ? Infinity : cfg.maxAllowance;
-
-      if (typeof preciseLimit !== 'number') throw new Error(`Tier "${tier}": preciseLimit must be a number or null.`);
-      if (typeof maxBurst !== 'number') throw new Error(`Tier "${tier}": maxBurst must be a number or null.`);
-      if (typeof maxAllowance !== 'number') throw new Error(`Tier "${tier}": maxAllowance must be a number or null.`);
-
-      parsed[tier] = {
-        basePriority: cfg.basePriority,
-        preciseLimit,
-        maxBurst,
-        refillRate: cfg.refillRate,
-        maxAllowance,
-        refillRateMs: cfg.refillRateMs
-      };
-    }
-    TIER_CONFIGS = parsed;
-    console.log("[VPS Config] Successfully parsed and validated customized dynamic tier configurations.");
-  } catch (err) {
-    console.error("❌ [VPS Critical] Fatal schema violation in TIER_CONFIGS environment variable:");
-    console.error(err.message);
-    process.exit(1);
-  }
-} else {
-  console.log("[VPS Config] No custom TIER_CONFIGS variable detected. Falling back to native system schemas.");
-}
-
-const PROXY_PATH_WHITELIST = new Set([
-  'ai/generate-image',
-  'ai/generate-image-stream',
-  'ai/encode-vibe',      // Whitelisted path to support vibe transfer pre-processing via master token
-  'ai/generate-stream',  // Legacy Text/story Generation API endpoint
-  'oa/v1/completions',   // New OpenAI-compatible Text Generation API endpoint (GLM-4, Erato, Xialong, etc.)
-  'user/subscription'    // Allow proxying of read-only subscription telemetry to spoof native UI meters
-]);
 
 // Volatile token buckets and queues (RAM-bound to maximize throughput and avoid I/O bottlenecks)
 const deviceBuckets = new Map();
@@ -103,7 +44,6 @@ let queue = [];
 
 // Channel B Concurrency State (Shared Text Generation Slots)
 let activeTextGenerations = 0;
-const MAX_CONCURRENT_TEXT_GENS = 3; 
 
 // Cryptographic Salt for IP hashing.
 // Regenerating this on startup ensures maximum privacy: hashes remain identical 
@@ -113,6 +53,8 @@ const IP_SALT = crypto.randomBytes(16).toString('hex');
 
 // Stateful ephemeral in-memory RAM cache to track device online/offline status (no I/O strain)
 const activeSessions = new Map(); // browserId -> lastActiveTimestamp
+
+let serverInstance = null;
 
 /**
  * Lazy-refills and updates the database-backed tier token bucket.
@@ -124,11 +66,11 @@ const activeSessions = new Map(); // browserId -> lastActiveTimestamp
  * @returns {Promise<number>} Evaluated current metered token balance.
  */
 async function getOrUpdateAllowance(browserId, tier, deduct = false) {
-  const config = TIER_CONFIGS[tier];
-  if (!config) return 0;
+  const tierConfig = TIER_CONFIGS[tier];
+  if (!tierConfig) return 0;
 
   // Exempt unlimited/exempt priority levels completely
-  if (config.maxAllowance === Infinity) {
+  if (tierConfig.maxAllowance === Infinity) {
     return Infinity;
   }
 
@@ -139,8 +81,8 @@ async function getOrUpdateAllowance(browserId, tier, deduct = false) {
   let lastUpdate = row.last_allowance_update_at;
   const now = Date.now();
 
-  const maxAllowance = config.maxAllowance;
-  const refillRate = config.refillRateMs;
+  const maxAllowance = tierConfig.maxAllowance;
+  const refillRate = tierConfig.refillRateMs;
 
   // Handle migration and initialization boundaries
   if (allowance === null || lastUpdate === null) {
@@ -180,13 +122,13 @@ async function getOrUpdateAllowance(browserId, tier, deduct = false) {
  * @returns {Promise<number|null>} Refill epoch or null if already capped.
  */
 async function getNextRefillTime(browserId, tier) {
-  const config = TIER_CONFIGS[tier];
-  if (!config || config.maxAllowance === Infinity) return null;
+  const tierConfig = TIER_CONFIGS[tier];
+  if (!tierConfig || tierConfig.maxAllowance === Infinity) return null;
 
   const row = await get('SELECT metered_allowance, last_allowance_update_at FROM devices WHERE browser_id = ?', [browserId]);
   if (!row || row.metered_allowance === null || row.last_allowance_update_at === null) return null;
-  if (row.metered_allowance >= config.maxAllowance) return null;
-  return row.last_allowance_update_at + config.refillRateMs;
+  if (row.metered_allowance >= tierConfig.maxAllowance) return null;
+  return row.last_allowance_update_at + tierConfig.refillRateMs;
 }
 
 /**
@@ -216,30 +158,30 @@ function hashIP(ip) {
 
 /**
  * Volatile dynamic token-bucket retriever implementing lazy math refills on-demand.
- * Preserves fractional token accumulation drift.
+ * Preserves fractional token accumulation drift and guards against division by zero.
  *
  * @param {string} browserId - Device footprint.
  * @param {string} tier - Allocation tier of the device.
  * @returns {object|null} Evaluated bucket reference.
  */
 function getOrInitBucket(browserId, tier) {
-  const config = TIER_CONFIGS[tier];
-  if (!config || config.maxBurst === Infinity) return null;
+  const tierConfig = TIER_CONFIGS[tier];
+  if (!tierConfig || tierConfig.maxBurst === Infinity) return null;
 
   let bucket = deviceBuckets.get(browserId);
   const now = Date.now();
   if (!bucket) {
     bucket = {
-      tokens: config.maxBurst,
+      tokens: tierConfig.maxBurst,
       lastTx: now
     };
     deviceBuckets.set(browserId, bucket);
   } else {
     const elapsed = now - bucket.lastTx;
-    if (elapsed >= config.refillRate) {
-      const gained = Math.floor(elapsed / config.refillRate);
-      bucket.tokens = Math.min(config.maxBurst, bucket.tokens + gained);
-      bucket.lastTx += gained * config.refillRate; // Keeps exact fractional remainder alignment
+    if (tierConfig.refillRate > 0 && elapsed >= tierConfig.refillRate) {
+      const gained = Math.floor(elapsed / tierConfig.refillRate);
+      bucket.tokens = Math.min(tierConfig.maxBurst, bucket.tokens + gained);
+      bucket.lastTx += gained * tierConfig.refillRate; // Keeps exact fractional remainder alignment
     }
   }
   return bucket;
@@ -275,7 +217,7 @@ async function syncTelemetry() {
           'Authorization': `Bearer ${masterToken}`,
           'User-Agent': 'nai-gateway-v5-harvester/1.0'
         },
-        timeout: 8000
+        timeout: config.TELEMETRY_FETCH_TIMEOUT_MS
       };
 
       const req = https.request(options, (res) => {
@@ -310,7 +252,7 @@ async function syncTelemetry() {
 
       req.on('timeout', () => {
         req.destroy();
-        reject(new Error("Upstream fetch timed out after 8000ms."));
+        reject(new Error(`Upstream fetch timed out after ${config.TELEMETRY_FETCH_TIMEOUT_MS}ms.`));
       });
 
       req.end();
@@ -418,7 +360,7 @@ app.use((req, res, next) => {
 
 /**
  * Dynamically updates effective queue priorities using dynamic linear aging decay (Fast vs Base slopes).
- * Evaluates step-function promotions (AUTO) at 120s thresholds.
+ * Evaluates step-function promotions (AUTO) at configured thresholds.
  */
 function processQueue() {
   const activeImageTask = queue.find(t => t.status === 'processing');
@@ -432,23 +374,23 @@ function processQueue() {
   pendingTasks.forEach(task => {
     const elapsedSeconds = (now - task.timestamp) / 1000;
     
-    // Dynamic Step-Function Jump (AUTO state promotion) at 120s
-    if (!task.has_burst_boost && elapsedSeconds >= 120) {
+    // Dynamic Step-Function Jump (AUTO state promotion)
+    if (!task.has_burst_boost && elapsedSeconds >= config.QUEUE_AUTO_BOOST_SECONDS) {
       const bucket = getOrInitBucket(task.browser_id, task.priority_tier);
       if (bucket && bucket.tokens >= 1.0) {
         bucket.tokens -= 1.0;
         task.has_burst_boost = true;
-        console.log(`[VPS Queue AUTO] Task "${task.req_id}" hit 120s threshold. Promoting to Fast Slope.`);
+        console.log(`[VPS Queue AUTO] Task "${task.req_id}" hit ${config.QUEUE_AUTO_BOOST_SECONDS}s threshold. Promoting to Fast Slope.`);
       }
     }
 
     let p = 0;
     if (task.has_burst_boost) {
       const base = (task.priority_tier === 'Admin') ? 30 : 20;
-      p = base + Math.floor(elapsedSeconds / 5);
+      p = base + Math.floor(elapsedSeconds / config.QUEUE_FAST_SLOPE_DIVISOR);
     } else {
-      const config = TIER_CONFIGS[task.priority_tier] || TIER_CONFIGS['Normal'];
-      p = config.basePriority + Math.floor(elapsedSeconds / 15);
+      const tierConfig = TIER_CONFIGS[task.priority_tier] || TIER_CONFIGS['Normal'];
+      p = tierConfig.basePriority + Math.floor(elapsedSeconds / config.QUEUE_BASE_SLOPE_DIVISOR);
     }
     
     task.effective_priority = p;
@@ -472,8 +414,7 @@ app.all('/proxy/:subdomain/{*splat}', async (req, res) => {
     : (req.params.splat || '');
 
   // SSRF Protection Rule: Reject arbitrary target routing
-  const whitelist = ['api', 'image', 'text'];
-  if (!whitelist.includes(subdomain)) {
+  if (!SUBDOMAIN_WHITELIST.includes(subdomain)) {
     console.warn(`[VPS SSRF Warning] Target subdomain rejected: "${subdomain}"`);
     return res.status(403).json({ error: 'SSRF Shield: Unauthorized subdomain destination.' });
   }
@@ -505,7 +446,6 @@ app.all('/proxy/:subdomain/{*splat}', async (req, res) => {
   let isTextGen = false;
 
   // Single-Path Resource Cleanup logic to mitigate duplicate execution and race conditions.
-  // This function is declared early to safely teardown states even if client aborts during upload.
   const executeCleanup = () => {
     if (cleanupExecuted) return;
     cleanupExecuted = true;
@@ -531,8 +471,8 @@ app.all('/proxy/:subdomain/{*splat}', async (req, res) => {
     const isV5Request = genModelHeader === 'V5';
     if (isImageGen && isV5Request) {
       const now = Date.now();
-      // Harvester Cooldown Throttling: 30-second minimum rate-limit boundary
-      if (!is_fetching && (now - last_fetched_at > 30000)) {
+      // Harvester Cooldown Throttling boundary
+      if (!is_fetching && (now - last_fetched_at > config.TELEMETRY_COOLDOWN_MS)) {
         console.log("[VPS Telemetry] V5 generation concluded. Initiating background capacity harvest...");
         setImmediate(() => {
           syncTelemetry().catch(err => console.error("[VPS Telemetry] Out-of-band telemetry sync aborted:", err.message));
@@ -599,7 +539,7 @@ app.all('/proxy/:subdomain/{*splat}', async (req, res) => {
       const isV5Request = genModelHeader === 'V5';
       if (isV5Request) {
         const now = Date.now();
-        const isStale = last_fetched_at > 0 && (now - last_fetched_at > 1800000); // 30-minute staleness
+        const isStale = last_fetched_at > 0 && (now - last_fetched_at > config.TELEMETRY_STALE_MS);
         const isUninitialized = last_fetched_at === 0;
 
         // Fail-Closed Safeguard: lock V5 on uninitialized or stale state & trigger self-healing sync
@@ -637,29 +577,28 @@ app.all('/proxy/:subdomain/{*splat}', async (req, res) => {
         });
       }
 
-      // Enforce Soft Parametric Firewall Restrictions (Max 1MP, 28 Steps, Single Sample)
-      // Serving as a defensive, front-facing check before the background audit.
+      // Enforce Soft Parametric Firewall Restrictions via Central Configuration
       const width = parseInt(req.headers['x-gen-width'], 10) || 0;
       const height = parseInt(req.headers['x-gen-height'], 10) || 0;
       const steps = parseInt(req.headers['x-gen-steps'], 10) || 0;
       const samples = parseInt(req.headers['x-gen-samples'], 10) || 1;
       const preciseRefs = parseInt(req.headers['x-precise-refs'], 10) || 0;
 
-      const config = TIER_CONFIGS[device.priority_tier] || TIER_CONFIGS['Normal'];
+      const tierConfig = TIER_CONFIGS[device.priority_tier] || TIER_CONFIGS['Normal'];
       const totalPixels = width * height;
       const violations = [];
 
-      if (totalPixels > 1048576) {
-        violations.push(`Resolution of ${width}x${height} (${totalPixels}px) exceeds the maximum limit of 1,048,576px (1MP)`);
+      if (totalPixels > config.FIREWALL_MAX_PIXELS) {
+        violations.push(`Resolution of ${width}x${height} (${totalPixels}px) exceeds the maximum limit of ${config.FIREWALL_MAX_PIXELS.toLocaleString('en-US')}px (1MP)`);
       }
-      if (steps > 28) {
-        violations.push(`Steps count of ${steps} exceeds the maximum limit of 28 steps`);
+      if (steps > config.FIREWALL_MAX_STEPS) {
+        violations.push(`Steps count of ${steps} exceeds the maximum limit of ${config.FIREWALL_MAX_STEPS} steps`);
       }
-      if (samples !== 1) {
-        violations.push(`Samples count of ${samples} exceeds the maximum limit of 1 sample (single-image generation only)`);
+      if (samples !== config.FIREWALL_MAX_SAMPLES) {
+        violations.push(`Samples count of ${samples} exceeds the maximum limit of ${config.FIREWALL_MAX_SAMPLES} sample (single-image generation only)`);
       }
-      if (preciseRefs > config.preciseLimit) {
-        violations.push(`Precise references count of ${preciseRefs} exceeds your max limit of ${config.preciseLimit}`);
+      if (preciseRefs > tierConfig.preciseLimit) {
+        violations.push(`Precise references count of ${preciseRefs} exceeds your max limit of ${tierConfig.preciseLimit}`);
       }
 
       if (violations.length > 0) {
@@ -737,9 +676,9 @@ app.all('/proxy/:subdomain/{*splat}', async (req, res) => {
       ];
       stripHeaders.forEach(h => delete headers[h]);
 
-      // Set the Content-Length to the exact, parsed byte size of our accumulated payload buffer.
-      // This completely avoids sending both Content-Length and Transfer-Encoding: chunked,
-      // which Cloudflare strictly flags and drops to protect against HTTP Request Smuggling attacks.
+      // Set the Content-Length to the parsed byte size of the accumulated payload buffer.
+      // This avoids sending both Content-Length and Transfer-Encoding: chunked,
+      // which Cloudflare flags and drops to protect against HTTP Request Smuggling attacks.
       headers['content-length'] = payloadBuffer.length;
 
       console.log(`[VPS Telemetry] Forwarding piped request upstream to NovelAI: ${upstreamUrl} (Body: ${payloadBuffer.length} bytes)`);
@@ -766,7 +705,7 @@ app.all('/proxy/:subdomain/{*splat}', async (req, res) => {
 
         // Inject explicit anti-buffering headers for streaming routes.
         // This forces CDNs (like Cloudflare), reverse proxies (like Nginx/Caddy), 
-        // and VPN nodes to immediately flush raw binary chunks to the client browser without delays.
+        // and VPN nodes to immediately flush raw binary chunks to the client browser.
         if (pathPart === 'ai/generate-image-stream' || pathPart === 'ai/generate-stream' || pathPart === 'oa/v1/completions') {
           upstreamRes.headers['x-accel-buffering'] = 'no';
           upstreamRes.headers['cache-control'] = 'no-cache, no-transform';
@@ -1031,7 +970,7 @@ app.get('/queue/status', async (req, res) => {
   const tempPending = queue.filter(t => t.status === 'pending');
   tempPending.forEach(t => {
     const elapsedSeconds = (now - t.timestamp) / 1000;
-    if (!t.has_burst_boost && elapsedSeconds >= 120) {
+    if (!t.has_burst_boost && elapsedSeconds >= config.QUEUE_AUTO_BOOST_SECONDS) {
       const bucket = getOrInitBucket(t.browser_id, t.priority_tier);
       if (bucket && bucket.tokens >= 1.0) {
         bucket.tokens -= 1.0;
@@ -1041,10 +980,10 @@ app.get('/queue/status', async (req, res) => {
     let p = 0;
     if (t.has_burst_boost) {
       const base = (t.priority_tier === 'Admin') ? 30 : 20;
-      p = base + Math.floor(elapsedSeconds / 5);
+      p = base + Math.floor(elapsedSeconds / config.QUEUE_FAST_SLOPE_DIVISOR);
     } else {
-      const config = TIER_CONFIGS[t.priority_tier] || TIER_CONFIGS['Normal'];
-      p = config.basePriority + Math.floor(elapsedSeconds / 15);
+      const tierConfig = TIER_CONFIGS[t.priority_tier] || TIER_CONFIGS['Normal'];
+      p = tierConfig.basePriority + Math.floor(elapsedSeconds / config.QUEUE_BASE_SLOPE_DIVISOR);
     }
     t.effective_priority = p;
   });
@@ -1065,7 +1004,7 @@ app.post('/queue/complete', async (req, res) => {
   res.json({ success: true });
 });
 
-// Revamped Admin Devices endpoint consolidating with online RAM metrics & metadata
+// Admin Devices endpoint
 app.get('/admin/devices', verifyAdmin, async (req, res) => {
   try { 
     const rows = await all('SELECT * FROM devices');
@@ -1073,7 +1012,7 @@ app.get('/admin/devices', verifyAdmin, async (req, res) => {
     for (const row of rows) {
       const key = row.discord_id || `unlinked:${row.browser_id}`;
       const lastActive = activeSessions.get(row.browser_id) || row.last_active_at || 0;
-      const isOnline = (Date.now() - lastActive) < 30000; // 30 seconds threshold
+      const isOnline = (Date.now() - lastActive) < config.ACTIVE_SESSION_TTL_MS;
       
       let meteredAllowance = null;
       const tierConfig = TIER_CONFIGS[row.priority_tier];
@@ -1296,7 +1235,7 @@ app.post('/admin/link', verifyAdmin, async (req, res) => {
       [discord_id]
     );
 
-    if (existingLinks.length >= 3) {
+    if (existingLinks.length >= config.MAX_LINKED_DEVICES_PER_USER) {
       const oldestDevice = existingLinks[0].browser_id;
       // Automatically prune the oldest linked device
       await run(
@@ -1431,19 +1370,20 @@ app.get('/admin/global-stats', verifyAdmin, async (req, res) => {
 });
 
 // Scavenger Loop (TTL Maintenance)
-setInterval(() => {
+// unref() ensures this background interval does not block the Node.js event loop from cleanly terminating in test harnesses
+const gcInterval = setInterval(() => {
   const now = Date.now();
   let stateChanged = false;
   
   queue = queue.filter(t => {
-    // Drop clients failing to poll within 12 seconds
-    if (t.status === 'pending' && (now - t.last_polled_at > 12000)) {
+    // Drop clients failing to poll within configured threshold
+    if (t.status === 'pending' && (now - t.last_polled_at > config.QUEUE_POLL_TIMEOUT_MS)) {
       stateChanged = true;
       console.warn(`[Nai-Gateway GC] Discarding inactive pending client: BrowserId: ${t.browser_id}`);
       return false; 
     }
-    // Forcefully drop processing connections stuck/hung for over 25 seconds
-    if (t.status === 'processing' && (now - t.started_processing_at > 25000)) {
+    // Forcefully drop processing connections stuck/hung for over spec-configured TTL
+    if (t.status === 'processing' && (now - t.started_processing_at > config.QUEUE_PROCESSING_TIMEOUT_MS)) {
       if (t.upstreamReq) t.upstreamReq.destroy();
       stateChanged = true;
       console.warn(`[Nai-Gateway GC] Terminating hung generation lock. Extinguished active socket for: ${t.browser_id}`);
@@ -1455,7 +1395,11 @@ setInterval(() => {
   if (stateChanged) {
     processQueue();
   }
-}, 5000);
+}, config.QUEUE_GC_INTERVAL_MS);
+
+if (gcInterval.unref) {
+  gcInterval.unref();
+}
 
 /**
  * Format-agnostic parameter extractor.
@@ -1543,20 +1487,16 @@ async function runBackgroundAudit(browserId, payloadBuffer, clientReportedV5) {
   const actualSamples = n_samples || 1;
   const actualRefs = precise_ref_count || 0;
 
-  // Enforce NovelAI Opus free generation parameters
-  const maxPixels = 1048576; // 1 Megapixel (1024x1024)
-  const maxSteps = 28;
-
   const device = await get('SELECT priority_tier, discord_id FROM devices WHERE browser_id = ?', [browserId]);
   if (!device) return;
 
-  const config = TIER_CONFIGS[device.priority_tier] || TIER_CONFIGS['Normal'];
+  const tierConfig = TIER_CONFIGS[device.priority_tier] || TIER_CONFIGS['Normal'];
   
-  // Firewall Parametric Rule Validation
-  const isViolation = (actualPixels > maxPixels) || 
-                      (actualSteps > maxSteps) || 
-                      (actualSamples !== 1) || 
-                      (actualRefs > config.preciseLimit);
+  // Firewall Parametric Rule Validation against configured thresholds
+  const isViolation = (actualPixels > config.FIREWALL_MAX_PIXELS) || 
+                      (actualSteps > config.FIREWALL_MAX_STEPS) || 
+                      (actualSamples !== config.FIREWALL_MAX_SAMPLES) || 
+                      (actualRefs > tierConfig.preciseLimit);
 
   // Post-Gen Audit: validation against model-spoofing bypass attempts
   // Match V5 identifier patterns
@@ -1575,7 +1515,7 @@ async function runBackgroundAudit(browserId, payloadBuffer, clientReportedV5) {
     console.warn(`[VPS Security Audit] Device: "${browserId}", Tier: "${device.priority_tier}"`);
     
     if (isViolation) {
-      console.warn(`[VPS Security Audit] Params: ${width}x${height} (${actualPixels} px), Steps: ${actualSteps}, Refs: ${actualRefs} (Limit: ${config.preciseLimit})`);
+      console.warn(`[VPS Security Audit] Params: ${width}x${height} (${actualPixels} px), Steps: ${actualSteps}, Refs: ${actualRefs} (Limit: ${tierConfig.preciseLimit})`);
     }
     if (bypassViolation) {
       console.warn(`[VPS Security Audit] Bypass violation: Real model is V5 ("${model}"), but client omitted the X-Gen-Model: V5 header.`);
@@ -1584,7 +1524,7 @@ async function runBackgroundAudit(browserId, payloadBuffer, clientReportedV5) {
     try {
       const banReason = bypassViolation 
         ? `Firewall Bypass Violation: Client generated with V5 model ("${model}") but suppressed X-Gen-Model: V5 header.`
-        : `Firewall Violation: Max Steps=${maxSteps}, Max Refs=${config.preciseLimit}. Attempted: Steps=${actualSteps}, Refs=${actualRefs} on device ${browserId}`;
+        : `Firewall Violation: Max Steps=${config.FIREWALL_MAX_STEPS}, Max Refs=${tierConfig.preciseLimit}. Attempted: Steps=${actualSteps}, Refs=${actualRefs} on device ${browserId}`;
 
       if (device.discord_id) {
         console.warn(`[VPS Security Audit] Revoking all devices linked to Discord ID: "${device.discord_id}"`);
@@ -1626,7 +1566,7 @@ async function runBackgroundAudit(browserId, payloadBuffer, clientReportedV5) {
 }
 
 // Sequential Promise DB Bootstrapper with Resilient warm boot telemetry synchronizer
-initDatabase()
+initDatabase(config.DATABASE_PATH)
   .then(async () => {
     try {
       console.log("[VPS Boot] Executing warm boot subscription sync...");
@@ -1635,9 +1575,18 @@ initDatabase()
       console.warn("[VPS Boot] Warm boot telemetry pull failed. Initializing with default failsafe metrics:", warmBootErr.message);
     }
     
-    app.listen(PORT, '127.0.0.1', () => console.log(`Gateway coordinator running on port ${PORT}`));
+    serverInstance = app.listen(PORT, '127.0.0.1', () => console.log(`Gateway coordinator running on port ${PORT}`));
   })
   .catch((err) => {
     console.error("[VPS Critical] Database initialization failed. Terminating engine process.", err);
     process.exit(1);
   });
+
+// Clean module lifecycle exposure for programmatic testing
+module.exports = {
+  app,
+  get server() {
+    return serverInstance;
+  },
+  gcInterval
+};

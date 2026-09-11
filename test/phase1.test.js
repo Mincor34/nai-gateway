@@ -27,6 +27,7 @@ const https = require('https');
 const fs = require('fs');
 const path = require('path');
 const sqlite3 = require('sqlite3').verbose();
+const { initDatabase, closeDatabase } = require('../database');
 
 // ----------------- ENVIRONMENT CONFIGURATION -----------------
 const GATEWAY_PORT = 13000;
@@ -252,8 +253,7 @@ test("NovelAI Gateway Phase 1 Comprehensive Security & Resilience Gate", async (
   // 1. SQLite Database High-Concurrency Lock Contention Test
   // Spawns 50 parallel asynchronous writes across independent connection instances to force real OS-level file lock contention
   await t.test("SQLite Database Lock Contention - 50 Parallel Independent Connection Writes within 50ms", async () => {
-    const { initDatabase } = require('../database');
-    await initDatabase();
+    await initDatabase(SANDBOX_DB_FILE); // Explicit path injection
 
     const runQueryOnIsolatedHandle = (index) => {
       return new Promise((resolve, reject) => {
@@ -290,7 +290,7 @@ test("NovelAI Gateway Phase 1 Comprehensive Security & Resilience Gate", async (
 
   // Bootstrap Gateway monolith
   console.log("[Test Suite] Initializing server.js...");
-  require('../server.js');
+  const serverModule = require('../server.js');
   await waitForServerToBootstrap(`http://127.0.0.1:${GATEWAY_PORT}/favicon.ico`);
   console.log("[Test Suite] Gateway Server successfully bootstrapped.");
 
@@ -403,7 +403,7 @@ test("NovelAI Gateway Phase 1 Comprehensive Security & Resilience Gate", async (
     mockUpstreamServerHits = [];
 
     await queryGateway('/auth/register', 'POST', {}, { browser_id: 'client_firewall', device_secret: 'secret_firewall', label: 'Firewall Tester' });
-    await queryGateway('/admin/approve', 'POST', { 'Authorization': 'Bearer test_admin_key_super_secret_123' }, { browser_id: 'client_firewall', priority_tier: 'Low' }); // Low tier limit: preciseLimit = 1
+    await queryGateway('/admin/approve', 'POST', { 'Authorization': 'Bearer test_admin_key_super_secret_123' }, { browser_id: 'client_firewall', priority_tier: 'Low' });
 
     // Helper to queue and wait for turn
     const joinAndWait = async (reqId) => {
@@ -469,7 +469,7 @@ test("NovelAI Gateway Phase 1 Comprehensive Security & Resilience Gate", async (
     assert.strictEqual(samplesLimitRes.status, 400, "Samples != 1 must return 400 Bad Request");
     assert.match(samplesLimitRes.data.message, /single-image generation only/i);
 
-    // Sub-test 4e: Precise References exceeding tier allocation (Low tier limit is 1)
+    // Sub-test 4e: Precise References exceeding tier allocation
     await joinAndWait('req_fw_refs');
     const refsLimitRes = await queryGateway('/proxy/image/ai/generate-image-stream', 'POST', {
       'X-Browser-ID': 'client_firewall',
@@ -488,7 +488,7 @@ test("NovelAI Gateway Phase 1 Comprehensive Security & Resilience Gate", async (
     // Assert zero bytes reached the mock upstream for all firewall drops
     assert.strictEqual(mockUpstreamServerHits.length, 0, "No payload data must ever reach upstream when dropped by firewall");
 
-    // INVARIANT ASSERTION: Confirm that parametric firewall drops NEVER ban or de-authorize the client
+    // Assert parametric firewall drops NEVER de-authorize or ban the client
     const statusCheck = await queryGateway('/auth/status?browser_id=client_firewall', 'GET', { 'Authorization': 'Bearer secret_firewall' });
     assert.strictEqual(statusCheck.status, 200, "Firewall client must remain registered and fully approved");
     assert.strictEqual(statusCheck.data.approved, true, "Firewall limit drops must never de-authorize a legitimate client");
@@ -687,8 +687,11 @@ test("NovelAI Gateway Phase 1 Comprehensive Security & Resilience Gate", async (
 
   // ----------------- SUITE TEARDOWN -----------------
   await new Promise(r => mockUpstreamServer.close(r));
+  await closeDatabase();
   if (gatewayServerInstance) {
     await new Promise(r => gatewayServerInstance.close(r));
+  } else if (serverModule.server) {
+    await new Promise(r => serverModule.server.close(r));
   }
   cleanupSandboxFiles();
   console.log("[Test Suite] Exhaustive Phase 1 verification complete. All security parameters confirmed.");
