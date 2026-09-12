@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         NovelAI Split-Token Gateway Coordinator (Guest)
 // @namespace    http://tampermonkey.net/
-// @version      4.0.2
+// @version      4.1.0
 // @description  FIFO queue coordination, rolling allowance telemetry visualization, and background stream proxy pipeline
 // @author       Minco
 // @match        https://novelai.net/*
@@ -907,7 +907,8 @@
                 try {
                     const statusRes = await backgroundRequest({
                         method: "GET",
-                        url: `${VPS_HOST}/queue/status?req_id=${req_id}`
+                        url: `${VPS_HOST}/queue/status?req_id=${req_id}&browser_id=${browserId}`,
+                        headers: { "Authorization": `Bearer ${deviceSecret}` }
                     });
                     if (statusRes.status === 200) {
                         const sData = JSON.parse(statusRes.responseText);
@@ -1022,8 +1023,11 @@
                         backgroundRequest({
                             method: "POST",
                             url: `${VPS_HOST}/queue/complete`,
-                            headers: { "Content-Type": "application/json" },
-                            data: JSON.stringify({ req_id })
+                            headers: { 
+                                "Content-Type": "application/json",
+                                "Authorization": `Bearer ${deviceSecret}`
+                            },
+                            data: JSON.stringify({ req_id, browser_id: browserId })
                         });
 
                         if (!hasResolved) {

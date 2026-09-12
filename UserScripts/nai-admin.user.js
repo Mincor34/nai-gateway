@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         NovelAI Split-Token Gateway Coordinator (Admin Panel)
 // @namespace    http://tampermonkey.net/
-// @version      4.0.2
+// @version      4.1.0
 // @description  Secure administration panel, telemetry dashboard, and session token injector
 // @author       Minco
 // @match        https://novelai.net/*
@@ -24,7 +24,7 @@
  *
  * SECURITY DESIGN PRINCIPLE:
  * Outbound requests targeting the VPS `/proxy/` and `/queue/` endpoints are routed using Tampermonkey's
- * privileged background XMLHttpRequests (`GM_xmlhttpRequest`) [Plan.md]. This breaks through local Content
+ * privileged background XMLHttpRequests (`GM_xmlhttpRequest`). This breaks through local Content
  * Security Policy (CSP) headers served by novelai.net that would otherwise block connection sockets to
  * your external gateway domain.
  */
@@ -1116,7 +1116,8 @@
             try {
                 const statusRes = await backgroundRequest({
                     method: "GET",
-                    url: `${VPS_HOST}/queue/status?req_id=${req_id}`
+                    url: `${VPS_HOST}/queue/status?req_id=${req_id}&browser_id=${browserId}`,
+                    headers: { "Authorization": `Bearer ${deviceSecret}` }
                 });
                 if (statusRes.status === 200) {
                     const sData = JSON.parse(statusRes.responseText);
@@ -1232,8 +1233,11 @@
                     backgroundRequest({
                         method: "POST",
                         url: `${VPS_HOST}/queue/complete`,
-                        headers: { "Content-Type": "application/json" },
-                        data: JSON.stringify({ req_id })
+                        headers: { 
+                            "Content-Type": "application/json",
+                            "Authorization": `Bearer ${deviceSecret}`
+                        },
+                        data: JSON.stringify({ req_id, browser_id: browserId })
                     });
 
                     if (!hasResolved) {
