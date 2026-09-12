@@ -1,1410 +1,218 @@
 /**
- * COORDINATOR GATEWAY CORE (server.js)
- * Architecture Level 5: Main Entrypoint & Service Orchestrator
+ * LEVEL 5: SERVICE ORCHESTRATOR & BOOTSTRAPPER (server.js)
  *
  * Implements:
- * - Explicit Configuration Ingestion via Level 1 Engine
- * - Sequential Promise DB Startup Guard with Resilient Warm-Boot Sync
- * - Synchronous RAM Queue Coordination via Level 3 Engine
- * - Event-Driven Master Account V5 Protection Layer
- * - Preserved Fractional Token Accumulation (RAM-bound)
- * - Safe Boundary-Sliced Multipart JSON Parser for Background Post-Audits
- * - Dual-Rate Dynamic Queue Aging with 120s AUTO Promotion
- * - Explicit Dynamic Allowance Validation on Queue Entry
- * - Identity-Bound Concurrency Queue Management (Discord-ID Locked)
- * - Decoupled REST interfaces for Discord Bot integrations
+ * - Unidirectional architecture routing
+ * - Global IP hashing middleware
+ * - Stream-safe unparsed /proxy mount
+ * - Post-stream standard body-parsers for /auth, /queue, /admin
+ * - Resilient warm-boot telemetry harvester with shared Promise deduplication
+ * - Active telemetry heartbeat loop to eliminate stale-state client drops
  */
 
+'use strict';
+
 const express = require('express');
+const http = require('http');
 const https = require('https');
 const crypto = require('crypto');
 const { loadConfig } = require('./config');
-const { initDatabase, closeDatabase, run, get, all } = require('./database');
+const { initDatabase, get } = require('./database');
 const queueManager = require('./queueManager');
 
-// Explicit Configuration Bootstrap
-const config = loadConfig(process.env);
-const PORT = config.PORT;
-const ADMIN_SECRET_KEY = config.ADMIN_SECRET_KEY;
-const TIER_CONFIGS = config.TIER_CONFIGS;
-const PROXY_PATH_WHITELIST = config.PROXY_PATH_WHITELIST;
-const SUBDOMAIN_WHITELIST = config.SUBDOMAIN_WHITELIST;
+// Route Controllers (Level 4)
+const proxyRouter = require('./routes/proxyRouter');
+const authRouter = require('./routes/authRouter');
+const queueRouter = require('./routes/queueRouter');
+const adminRouter = require('./routes/adminRouter');
 
 const app = express();
 
-// v5 Protection Layer State (RAM Cache Registry)
+// IP Telemetry Cryptographic Salt
+const IP_SALT = crypto.randomBytes(16).toString('hex');
+
+// V5 Master Account Telemetry Registry
 let master_v5_percent = 100;
 let last_fetched_at = 0;
 let is_hard_locked = false;
-let is_fetching = false;
-
-// Cryptographic Salt for IP hashing.
-// Regenerating this on startup ensures maximum privacy: hashes remain identical 
-// during runtime (allowing you to track/rate-limit a session), but become 
-// completely un-reconstructible if log files are ever leaked.
-const IP_SALT = crypto.randomBytes(16).toString('hex');
-
-let serverInstance = null;
-
-// Start Queue Scavenger GC cycle
-queueManager.startGc();
-
-/**
- * Lazy-refills and updates the database-backed tier token bucket.
- * Mathematically accounts for elapsed time while preserving the current timing remainder.
- *
- * @param {string} browserId - Unique device browser footprint.
- * @param {string} tier - Device priority tier mapping.
- * @param {boolean} deduct - True if 1 token should be consumed atomically.
- * @returns {Promise<number>} Evaluated current metered token balance.
- */
-async function getOrUpdateAllowance(browserId, tier, deduct = false) {
-  const tierConfig = TIER_CONFIGS[tier];
-  if (!tierConfig) return 0;
-
-  // Exempt unlimited/exempt priority levels completely
-  if (tierConfig.maxAllowance === Infinity) {
-    return Infinity;
-  }
-
-  const row = await get('SELECT metered_allowance, last_allowance_update_at FROM devices WHERE browser_id = ?', [browserId]);
-  if (!row) return 0;
-
-  let allowance = row.metered_allowance;
-  let lastUpdate = row.last_allowance_update_at;
-  const now = Date.now();
-
-  const maxAllowance = tierConfig.maxAllowance;
-  const refillRate = tierConfig.refillRateMs;
-
-  // Handle migration and initialization boundaries
-  if (allowance === null || lastUpdate === null) {
-    allowance = maxAllowance;
-    lastUpdate = now;
-    await run('UPDATE devices SET metered_allowance = ?, last_allowance_update_at = ? WHERE browser_id = ?', [maxAllowance, now, browserId]);
-  }
-
-  const elapsed = Math.max(0, now - lastUpdate);
-  const gained = refillRate > 0 ? Math.floor(elapsed / refillRate) : 0;
-
-  if (gained > 0) {
-    allowance = Math.min(maxAllowance, allowance + gained);
-    lastUpdate = lastUpdate + (gained * refillRate); // Preserves fractional timing drift down to the millisecond
-  }
-
-  if (deduct) {
-    if (allowance >= 1) {
-      allowance -= 1;
-      await run('UPDATE devices SET metered_allowance = ?, last_allowance_update_at = ? WHERE browser_id = ?', [allowance, lastUpdate, browserId]);
-    } else {
-      return -1; // Exhausted state sentinel
-    }
-  } else if (gained > 0) {
-    // Save-on-read: Only hit SQLite when an active refill block transitions
-    await run('UPDATE devices SET metered_allowance = ?, last_allowance_update_at = ? WHERE browser_id = ?', [allowance, lastUpdate, browserId]);
-  }
-
-  return allowance;
-}
-
-/**
- * Calculates the exact millisecond epoch for the user's next rolling allowance refill.
- *
- * @param {string} browserId - Unique device browser footprint.
- * @param {string} tier - Device priority tier mapping.
- * @returns {Promise<number|null>} Refill epoch or null if already capped.
- */
-async function getNextRefillTime(browserId, tier) {
-  const tierConfig = TIER_CONFIGS[tier];
-  if (!tierConfig || tierConfig.maxAllowance === Infinity) return null;
-
-  const row = await get('SELECT metered_allowance, last_allowance_update_at FROM devices WHERE browser_id = ?', [browserId]);
-  if (!row || row.metered_allowance === null || row.last_allowance_update_at === null) return null;
-  if (row.metered_allowance >= tierConfig.maxAllowance) return null;
-  return row.last_allowance_update_at + tierConfig.refillRateMs;
-}
-
-/**
- * Computes a secure, salted SHA-256 hash of an IP address.
- * Takes the first 12 characters to keep terminal telemetry readable.
- *
- * @param {string} ip - Raw client IP.
- * @returns {string} Salted hash prefix.
- */
-function hashIP(ip) {
-  if (!ip || ip === 'unknown' || ip === '127.0.0.1' || ip === '::1') {
-    return 'local/unknown';
-  }
-  return crypto.createHash('sha256').update(ip + IP_SALT).digest('hex').substring(0, 12);
-}
+let activeFetchPromise = null;
 
 /**
  * Asynchronously synchronizes master account subscription telemetry.
- * Traps runtime exceptions to prevent process crashes and cache stampede memory leaks.
- */
-async function syncTelemetry() {
-  if (is_fetching) return;
-  
-  // Set lock state at entry point before crossing any asynchronous await boundaries
-  is_fetching = true;
-
-  try {
-    const configRecord = await get('SELECT value FROM config WHERE key = ?', ['master_token']);
-    if (!configRecord || !configRecord.value) {
-      console.warn("[VPS Harvester] Telemetry sync skipped: No master_token configured in database yet.");
-      is_fetching = false; // Release lock on early return
-      return;
-    }
-    const masterToken = configRecord.value;
-
-    console.log("[VPS Harvester] Fetching master subscription telemetry from image.novelai.net...");
-
-    await new Promise((resolve, reject) => {
-      const options = {
-        hostname: 'image.novelai.net',
-        path: '/user/subscription',
-        method: 'GET',
-        headers: {
-          'Authorization': `Bearer ${masterToken}`,
-          'User-Agent': 'nai-gateway-v5-harvester/1.0'
-        },
-        timeout: config.TELEMETRY_FETCH_TIMEOUT_MS
-      };
-
-      const req = https.request(options, (res) => {
-        let rawData = '';
-        res.on('data', chunk => rawData += chunk);
-        res.on('end', () => {
-          try {
-            if (res.statusCode === 200) {
-              const payload = JSON.parse(rawData);
-              const percent = payload.usage?.percent;
-              if (typeof percent === 'number') {
-                master_v5_percent = percent;
-                last_fetched_at = Date.now();
-                is_hard_locked = (percent < 10);
-                console.log(`[VPS Harvester] Telemetry sync successful. Capacity: ${master_v5_percent}%, Locked: ${is_hard_locked}`);
-                resolve();
-              } else {
-                reject(new Error("Malformed subscription response payload: usage.percent missing."));
-              }
-            } else {
-              reject(new Error(`Upstream returned error status code: ${res.statusCode}`));
-            }
-          } catch (parseErr) {
-            reject(parseErr);
-          }
-        });
-      });
-
-      req.on('error', (err) => {
-        reject(err);
-      });
-
-      req.on('timeout', () => {
-        req.destroy();
-        reject(new Error(`Upstream fetch timed out after ${config.TELEMETRY_FETCH_TIMEOUT_MS}ms.`));
-      });
-
-      req.end();
-    });
-
-  } catch (err) {
-    console.error("[VPS Harvester] Critical exception thrown in telemetry harvester sync:", err);
-    throw err; // Rethrow to let the boot sequence handle warm boot failures explicitly
-  } finally {
-    is_fetching = false; // Release the lock on operational exit
-  }
-}
-
-// ----------------- SECURE PAYLOAD TELEMETRY UTILITIES -----------------
-
-/**
- * Recursively inspects a JSON payload and replaces massive Base64 strings
- * with compact metadata placeholders to prevent terminal locking and log bloat.
+ * Leverages shared Promise resolution to prevent cache stampedes.
  *
- * @param {*} obj - Target payload object.
- * @returns {*} Sanitized object copy.
+ * @returns {Promise<void>} Resolves when telemetry is synchronized.
  */
-function sanitizeObjectForLogging(obj) {
-  if (obj === null || obj === undefined) return obj;
-  
-  if (Array.isArray(obj)) {
-    return obj.map(item => sanitizeObjectForLogging(item));
+function syncTelemetry() {
+  if (activeFetchPromise) {
+    return activeFetchPromise;
   }
-  
-  if (typeof obj === 'object') {
-    const cleaned = {};
-    for (const [key, val] of Object.entries(obj)) {
-      cleaned[key] = sanitizeObjectForLogging(val);
-    }
-    return cleaned;
-  }
-  
-  if (typeof obj === 'string') {
-    if (obj.length > 500) {
-      const mimeType = obj.startsWith('data:') ? obj.split(';')[0] : 'Base64/Binary';
-      return `[Truncated ${mimeType}, Length: ${obj.length} chars]`;
-    }
-  }
-  
-  return obj;
-}
 
-/**
- * Formats both raw JSON and Multipart/FormData payloads into a clean, readable, 
- * and untruncated structured string for secure VPS telemetry.
- *
- * @param {Buffer} buffer - Raw request body buffer.
- * @returns {string} Formatted log output.
- */
-function formatPayloadForLogging(buffer) {
-  try {
-    if (!buffer || buffer.length === 0) return "{ empty payload }";
-
-    const bodyStr = buffer.toString('utf8');
-
-    if (buffer[0] === 0x2d && buffer[1] === 0x2d) { // Starts with "--" boundary marker
-      const firstLineEnd = bodyStr.indexOf('\n');
-      const boundary = firstLineEnd !== -1 ? bodyStr.slice(0, firstLineEnd).trim() : '';
-      const requestIndex = bodyStr.indexOf('name="request"');
-      
-      if (requestIndex !== -1 && boundary) {
-        const startIdx = bodyStr.indexOf('{', requestIndex);
-        if (startIdx !== -1) {
-          const nextBoundary = bodyStr.indexOf(boundary, startIdx);
-          const endIdx = nextBoundary !== -1 ? nextBoundary : bodyStr.length;
-
-          let jsonCandidate = bodyStr.slice(startIdx, endIdx).trim();
-          const lastBrace = jsonCandidate.lastIndexOf('}');
-          if (lastBrace !== -1) {
-            jsonCandidate = jsonCandidate.slice(0, lastBrace + 1);
-          }
-          
-          const parsed = JSON.parse(jsonCandidate);
-          return JSON.stringify(sanitizeObjectForLogging(parsed), null, 2);
-        }
+  activeFetchPromise = (async () => {
+    try {
+      const config = loadConfig(process.env);
+      const configRecord = await get('SELECT value FROM config WHERE key = ?', ['master_token']);
+      if (!configRecord || !configRecord.value) {
+        console.warn("[VPS Harvester] Telemetry sync skipped: No master_token configured in database yet.");
+        return;
       }
-      return `[Multipart Payload - Boundary: ${boundary}, Length: ${buffer.length} bytes]`;
-    }
+      const masterToken = configRecord.value;
 
-    if (bodyStr.trim().startsWith('{')) {
-      const parsed = JSON.parse(bodyStr);
-      return JSON.stringify(sanitizeObjectForLogging(parsed), null, 2);
-    }
+      console.log("[VPS Harvester] Fetching master subscription telemetry...");
 
-    return bodyStr.substring(0, 1000) + `... [Truncated raw data, Total: ${buffer.length} bytes]`;
-  } catch (err) {
-    return `[Logger Error] Parsing failure: ${err.message}. Raw payload size: ${buffer.length} bytes.`;
-  }
+      await new Promise((resolve, reject) => {
+        const baseUrl = config.UPSTREAM_BASE_URL_TEMPLATE.replace('{subdomain}', 'image');
+        const telemetryUrl = `${baseUrl}/user/subscription`;
+        const parsedUrl = new URL(telemetryUrl);
+
+        const options = {
+          hostname: parsedUrl.hostname,
+          port: parsedUrl.port || (parsedUrl.protocol === 'https:' ? 443 : 80),
+          path: parsedUrl.pathname + parsedUrl.search,
+          method: 'GET',
+          headers: {
+            'Authorization': `Bearer ${masterToken}`,
+            'User-Agent': 'nai-gateway-v5-harvester/1.0'
+          },
+          timeout: config.TELEMETRY_FETCH_TIMEOUT_MS
+        };
+
+        const transport = parsedUrl.protocol === 'https:' ? https : http;
+
+        const req = transport.request(options, (res) => {
+          let rawData = '';
+          res.on('data', chunk => rawData += chunk);
+          res.on('end', () => {
+            try {
+              if (res.statusCode === 200) {
+                const payload = JSON.parse(rawData);
+                const percent = payload.usage?.percent;
+                if (typeof percent === 'number') {
+                  master_v5_percent = percent;
+                  last_fetched_at = Date.now();
+                  is_hard_locked = (percent < 10);
+                  console.log(`[VPS Harvester] Telemetry sync successful. Capacity: ${master_v5_percent}%, Locked: ${is_hard_locked}`);
+                  resolve();
+                } else {
+                  reject(new Error("Malformed subscription response payload: usage.percent missing."));
+                }
+              } else {
+                reject(new Error(`Upstream returned error status code: ${res.statusCode}`));
+              }
+            } catch (parseErr) {
+              reject(parseErr);
+            }
+          });
+        });
+
+        req.on('error', reject);
+        req.on('timeout', () => {
+          req.destroy();
+          reject(new Error(`Upstream fetch timed out after ${config.TELEMETRY_FETCH_TIMEOUT_MS}ms.`));
+        });
+
+        req.end();
+      });
+    } catch (err) {
+      console.error("[VPS Harvester] Exception in telemetry harvester sync:", err.message);
+      throw err; // Propagate exception to boot sequence for explicit error logging
+    } finally {
+      activeFetchPromise = null;
+    }
+  })();
+
+  return activeFetchPromise;
 }
 
-// ----------------- CENTRAL TELEMETRY MIDDLEWARE -----------------
+// Global Telemetry Attachment Middleware
+app.use((req, res, next) => {
+  req.telemetry = {
+    get percent() { return master_v5_percent; },
+    get lastFetched() { return last_fetched_at; },
+    get isHardLocked() { return is_hard_locked; },
+    triggerSync: () => {
+      const config = loadConfig(process.env);
+      const now = Date.now();
+      if (!activeFetchPromise && (now - last_fetched_at > config.TELEMETRY_COOLDOWN_MS)) {
+        setImmediate(() => {
+          syncTelemetry().catch(err => console.error("[VPS Telemetry] Out-of-band sync failed:", err.message));
+        });
+      }
+    },
+    ensureFresh: async () => {
+      const config = loadConfig(process.env);
+      const now = Date.now();
+      if (last_fetched_at === 0 || (now - last_fetched_at > config.TELEMETRY_STALE_MS)) {
+        await syncTelemetry();
+      }
+    }
+  };
+  next();
+});
+
+// Central Request Logger
 app.use((req, res, next) => {
   if (req.url === '/favicon.ico') return res.status(204).end();
   const timestamp = new Date().toISOString();
   const rawIp = req.headers['x-real-ip'] || req.ip || 'unknown'; 
-  const maskedIp = hashIP(rawIp);
+  const maskedIp = (rawIp === 'unknown' || rawIp === '127.0.0.1' || rawIp === '::1')
+    ? 'local/unknown'
+    : crypto.createHash('sha256').update(rawIp + IP_SALT).digest('hex').substring(0, 12);
   console.log(`[VPS Telemetry] ${timestamp} | ${req.method} ${req.url} | Client: ${maskedIp}`);
   next();
 });
 
-// ----------------- SECURE SWAP PROXY HANDLER (NO BODY PARSERS PRE-MOUNTED) -----------------
-// Declarative routing here prevents Express middleware from destroying boundary/binary formats.
-app.all('/proxy/:subdomain/{*splat}', async (req, res) => {
-  const { subdomain } = req.params;
-  
-  // Reconstruct the remaining path from the named wildcard array segments
-  const pathPart = Array.isArray(req.params.splat) 
-    ? req.params.splat.join('/') 
-    : (req.params.splat || '');
+// ----------------- ROUTE CONTROLLER MOUNTING -----------------
 
-  // SSRF Protection Rule: Reject arbitrary target routing
-  if (!SUBDOMAIN_WHITELIST.includes(subdomain)) {
-    console.warn(`[VPS SSRF Warning] Target subdomain rejected: "${subdomain}"`);
-    return res.status(403).json({ error: 'SSRF Shield: Unauthorized subdomain destination.' });
-  }
+// 1. Mount Stream-Safe Proxy Router WITHOUT global body-parsers
+app.use('/proxy', proxyRouter);
 
-  // Privilege Escalation Prevention Rule: Ensure the requested endpoint is strictly whitelisted
-  if (!PROXY_PATH_WHITELIST.has(pathPart)) {
-    console.warn(`[VPS Security Warning] Target path non-whitelisted: "${pathPart}"`);
-    return res.status(403).json({ error: 'Access Denied: Path not whitelisted for proxying.' });
-  }
-
-  // Retrieve routing identification variables
-  const browserId = req.headers['x-browser-id'];
-  const clientAuth = req.headers['authorization'];
-  if (!browserId || !clientAuth || !clientAuth.startsWith('Bearer ')) {
-    return res.status(401).json({ error: 'Missing routing authorization context.' });
-  }
-  const deviceSecret = clientAuth.split(' ')[1];
-
-  queueManager.ping(browserId);
-
-  const isImageGen = pathPart === 'ai/generate-image' || pathPart === 'ai/generate-image-stream';
-  const genModelHeader = req.headers['x-gen-model'];
-
-  // Declare variables in the parent scope to prevent resource leakage on aborted uploads
-  let activeTask = null;
-  let upstreamReq = null;
-  let cleanupExecuted = false;
-  let isTextGenClaimed = false;
-  let isTextGen = false;
-  let textGenLockId = null;
-
-  // Single-Path Resource Cleanup logic to mitigate duplicate execution and race conditions.
-  const executeCleanup = () => {
-    if (cleanupExecuted) return;
-    cleanupExecuted = true;
-
-    if (upstreamReq) {
-      try { upstreamReq.destroy(); } catch (err) {}
-    }
-
-    if (isTextGen && isTextGenClaimed && textGenLockId) {
-      queueManager.releaseTextSlot(textGenLockId);
-    }
-
-    if (activeTask) {
-      queueManager.complete(activeTask.req_id, browserId);
-      console.log(`[VPS Telemetry] Stream cleaned up. Slot released for request: "${activeTask.req_id}"`);
-    }
-
-    // v5 Protection Layer: Trigger Telemetry Harvester on natural V5 completion
-    const isV5Request = genModelHeader === 'V5';
-    if (isImageGen && isV5Request) {
-      const now = Date.now();
-      // Harvester Cooldown Throttling boundary
-      if (!is_fetching && (now - last_fetched_at > config.TELEMETRY_COOLDOWN_MS)) {
-        console.log("[VPS Telemetry] V5 generation concluded. Initiating background capacity harvest...");
-        setImmediate(() => {
-          syncTelemetry().catch(err => console.error("[VPS Telemetry] Out-of-band telemetry sync aborted:", err.message));
-        });
-      } else if (is_fetching) {
-        console.log("[VPS Telemetry] Telemetry Harvester is currently active. Skipping overlapping harvest.");
-      } else {
-        console.log("[VPS Telemetry] Telemetry Harvester cooldown in effect. Skipping harvest trigger.");
-      }
-    }
-  };
-
-  // Bind cleanup immediately. If a client disconnects during the body upload stream,
-  // this triggers and prevents permanent concurrency leaks.
-  res.on('close', executeCleanup);
-  res.on('finish', executeCleanup);
-
-  try {
-    // Validate guest authorization signature
-    let device;
-    if (deviceSecret === ADMIN_SECRET_KEY) {
-      device = { approved: 1, banned: 0, priority_tier: 'Admin' };
-    } else {
-      device = await get(
-        'SELECT approved, banned, priority_tier, discord_id FROM devices WHERE browser_id = ? AND device_secret = ?',
-        [browserId, deviceSecret]
-      );
-    }
-
-    if (!device) {
-      console.warn(`[VPS Auth Warning] Rejected credentials for device: "${browserId}"`);
-      return res.status(401).json({ error: 'Access Denied: Device credentials rejected.' });
-    }
-
-    // Flag-based ban safety checks
-    if (device.banned === 1) {
-      return res.status(403).json({ error: 'Access Denied: Your device/profile has been permanently banned.' });
-    }
-
-    if (device.discord_id) {
-      const isBannedUser = await get('SELECT 1 FROM banned_discords WHERE discord_id = ?', [device.discord_id]);
-      if (isBannedUser) {
-        await run('UPDATE devices SET banned = 1 WHERE discord_id = ?', [device.discord_id]);
-        return res.status(403).json({ error: 'Access Denied: Your Discord identity is permanently banned.' });
-      }
-    }
-
-    if (device.approved !== 1) {
-      return res.status(401).json({ error: 'Access Denied: Device pending registration approval.' });
-    }
-
-    // Run selective V5 check AFTER authentication.
-    if (isImageGen) {
-      // Reject missing model headers to prevent accidental bans on outdated clients
-      if (!genModelHeader) {
-        console.warn(`[VPS Gatekeeper] Rejected image gen request from browser "${browserId}" due to missing model validation header (outdated script).`);
-        return res.status(426).json({
-          statusCode: 426,
-          error: 'SCRIPT_UPDATE_REQUIRED',
-          message: 'Your NovelAI Gateway Tampermonkey userscript is outdated. Please update to the latest version to proceed.'
-        });
-      }
-
-      const isV5Request = genModelHeader === 'V5';
-      if (isV5Request) {
-        const now = Date.now();
-        const isStale = last_fetched_at > 0 && (now - last_fetched_at > config.TELEMETRY_STALE_MS);
-        const isUninitialized = last_fetched_at === 0;
-
-        // Fail-Closed Safeguard: lock V5 on uninitialized or stale state & trigger self-healing sync
-        if (isStale || isUninitialized) {
-          is_hard_locked = true;
-          console.warn(`[VPS Gatekeeper] Telemetry state is ${isUninitialized ? 'uninitialized' : 'stale'}. Forcing V5 lockout & triggering out-of-band refresh.`);
-          setImmediate(() => {
-            syncTelemetry().catch(err => console.error("[VPS Gatekeeper] Self-healing background sync failed:", err.message));
-          });
-        }
-
-        if (is_hard_locked) {
-          console.warn(`[VPS Gatekeeper] V5 generation rejected for browser "${browserId}". V5 Percent: ${master_v5_percent}%, Last Fetched Age: ${isUninitialized ? 'never' : ((now - last_fetched_at) / 1000).toFixed(1) + 's'}`);
-          return res.status(429).json({
-            statusCode: 429,
-            error: 'V5_CAPACITY_DEPLETED',
-            message: 'v5 generation is temporarily disabled due to low master account capacity (<10%). Try again in a few minutes, or switch to an older model.'
-          });
-        }
-      }
-    }
-
-    isTextGen = pathPart === 'ai/generate-stream' || pathPart === 'oa/v1/completions';
-
-    if (isImageGen) {
-      // Validate active queue lock requirements for Channel A
-      const requestId = req.headers['x-request-id'];
-      if (!requestId) return res.status(400).json({ error: 'Missing request ID.' });
-
-      activeTask = queueManager.getProcessingTask(requestId, browserId);
-      if (!activeTask) {
-        return res.status(403).json({
-          statusCode: 403,
-          message: 'Anlas Protection: Transaction queue verification lock required.'
-        });
-      }
-
-      // Enforce Soft Parametric Firewall Restrictions via Central Configuration
-      const width = parseInt(req.headers['x-gen-width'], 10) || 0;
-      const height = parseInt(req.headers['x-gen-height'], 10) || 0;
-      const steps = parseInt(req.headers['x-gen-steps'], 10) || 0;
-      const samples = parseInt(req.headers['x-gen-samples'], 10) || 1;
-      const preciseRefs = parseInt(req.headers['x-precise-refs'], 10) || 0;
-
-      const tierConfig = TIER_CONFIGS[device.priority_tier] || TIER_CONFIGS['Normal'];
-      const totalPixels = width * height;
-      const violations = [];
-
-      if (totalPixels > config.FIREWALL_MAX_PIXELS) {
-        violations.push(`Resolution of ${width}x${height} (${totalPixels}px) exceeds the maximum limit of ${config.FIREWALL_MAX_PIXELS.toLocaleString('en-US')}px (1MP)`);
-      }
-      if (steps > config.FIREWALL_MAX_STEPS) {
-        violations.push(`Steps count of ${steps} exceeds the maximum limit of ${config.FIREWALL_MAX_STEPS} steps`);
-      }
-      if (samples !== config.FIREWALL_MAX_SAMPLES) {
-        violations.push(`Samples count of ${samples} exceeds the maximum limit of ${config.FIREWALL_MAX_SAMPLES} sample (single-image generation only)`);
-      }
-      if (preciseRefs > tierConfig.preciseLimit) {
-        violations.push(`Precise references count of ${preciseRefs} exceeds your max limit of ${tierConfig.preciseLimit}`);
-      }
-
-      if (violations.length > 0) {
-        const combinedMessage = `\n\nAnlas Protection Limit Violations:\n` + 
-                                violations.map(v => `• ${v}`).join('\n');
-                                
-        return res.status(400).json({
-          statusCode: 400,
-          message: combinedMessage,
-          violations: violations
-        });
-      }
-    } else if (isTextGen) {
-      // Channel B Fast-Track Concurrency Limit Execution
-      textGenLockId = req.headers['x-request-id'] || crypto.randomUUID();
-      if (!queueManager.acquireTextSlot(textGenLockId)) {
-        return res.status(429).json({ error: 'Text processing pipelines saturated. Retry request.' });
-      }
-      isTextGenClaimed = true; // Mark as successfully allocated
-    }
-
-    // Retrieve system session credential
-    const configRecord = await get('SELECT value FROM config WHERE key = ?', ['master_token']);
-    if (!configRecord || !configRecord.value) {
-      executeCleanup();
-      return res.status(503).json({ error: 'System unconfigured: No master token pushed.' });
-    }
-    const masterToken = configRecord.value;
-
-    const queryString = req.url.split('?')[1] || '';
-    const upstreamUrl = `https://${subdomain}.novelai.net/${pathPart}${queryString ? '?' + queryString : ''}`;
-
-    // Accumulate the entire request body from the client into memory on the VPS.
-    // This allows us to re-calculate the Content-Length cleanly before forwarding upstream.
-    const bodyChunks = [];
-    req.on('data', chunk => bodyChunks.push(chunk));
-    
-    req.on('end', () => {
-      const payloadBuffer = Buffer.concat(bodyChunks);
-
-      // Asynchronously trigger parameter audit and track request stats in SQLite
-      setImmediate(async () => {
-        try {
-          await run(
-            'UPDATE devices SET total_requests = total_requests + 1, last_active_at = ? WHERE browser_id = ?',
-            [Date.now(), browserId]
-          );
-          if (isImageGen && deviceSecret !== ADMIN_SECRET_KEY) {
-            // Background parameters and model spoof manipulation validation audit
-            const isV5Request = genModelHeader === 'V5';
-            await runBackgroundAudit(browserId, payloadBuffer, isV5Request);
-          }
-        } catch (err) {
-          console.error('[VPS Audit] Session tracking error:', err);
-        }
-      });
-
-      // Uses the sanitizer to output the untruncated parameter schema
-      // without flooding PM2 logs with binary image strings.
-      if (req.headers['x-debug-mode'] === 'true') {
-        console.log(`\n--- [VPS Debug Telemetry] Untruncated Structured Payload (Client: "${browserId}") ---`);
-        console.log(formatPayloadForLogging(payloadBuffer));
-        console.log("------------------------------------------------------------------------------------\n");
-      }
-
-      const headers = { ...req.headers };
-      headers['host'] = `${subdomain}.novelai.net`;
-      headers['authorization'] = `Bearer ${masterToken}`;
-
-      // Remove client metadata and conflicting HTTP headers.
-      // Strip 'content-length' and 'transfer-encoding' to re-calculate them dynamically.
-      const stripHeaders = [
-        'x-browser-id', 'x-request-id', 'x-gen-width', 'x-gen-height', 'x-gen-steps', 'x-gen-samples', 'x-debug-mode', 'x-script-version',
-        'x-gen-model', 'connection', 'content-length', 'transfer-encoding'
-      ];
-      stripHeaders.forEach(h => delete headers[h]);
-
-      // Set the Content-Length to the parsed byte size of the accumulated payload buffer.
-      // This avoids sending both Content-Length and Transfer-Encoding: chunked,
-      // which Cloudflare flags and drops to protect against HTTP Request Smuggling attacks.
-      headers['content-length'] = payloadBuffer.length;
-
-      console.log(`[VPS Telemetry] Forwarding piped request upstream to NovelAI: ${upstreamUrl} (Body: ${payloadBuffer.length} bytes)`);
-
-      upstreamReq = https.request(upstreamUrl, { method: req.method, headers }, (upstreamRes) => {
-        console.log(`[VPS Telemetry] Received upstream headers. Status: ${upstreamRes.statusCode}`);
-        
-        // Deduct metered tier token asynchronously upon successful completion
-        const tierConfig = TIER_CONFIGS[device.priority_tier];
-        if (upstreamRes.statusCode === 200 && isImageGen && tierConfig && tierConfig.maxAllowance !== Infinity) {
-          setImmediate(async () => {
-            try {
-              const remaining = await getOrUpdateAllowance(browserId, device.priority_tier, true);
-              console.log(`[VPS Audit Ledger] Deducted 1 token for "${browserId}" (${device.priority_tier}). Remaining balance: ${remaining}`);
-            } catch (err) {
-              console.error('[VPS Audit] Failed to deduct metered token:', err);
-            }
-          });
-        }
-
-        // Disable Nagle's algorithm on response socket to flush streaming progress chunks instantly.
-        // Prevents TCP stream chunk buffering delays over VPN connections.
-        req.socket.setNoDelay(true);
-
-        // Inject explicit anti-buffering headers for streaming routes.
-        // This forces CDNs (like Cloudflare), reverse proxies (like Nginx/Caddy), 
-        // and VPN nodes to immediately flush raw binary chunks to the client browser.
-        if (pathPart === 'ai/generate-image-stream' || pathPart === 'ai/generate-stream' || pathPart === 'oa/v1/completions') {
-          upstreamRes.headers['x-accel-buffering'] = 'no';
-          upstreamRes.headers['cache-control'] = 'no-cache, no-transform';
-        }
-
-        res.writeHead(upstreamRes.statusCode, upstreamRes.headers);
-        upstreamRes.pipe(res);
-      });
-
-      upstreamReq.on('error', (err) => {
-        console.error('[VPS Telemetry] Upstream connection socket exception occurred:', err);
-        if (!res.headersSent) {
-          res.status(502).json({ 
-            error: 'Upstream dynamic pipe disconnected',
-            reason: err.message,
-            code: err.code
-          });
-        }
-      });
-
-      // Disable Nagle's algorithm on outbound request connection to minimize upstream latency
-      upstreamReq.setNoDelay(true);
-      if (activeTask) {
-        queueManager.attachUpstreamRequest(activeTask.req_id, upstreamReq);
-      }
-
-      // Transmit the accumulated body buffer directly and end the socket cleanly
-      upstreamReq.write(payloadBuffer);
-      upstreamReq.end();
-    });
-
-  } catch (err) {
-    console.error('[VPS Telemetry] Fatal exception thrown inside proxy router context:', err);
-    executeCleanup();
-    if (!res.headersSent) {
-      res.status(500).json({ error: 'Proxy execution failure.' });
-    }
-  }
-});
-
-// ----------------- STANDARD API ENDPOINTS -----------------
-// Mount global body parsers to satisfy standard payload endpoints
+// 2. Mount standard body parsers strictly AFTER stream-sensitive proxy boundaries
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
-const verifyAdmin = (req, res, next) => {
-  const authHeader = req.headers['authorization'];
-  if (!authHeader || !authHeader.startsWith('Bearer ')) {
-    return res.status(401).json({ error: 'Missing admin credentials' });
-  }
-  if (authHeader.split(' ')[1] !== ADMIN_SECRET_KEY) {
-    return res.status(403).json({ error: 'Invalid admin token' });
-  }
-  next();
-};
+// 3. Mount remaining service routers
+app.use('/auth', authRouter);
+app.use('/queue', queueRouter);
+app.use('/admin', adminRouter);
 
-app.post('/auth/register', async (req, res) => {
-  const { browser_id, device_secret, label } = req.body;
-  if (!browser_id || !device_secret) return res.status(400).json({ error: 'Bad parameters' });
-  try {
-    await run(
-      'INSERT OR IGNORE INTO devices (browser_id, device_secret, label, priority_tier, approved, banned, anlas_consumed, total_requests, last_active_at, metered_allowance, last_allowance_update_at) VALUES (?, ?, ?, ?, 0, 0, 0, 0, ?, 100, ?)',
-      [browser_id, device_secret, label || 'Guest Instance', 'Normal', Date.now(), Date.now()]
-    );
-    res.json({ success: true });
-  } catch (err) {
-    console.error('[VPS Telemetry] Registration exception:', err);
-    res.status(500).json({ error: err.message });
-  }
-});
+// Start Queue Scavenger GC cycle
+queueManager.startGc();
 
-/**
- * Hardened identity modifier.
- * Permits authorized devices or administrators to update their registered nicknames.
- */
-app.post('/auth/update-label', async (req, res) => {
-  const { browser_id, label } = req.body;
-  const authHeader = req.headers['authorization'];
-  const device_secret = authHeader?.split(' ')[1];
+let serverInstance = null;
+let heartbeatInterval = null;
 
-  if (!browser_id || !label) {
-    return res.status(400).json({ error: 'Missing parameters' });
-  }
+// Bootstrap Sequence Guard
+const bootConfig = loadConfig(process.env);
 
-  try {
-    let device;
-    if (device_secret === ADMIN_SECRET_KEY) {
-      device = { approved: 1 };
-    } else {
-      device = await get(
-        'SELECT approved FROM devices WHERE browser_id = ? AND device_secret = ?',
-        [browser_id, device_secret]
-      );
-    }
-    if (!device) return res.status(401).json({ error: 'Unauthorized nickname change' });
-
-    await run('UPDATE devices SET label = ? WHERE browser_id = ?', [label, browser_id]);
-    console.log(`[VPS Telemetry] Device "${browser_id}" updated nickname: "${label}"`);
-    res.json({ success: true });
-  } catch (err) {
-    console.error('[VPS Telemetry] Update label exception:', err);
-    res.status(500).json({ error: err.message });
-  }
-});
-
-// Hardened Identity Verification Endpoint. Protects database states from malicious scraping.
-app.get('/auth/status', async (req, res) => {
-  const { browser_id } = req.query;
-  const authHeader = req.headers['authorization'];
-  const device_secret = authHeader?.split(' ')[1];
-
-  if (!browser_id || !device_secret) {
-    return res.status(401).json({ error: 'Unauthenticated status query' });
-  }
-
-  queueManager.ping(browser_id);
-
-  try {
-    let row;
-    if (device_secret === ADMIN_SECRET_KEY) {
-      row = { approved: 1, banned: 0, priority_tier: 'Admin', anlas_consumed: 0, discord_id: 'admin' };
-    } else {
-      row = await get(
-        'SELECT approved, banned, priority_tier, discord_id, anlas_consumed FROM devices WHERE browser_id = ? AND device_secret = ?', 
-        [browser_id, device_secret]
-      );
-    }
-    if (!row) return res.status(401).json({ error: 'Invalid device credentials' });
-    if (row.banned === 1) return res.status(403).json({ error: 'Device is permanently banned.' });
-
-    let allowanceInfo = null;
-    const tierConfig = TIER_CONFIGS[row.priority_tier];
-    if (tierConfig && tierConfig.maxAllowance !== Infinity) {
-      const allowance = await getOrUpdateAllowance(browser_id, row.priority_tier, false);
-      const nextRefillAt = await getNextRefillTime(browser_id, row.priority_tier);
-      allowanceInfo = {
-        allowance: allowance,
-        max: tierConfig.maxAllowance,
-        next_refill_in: nextRefillAt ? Math.max(0, nextRefillAt - Date.now()) : 0
-      };
-    }
-
-    // Retrieve other approved browser IDs registered under the same Discord user
-    let linkedDevices = [];
-    if (row.discord_id && row.discord_id !== 'admin') {
-      const devices = await all('SELECT browser_id, label FROM devices WHERE discord_id = ? AND approved = 1', [row.discord_id]);
-      linkedDevices = devices.map(d => ({ id: d.browser_id, label: d.label }));
-    }
-
-    res.json({ 
-      approved: !!row.approved, 
-      tier: row.priority_tier,
-      anlas_consumed: row.anlas_consumed || 0,
-      // Transforms JSON-unfriendly Infinity to a standardized string token
-      precise_limit: TIER_CONFIGS[row.priority_tier]?.preciseLimit === Infinity ? "Unlimited" : (TIER_CONFIGS[row.priority_tier]?.preciseLimit ?? 0),
-      session: allowanceInfo, // Remains key-mapped as "session" to prevent serialization breakages
-      linked_devices: linkedDevices,
-      master_v5_percent: master_v5_percent // Synchronized with frontend visual status gauges
-    });
-  } catch (err) {
-    console.error('[VPS Telemetry] Authentication verification query failure:', err);
-    res.status(500).json({ error: err.message });
-  }
-});
-
-app.post('/queue/join', async (req, res) => {
-  const { browser_id, tab_id, req_id } = req.body;
-  const authHeader = req.headers['authorization'];
-  const device_secret = authHeader?.split(' ')[1];
-
-  queueManager.ping(browser_id);
-
-  try {
-    let device;
-    if (device_secret === ADMIN_SECRET_KEY) {
-      device = { approved: 1, banned: 0, priority_tier: 'Admin', discord_id: 'admin' };
-    } else {
-      device = await get(
-        'SELECT approved, banned, priority_tier, discord_id FROM devices WHERE browser_id = ? AND device_secret = ?',
-        [browser_id, device_secret]
-      );
-    }
-    if (!device) return res.status(401).json({ error: 'Unauthorized' });
-    if (device.banned === 1) return res.status(403).json({ error: 'Access Denied: Banned device.' });
-    if (device.approved !== 1) return res.status(401).json({ error: 'Access Denied: Unapproved.' });
-
-    // Enforce rolling token bucket checks
-    const tierConfig = TIER_CONFIGS[device.priority_tier];
-    if (tierConfig && tierConfig.maxAllowance !== Infinity) {
-      const allowance = await getOrUpdateAllowance(browser_id, device.priority_tier, false);
-      if (allowance < 1) {
-        console.warn(`[VPS Session Guard] User ${browser_id} allowance depleted.`);
-        return res.status(403).json({
-          statusCode: 403,
-          error: 'ALLOWANCE_EXHAUSTED'
-        });
-      }
-      console.log(`[VPS Session Check] Browser ${browser_id} verified with ${allowance} remaining tokens.`);
-    }
-
-    queueManager.join({
-      browser_id,
-      tab_id,
-      req_id,
-      priority_tier: device.priority_tier,
-      discord_id: device.discord_id
-    });
-
-    res.json({ success: true });
-  } catch (err) {
-    console.error('[VPS Telemetry] Queue join process exception:', err);
-    res.status(500).json({ error: err.message });
-  }
-});
-
-app.get('/queue/status', async (req, res) => {
-  const { req_id, browser_id } = req.query;
-  const authHeader = req.headers['authorization'];
-  const device_secret = authHeader?.split(' ')[1];
-
-  if (!req_id || !browser_id || !device_secret) {
-    return res.status(400).json({ error: 'Missing parameters or authorization context' });
-  }
-
-  try {
-    let device;
-    if (device_secret === ADMIN_SECRET_KEY) {
-      device = { approved: 1, banned: 0 };
-    } else {
-      device = await get('SELECT approved, banned FROM devices WHERE browser_id = ? AND device_secret = ?', [browser_id, device_secret]);
-    }
-    
-    if (!device) return res.status(401).json({ error: 'Unauthorized' });
-    if (device.banned === 1) return res.status(403).json({ error: 'Banned' });
-    if (device.approved !== 1) return res.status(401).json({ error: 'Unapproved' });
-
-    const pollResult = queueManager.poll(req_id, browser_id);
-    if (!pollResult) {
-      return res.status(404).json({ error: 'Task missing' });
-    }
-
-    if (pollResult.status === 'your_turn') {
-      return res.json({ status: 'your_turn' });
-    }
-
-    res.json({ status: 'waiting', position: pollResult.position });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
-
-app.post('/queue/complete', async (req, res) => {
-  const { req_id, browser_id } = req.body;
-  const authHeader = req.headers['authorization'];
-  const device_secret = authHeader?.split(' ')[1];
-
-  if (!req_id || !browser_id || !device_secret) {
-    return res.status(400).json({ error: 'Missing parameters or authorization context' });
-  }
-
-  try {
-    let device;
-    if (device_secret === ADMIN_SECRET_KEY) {
-      device = { approved: 1, banned: 0 };
-    } else {
-      device = await get('SELECT approved, banned FROM devices WHERE browser_id = ? AND device_secret = ?', [browser_id, device_secret]);
-    }
-    
-    if (!device) return res.status(401).json({ error: 'Unauthorized' });
-    if (device.banned === 1) return res.status(403).json({ error: 'Banned' });
-    if (device.approved !== 1) return res.status(401).json({ error: 'Unapproved' });
-
-    queueManager.complete(req_id, browser_id);
-    console.log(`[VPS Telemetry] Received verified completion bounds. Dropping request: "${req_id}"`);
-    res.json({ success: true });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
-
-// Admin Devices endpoint
-app.get('/admin/devices', verifyAdmin, async (req, res) => {
-  try { 
-    const rows = await all('SELECT * FROM devices');
-    const groups = {};
-    for (const row of rows) {
-      const key = row.discord_id || `unlinked:${row.browser_id}`;
-      const lastActive = queueManager.getLastActive(row.browser_id) || row.last_active_at || 0;
-      const isOnline = queueManager.isDeviceOnline(row.browser_id);
-      
-      let meteredAllowance = null;
-      const tierConfig = TIER_CONFIGS[row.priority_tier];
-      if (tierConfig && tierConfig.maxAllowance !== Infinity) {
-        meteredAllowance = await getOrUpdateAllowance(row.browser_id, row.priority_tier, false);
-      }
-      
-      if (!groups[key]) {
-        groups[key] = {
-          discord_id: row.discord_id || null,
-          discord_username: row.discord_username || (row.discord_id ? `User (${row.discord_id.substring(0, 6)})` : "Unlinked Device"),
-          priority_tier: row.priority_tier,
-          approved: row.approved,
-          banned: row.banned,
-          anlas_consumed: 0,
-          total_requests: 0,
-          last_active_at: 0,
-          is_online: false,
-          devices: []
-        };
-      }
-      
-      groups[key].devices.push({
-        browser_id: row.browser_id,
-        label: row.label,
-        approved: row.approved,
-        banned: row.banned,
-        anlas_consumed: row.anlas_consumed,
-        total_requests: row.total_requests || 0,
-        last_active_at: lastActive,
-        is_online: isOnline,
-        metered_allowance: meteredAllowance
-      });
-      
-      groups[key].anlas_consumed += row.anlas_consumed;
-      groups[key].total_requests += (row.total_requests || 0);
-      if (lastActive > groups[key].last_active_at) {
-        groups[key].last_active_at = lastActive;
-      }
-      if (isOnline) {
-        groups[key].is_online = true;
-      }
-      if (row.banned === 1) {
-        groups[key].banned = 1;
-      }
-    }
-    res.json(Object.values(groups));
-  } catch (err) { 
-    res.status(500).json({ error: err.message }); 
-  }
-});
-
-/**
- * Decoupled endpoint to query linked footprints for a specific Discord user over HTTPS.
- */
-app.get('/admin/user-devices', verifyAdmin, async (req, res) => {
-  const { discord_id } = req.query;
-  if (!discord_id) return res.status(400).json({ error: "Missing discord_id parameter" });
-  try {
-    const devices = await all('SELECT browser_id, label, approved, banned, priority_tier, anlas_consumed, total_requests, last_active_at FROM devices WHERE discord_id = ?', [discord_id]);
-    res.json(devices);
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
-
-/**
- * Decoupled query to fetch unnotified bans from the gateway VPS over HTTPS.
- */
-app.get('/admin/unnotified-bans', verifyAdmin, async (req, res) => {
-  try {
-    const bans = await all('SELECT discord_id, reason FROM banned_discords WHERE is_notified = 0');
-    res.json(bans);
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
-
-/**
- * Decoupled command to mark a Discord user ban as DM-notified over HTTPS.
- */
-app.post('/admin/mark-ban-notified', verifyAdmin, async (req, res) => {
-  const { discord_id } = req.body;
-  if (!discord_id) return res.status(400).json({ error: "Missing discord_id parameter" });
-  try {
-    await run('UPDATE banned_discords SET is_notified = 1 WHERE discord_id = ?', [discord_id]);
-    res.json({ success: true });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
-
-app.post('/admin/approve', verifyAdmin, async (req, res) => {
-  const { browser_id, discord_id, priority_tier } = req.body;
-  try {
-    if (discord_id) {
-      await run('UPDATE devices SET approved = 1, priority_tier = ? WHERE discord_id = ?', [priority_tier, discord_id]);
-      console.log(`[VPS Telemetry Admin] Approved Discord Account: "${discord_id}". Priority: "${priority_tier}"`);
-    } else {
-      await run('UPDATE devices SET approved = 1, priority_tier = ? WHERE browser_id = ?', [priority_tier, browser_id]);
-      console.log(`[VPS Telemetry Admin] Approved Unlinked Browser: "${browser_id}". Priority: "${priority_tier}"`);
-    }
-    res.json({ success: true });
-  } catch (err) { res.status(500).json({ error: err.message }); }
-});
-
-app.post('/admin/revoke', verifyAdmin, async (req, res) => {
-  const { browser_id, discord_id } = req.body;
-  try {
-    if (discord_id) {
-      await run('UPDATE devices SET approved = 0 WHERE discord_id = ?', [discord_id]);
-      console.log(`[VPS Telemetry Admin] Revoked access for Discord Account: "${discord_id}"`);
-    } else {
-      await run('UPDATE devices SET approved = 0 WHERE browser_id = ?', [browser_id]);
-      console.log(`[VPS Telemetry Admin] Revoked access for Unlinked Browser: "${browser_id}"`);
-    }
-    res.json({ success: true });
-  } catch (err) { res.status(500).json({ error: err.message }); }
-});
-
-// Explicit Flag-based Ban API Endpoints
-app.post('/admin/ban', verifyAdmin, async (req, res) => {
-  const { discord_id, browser_id, reason } = req.body;
-  try {
-    const banReason = reason || "Banned via Admin Console";
-    if (discord_id) {
-      await run('INSERT OR REPLACE INTO banned_discords (discord_id, banned_at, reason, is_notified) VALUES (?, ?, ?, 0)', [
-        discord_id,
-        Date.now(),
-        banReason
-      ]);
-      await run('UPDATE devices SET banned = 1 WHERE discord_id = ?', [discord_id]);
-      console.log(`[VPS Telemetry Admin] Banned Discord Account: "${discord_id}"`);
-      queueManager.evict({ discord_id });
-    } else if (browser_id) {
-      await run('UPDATE devices SET banned = 1 WHERE browser_id = ?', [browser_id]);
-      console.log(`[VPS Telemetry Admin] Banned Unlinked Browser: "${browser_id}"`);
-      queueManager.evict({ browser_id });
-    }
-    res.json({ success: true });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
-
-app.post('/admin/unban', verifyAdmin, async (req, res) => {
-  const { discord_id, browser_id } = req.body;
-  try {
-    if (discord_id) {
-      await run('DELETE FROM banned_discords WHERE discord_id = ?', [discord_id]);
-      await run('UPDATE devices SET banned = 0 WHERE discord_id = ?', [discord_id]);
-    } else if (browser_id) {
-      await run('UPDATE devices SET banned = 0 WHERE browser_id = ?', [browser_id]);
-    }
-    res.json({ success: true });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
-
-app.post('/admin/prune-device', verifyAdmin, async (req, res) => {
-  const { browser_id } = req.body;
-  try {
-    await run('DELETE FROM devices WHERE browser_id = ?', [browser_id]);
-    console.log(`[VPS Telemetry Admin] Pruned individual browser registration: "${browser_id}"`);
-    res.json({ success: true });
-  } catch (err) { res.status(500).json({ error: err.message }); }
-});
-
-app.post('/admin/update-token', verifyAdmin, async (req, res) => {
-  try {
-    await run('INSERT OR REPLACE INTO config (key, value) VALUES (?, ?)', ['master_token', req.body.master_token]);
-    console.log('[VPS Admin] Pushed fresh master Opus session token to configuration schema.');
-    res.json({ success: true });
-  } catch (err) { res.status(500).json({ error: err.message }); }
-});
-
-/**
- * @api {post} /admin/link Link Hardware Footprint
- * @apiGroup Admin
- * @apiDescription Links a registered device's browser footprint directly to a verified Discord ID.
- * Implements an automatic blacklist, a maximum of 3 active linked devices, and oldest device pruning.
- */
-app.post('/admin/link', verifyAdmin, async (req, res) => {
-  const { browser_id, discord_id, discord_username, priority_tier } = req.body;
-  if (!browser_id || !discord_id || !priority_tier) {
-    return res.status(400).json({ error: "Missing required linking parameters." });
-  }
-
-  try {
-    // Check if user has been placed in the persistent blacklist schema
-    const isBanned = await get('SELECT 1 FROM banned_discords WHERE discord_id = ?', [discord_id]);
-    if (isBanned) {
-      return res.status(403).json({ error: "This Discord account is permanently blacklisted." });
-    }
-
-    // Verify browser footprint exists on database
-    const device = await get('SELECT 1 FROM devices WHERE browser_id = ?', [browser_id]);
-    if (!device) {
-      return res.status(404).json({ error: "Device ID not recognized. Open NovelAI to register the client." });
-    }
-
-    // Limit Check: A single Discord account can have a maximum of 3 linked approved devices.
-    const existingLinks = await all(
-      'SELECT browser_id FROM devices WHERE discord_id = ? AND approved = 1 ORDER BY ROWID ASC',
-      [discord_id]
-    );
-
-    if (existingLinks.length >= config.MAX_LINKED_DEVICES_PER_USER) {
-      const oldestDevice = existingLinks[0].browser_id;
-      // Automatically prune the oldest linked device
-      await run(
-        'UPDATE devices SET approved = 0, discord_id = NULL, discord_username = NULL WHERE browser_id = ?',
-        [oldestDevice]
-      );
-      console.log(`[VPS Admin API] Automatically pruned oldest linked browser ID: ${oldestDevice} for user ${discord_id}`);
-    }
-
-    // Atomically link discord context and approve device
-    await run(
-      'UPDATE devices SET approved = 1, banned = 0, priority_tier = ?, discord_id = ?, discord_username = ? WHERE browser_id = ?',
-      [priority_tier, discord_id, discord_username || null, browser_id]
-    );
-    console.log(`[VPS Admin API] Linked Discord ID ${discord_id} to browser ${browser_id} (${priority_tier})`);
-    res.json({ success: true });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
-
-/**
- * @api {post} /admin/sync-usernames Batch Sync Discord Usernames
- * @apiGroup Admin
- * @apiDescription Restores and updates missing discord_username metadata on legacy database records.
- */
-app.post('/admin/sync-usernames', verifyAdmin, async (req, res) => {
-  const { mappings } = req.body;
-  if (!mappings || !Array.isArray(mappings)) {
-    return res.status(400).json({ error: "Missing or invalid mappings payload array." });
-  }
-
-  try {
-    console.log(`[VPS Admin] Received sync payload for ${mappings.length} accounts.`);
-    
-    for (const m of mappings) {
-      console.log(`[VPS Admin] Attempting write: User ID ${m.discord_id} -> Username ${m.discord_username}`);
-      await run(
-        'UPDATE devices SET discord_username = ? WHERE discord_id = ?',
-        [m.discord_username, m.discord_id]
-      );
-    }
-    
-    console.log(`[VPS Admin] Successfully batch synced usernames for ${mappings.length} Discord accounts.`);
-    res.json({ success: true });
-  } catch (err) {
-    // Log the raw stack trace to standard error on the VPS console
-    console.error('❌ [VPS Admin] CRITICAL USERNAME SYNC FAILURE:\n', err);
-    
-    // Transmit the complete stack trace back to the bot so it can be read remotely
-    res.status(500).json({ 
-      error: `VPS_SQLITE_EXEC_ERROR: ${err.message}\nStack: ${err.stack}` 
-    });
-  }
-});
-
-/**
- * @api {post} /admin/sync-tier Synchronize Discord User Tiers
- * @apiGroup Admin
- * @apiDescription Updates priority tiers for all approved devices matched to a specific Discord identity.
- */
-app.post('/admin/sync-tier', verifyAdmin, async (req, res) => {
-  const { discord_id, priority_tier } = req.body;
-  if (!discord_id || !priority_tier) {
-    return res.status(400).json({ error: "Missing sync parameters." });
-  }
-
-  try {
-    const isBanned = await get('SELECT 1 FROM banned_discords WHERE discord_id = ?', [discord_id]);
-    if (isBanned) {
-      return res.status(403).json({ error: "This Discord account is blacklisted." });
-    }
-
-    await run(
-      'UPDATE devices SET approved = 1, priority_tier = ? WHERE discord_id = ?',
-      [priority_tier, discord_id]
-    );
-    console.log(`[VPS Admin API] Updated tiers for devices mapped to Discord ID ${discord_id} to ${priority_tier}`);
-    res.json({ success: true });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
-
-/**
- * @api {post} /admin/revoke-discord Revoke Discord Devices
- * @apiGroup Admin
- * @apiDescription Instantly deauthorizes every active browser footprint associated with a Discord ID.
- */
-app.post('/admin/revoke-discord', verifyAdmin, async (req, res) => {
-  const { discord_id } = req.body;
-  if (!discord_id) {
-    return res.status(400).json({ error: "Missing discord_id parameter." });
-  }
-
-  try {
-    await run('UPDATE devices SET approved = 0, discord_id = NULL, discord_username = NULL WHERE discord_id = ?', [discord_id]);
-    console.log(`[VPS Admin API] Deauthorized all devices registered to Discord ID ${discord_id}`);
-    res.json({ success: true });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
-
-// Admin Global Metrics endpoint for Discord Bot
-app.get('/admin/global-stats', verifyAdmin, async (req, res) => {
-  try {
-    const devicesCount = await get('SELECT COUNT(*) as count FROM devices');
-    const linkedUsersCount = await get('SELECT COUNT(DISTINCT discord_id) as count FROM devices WHERE discord_id IS NOT NULL');
-    const totalAnlas = await get('SELECT SUM(anlas_consumed) as sum FROM devices');
-    const totalRequests = await get('SELECT SUM(total_requests) as sum FROM devices');
-    
-    const topAnlas = await all('SELECT discord_id, discord_username, SUM(anlas_consumed) as anlas FROM devices WHERE discord_id IS NOT NULL GROUP BY discord_id ORDER BY anlas DESC LIMIT 5');
-    const topRequests = await all('SELECT discord_id, discord_username, SUM(total_requests) as reqs FROM devices WHERE discord_id IS NOT NULL GROUP BY discord_id ORDER BY reqs DESC LIMIT 5');
-    
-    const bannedCount = await get('SELECT COUNT(*) as count FROM banned_discords');
-    const bannedList = await all('SELECT discord_id, reason FROM banned_discords');
-
-    res.json({
-      total_devices: devicesCount.count,
-      linked_users: linkedUsersCount.count,
-      total_anlas_consumed: totalAnlas.sum || 0,
-      total_requests: totalRequests.sum || 0,
-      top_anlas_consumers: topAnlas,
-      top_request_makers: topRequests,
-      banned_count: bannedCount.count,
-      banned_list: bannedList
-    });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
-
-/**
- * Format-agnostic parameter extractor.
- * Safely parses JSON blocks or Multi-part streams, identifying active Precise character references.
- *
- * @param {Buffer} buffer - Outbound raw client payload buffer.
- * @returns {object|null} Structured parameters or null on parsing failure.
- */
-function extractParametersFromRawBody(buffer) {
-  try {
-    if (!buffer || buffer.length === 0) return null;
-
-    const bodyStr = buffer.toString('utf8');
-    const cleanedStr = bodyStr.replace(/"(?:data:image\/[^"]+|[A-Za-z0-9+/=]{1000,})"/g, '""');
-
-    let parsed = null;
-
-    // Multipart/FormData JSON Extraction
-    if (buffer[0] === 0x2d && buffer[1] === 0x2d) { // "--"
-      const firstLineEnd = cleanedStr.indexOf('\n');
-      const boundary = firstLineEnd !== -1 ? cleanedStr.slice(0, firstLineEnd).trim() : '';
-
-      const requestIndex = cleanedStr.indexOf('name="request"');
-      if (requestIndex !== -1 && boundary) {
-        const startIdx = cleanedStr.indexOf('{', requestIndex);
-        if (startIdx !== -1) {
-          const nextBoundary = cleanedStr.indexOf(boundary, startIdx);
-          const endIdx = nextBoundary !== -1 ? nextBoundary : cleanedStr.length;
-
-          let jsonCandidate = cleanedStr.slice(startIdx, endIdx).trim();
-          const lastBrace = jsonCandidate.lastIndexOf('}');
-          if (lastBrace !== -1) {
-            jsonCandidate = jsonCandidate.slice(0, lastBrace + 1);
-          }
-          parsed = JSON.parse(jsonCandidate);
-        }
-      }
-    } else {
-      // Direct JSON Payload Parsing
-      if (cleanedStr.trim().startsWith('{')) {
-        parsed = JSON.parse(cleanedStr);
-      }
-    }
-
-    if (parsed) {
-      const params = parsed.parameters || parsed || {};
-      
-      // Multi-schema safety fallback: scan legacy, current, and alternative reference schemas
-      const preciseRefs = 
-        (Array.isArray(params.director_reference_images_cached) ? params.director_reference_images_cached.length : 0) +
-        (Array.isArray(params.director_reference_images) ? params.director_reference_images.length : 0) +
-        (Array.isArray(params.reference_image_multiple) ? params.reference_image_multiple.length : 0);
-
-      return {
-        width: params.width || parsed.width || null,
-        height: params.height || parsed.height || null,
-        steps: params.steps || parsed.steps || null,
-        n_samples: params.n_samples || parsed.n_samples || null,
-        precise_ref_count: preciseRefs,
-        model: parsed.model || params.model || null
-      };
-    }
-  } catch (err) {
-    console.error('[VPS Audit] Error extracting parameters:', err);
-  }
-  return null;
-}
-
-/**
- * Audit request parameters on a separate thread tick.
- * Executes immediate database deauthorization sweeps on resource limit violations.
- *
- * @param {string} browserId - Unique device key.
- * @param {Buffer} payloadBuffer - Outbound parameters buffer.
- * @param {boolean} clientReportedV5 - Model validation flag received in header.
- */
-async function runBackgroundAudit(browserId, payloadBuffer, clientReportedV5) {
-  const actualParams = extractParametersFromRawBody(payloadBuffer);
-  if (!actualParams) return;
-
-  const { width, height, steps, n_samples, precise_ref_count, model } = actualParams;
-  
-  const actualPixels = (width && height) ? (width * height) : 0;
-  const actualSteps = steps || 0;
-  const actualSamples = n_samples || 1;
-  const actualRefs = precise_ref_count || 0;
-
-  const device = await get('SELECT priority_tier, discord_id FROM devices WHERE browser_id = ?', [browserId]);
-  if (!device) return;
-
-  const tierConfig = TIER_CONFIGS[device.priority_tier] || TIER_CONFIGS['Normal'];
-  
-  // Firewall Parametric Rule Validation against configured thresholds
-  const isViolation = (actualPixels > config.FIREWALL_MAX_PIXELS) || 
-                      (actualSteps > config.FIREWALL_MAX_STEPS) || 
-                      (actualSamples !== config.FIREWALL_MAX_SAMPLES) || 
-                      (actualRefs > tierConfig.preciseLimit);
-
-  // Post-Gen Audit: validation against model-spoofing bypass attempts
-  // Match V5 identifier patterns
-  const isV5Model = typeof model === 'string' && /[-_]5[-_]/i.test(model) && !model.includes('4-5');
-  const bypassViolation = isV5Model && !clientReportedV5;
-
-  // Accounting Ledger Integration: Tracks master Anlas consumption (5 per precise reference)
-  const anlasSpent = actualRefs * 5;
-  if (anlasSpent > 0) {
-    await run('UPDATE devices SET anlas_consumed = anlas_consumed + ? WHERE browser_id = ?', [anlasSpent, browserId]);
-    console.log(`[VPS Audit Ledger] Deducted ${anlasSpent} Anlas on user profile ${device.discord_id || browserId} (refs used: ${actualRefs})`);
-  }
-
-  if (isViolation || bypassViolation) {
-    console.warn(`\x1b[31m[VPS SECURITY AUDIT] !!! VIOLATION DETECTED !!!\x1b[0m`);
-    console.warn(`[VPS Security Audit] Device: "${browserId}", Tier: "${device.priority_tier}"`);
-    
-    if (isViolation) {
-      console.warn(`[VPS Security Audit] Params: ${width}x${height} (${actualPixels} px), Steps: ${actualSteps}, Refs: ${actualRefs} (Limit: ${tierConfig.preciseLimit})`);
-    }
-    if (bypassViolation) {
-      console.warn(`[VPS Security Audit] Bypass violation: Real model is V5 ("${model}"), but client omitted the X-Gen-Model: V5 header.`);
-    }
-
-    try {
-      const banReason = bypassViolation 
-        ? `Firewall Bypass Violation: Client generated with V5 model ("${model}") but suppressed X-Gen-Model: V5 header.`
-        : `Firewall Violation: Max Steps=${config.FIREWALL_MAX_STEPS}, Max Refs=${tierConfig.preciseLimit}. Attempted: Steps=${actualSteps}, Refs=${actualRefs} on device ${browserId}`;
-
-      if (device.discord_id) {
-        console.warn(`[VPS Security Audit] Revoking all devices linked to Discord ID: "${device.discord_id}"`);
-        await run('INSERT OR REPLACE INTO banned_discords (discord_id, banned_at, reason, is_notified) VALUES (?, ?, ?, 0)', [
-          device.discord_id,
-          Date.now(),
-          banReason
-        ]);
-        await run('UPDATE devices SET banned = 1 WHERE discord_id = ?', [device.discord_id]);
-        queueManager.evict({ discord_id: device.discord_id });
-      } else {
-        console.warn(`[VPS Security Audit] Revoking browser_id directly: "${browserId}"`);
-        await run('UPDATE devices SET banned = 1 WHERE browser_id = ?', [browserId]);
-        queueManager.evict({ browser_id });
-      }
-      
-      console.log(`[VPS Security Audit] Success. Ban and queue eviction completed for "${browserId}".`);
-    } catch (dbErr) {
-      console.error('[VPS Security Audit] Failed to execute database ban:', dbErr);
-    }
-  }
-}
-
-// Sequential Promise DB Bootstrapper with Resilient warm boot telemetry synchronizer
-initDatabase(config.DATABASE_PATH)
+initDatabase(bootConfig.DATABASE_PATH)
   .then(async () => {
     try {
       console.log("[VPS Boot] Executing warm boot subscription sync...");
       await syncTelemetry();
     } catch (warmBootErr) {
-      console.warn("[VPS Boot] Warm boot telemetry pull failed. Initializing with default failsafe metrics:", warmBootErr.message);
+      console.warn("[VPS Boot] Warm boot telemetry pull failed. Initializing with default metrics:", warmBootErr.message);
+    }
+
+    // Active Telemetry Heartbeat: Refresh every 10 minutes to eliminate stale client drops
+    const heartbeatMs = Math.min(600000, Math.floor(bootConfig.TELEMETRY_STALE_MS / 2));
+    heartbeatInterval = setInterval(() => {
+      syncTelemetry().catch(err => console.warn("[VPS Harvester] Heartbeat refresh failed:", err.message));
+    }, heartbeatMs);
+
+    if (heartbeatInterval.unref) {
+      heartbeatInterval.unref();
     }
     
-    serverInstance = app.listen(PORT, '127.0.0.1', () => console.log(`Gateway coordinator running on port ${PORT}`));
+    serverInstance = app.listen(bootConfig.PORT, '127.0.0.1', () => {
+      console.log(`Gateway coordinator running on port ${bootConfig.PORT}`);
+    });
   })
   .catch((err) => {
     console.error("[VPS Critical] Database initialization failed. Terminating engine process.", err);
     process.exit(1);
   });
 
-// Clean module lifecycle exposure for programmatic testing
 module.exports = {
   app,
   get server() {
@@ -1413,5 +221,9 @@ module.exports = {
   get gcInterval() {
     return queueManager.gcInterval;
   },
-  queueManager
+  get heartbeatInterval() {
+    return heartbeatInterval;
+  },
+  queueManager,
+  syncTelemetry
 };

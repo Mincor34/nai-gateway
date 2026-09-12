@@ -11,7 +11,10 @@
  * 6. Zero magic numbers: exposes all system operational boundaries to higher architectural layers.
  * 7. Explicit key sanitization protects against prototype pollution while preserving standard Object prototype methods.
  * 8. Deep immutability: all tier objects and manifests are deeply frozen across both default and custom paths.
+ * 9. Upstream URL Template Injection: Allows end-to-end transport isolation without runtime monkey-patching.
  */
+
+'use strict';
 
 const DEFAULT_TIER_CONFIGS = Object.freeze({
   'Admin':   Object.freeze({ basePriority: 30, preciseLimit: Infinity, maxBurst: Infinity, refillRate: 0,      maxAllowance: Infinity, refillRateMs: 0 }),
@@ -41,6 +44,13 @@ const OPERATIONAL_DEFAULTS = Object.freeze({
   NODE_ENV: 'development',
   MAX_CONCURRENT_TEXT_GENS: 3,
   
+  // Upstream Destination Boundary
+  UPSTREAM_BASE_URL_TEMPLATE: 'https://{subdomain}.novelai.net',
+
+  // Physical Memory Boundary: 50MB maximum request buffer fits comfortably within PM2 200MB heap
+  // while supporting multiple Base64-inflated high-resolution reference images
+  MAX_PAYLOAD_SIZE_BYTES: 52428800,
+
   // Parametric Firewall Boundaries (Enforces NovelAI Opus free generation parameters)
   FIREWALL_MAX_PIXELS: 1048576, // 1 Megapixel (1024x1024)
   FIREWALL_MAX_STEPS: 28,
@@ -57,11 +67,13 @@ const OPERATIONAL_DEFAULTS = Object.freeze({
   // Master Account Telemetry Harvester Boundaries
   TELEMETRY_FETCH_TIMEOUT_MS: 8000,
   TELEMETRY_STALE_MS: 1800000, // 30 minutes
-  TELEMETRY_COOLDOWN_MS: 30000, // 30 seconds rate-limit between harvests
+  TELEMETRY_COOLDOWN_MS: 60000, // 1 minute rate-limit between harvests
   
   // Identity & Account Policies
   ACTIVE_SESSION_TTL_MS: 30000, // Active presence RAM threshold
   MAX_LINKED_DEVICES_PER_USER: 3
+
+  //TODO: Add a MINIMUM_USERSCRIPT_VERSION parameter to enforce legacy client versioning and prevent unsupported API calls.
 });
 
 /**
@@ -192,6 +204,28 @@ function loadConfig(env = process.env) {
     databasePath = rawDbPath;
   }
 
+  let upstreamTemplate = OPERATIONAL_DEFAULTS.UPSTREAM_BASE_URL_TEMPLATE;
+  if (env.UPSTREAM_BASE_URL_TEMPLATE !== undefined) {
+    const rawTemplate = String(env.UPSTREAM_BASE_URL_TEMPLATE).trim();
+    if (rawTemplate === '') {
+      throw new Error("Fatal schema violation in UPSTREAM_BASE_URL_TEMPLATE: Path cannot be empty or whitespace.");
+    }
+    upstreamTemplate = rawTemplate;
+  }
+
+  let maxPayloadSizeBytes = OPERATIONAL_DEFAULTS.MAX_PAYLOAD_SIZE_BYTES;
+  if (env.MAX_PAYLOAD_SIZE_BYTES !== undefined) {
+    const rawLimit = String(env.MAX_PAYLOAD_SIZE_BYTES).trim();
+    if (!/^\d+$/.test(rawLimit)) {
+      throw new Error(`Fatal schema violation in MAX_PAYLOAD_SIZE_BYTES: "${env.MAX_PAYLOAD_SIZE_BYTES}" must be a positive integer.`);
+    }
+    const parsedLimit = parseInt(rawLimit, 10);
+    if (parsedLimit < 1048576) { // Enforce minimum 1MB sanity floor
+      throw new Error(`Fatal schema violation in MAX_PAYLOAD_SIZE_BYTES: Limit must be at least 1,048,576 bytes (1MB).`);
+    }
+    maxPayloadSizeBytes = parsedLimit;
+  }
+
   const nodeEnv = env.NODE_ENV ? String(env.NODE_ENV).trim() : OPERATIONAL_DEFAULTS.NODE_ENV;
   const tierConfigs = parseTierConfigs(env.TIER_CONFIGS);
 
@@ -200,6 +234,8 @@ function loadConfig(env = process.env) {
     ADMIN_SECRET_KEY: adminSecretKey.trim(),
     DATABASE_PATH: databasePath,
     NODE_ENV: nodeEnv,
+    UPSTREAM_BASE_URL_TEMPLATE: upstreamTemplate,
+    MAX_PAYLOAD_SIZE_BYTES: maxPayloadSizeBytes,
     TIER_CONFIGS: tierConfigs,
     PROXY_PATH_WHITELIST,
     SUBDOMAIN_WHITELIST,

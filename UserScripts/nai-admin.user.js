@@ -24,7 +24,7 @@
  *
  * SECURITY DESIGN PRINCIPLE:
  * Outbound requests targeting the VPS `/proxy/` and `/queue/` endpoints are routed using Tampermonkey's
- * privileged background XMLHttpRequests (`GM_xmlhttpRequest`) [Plan.md]. This breaks through local Content
+ * privileged background XMLHttpRequests (`GM_xmlhttpRequest`). This breaks through local Content
  * Security Policy (CSP) headers served by novelai.net that would otherwise block connection sockets to
  * your external gateway domain.
  */
