@@ -311,7 +311,7 @@ test("NovelAI Gateway Phase 1 Comprehensive Security & Resilience Gate", async (
     await queryGateway('/queue/join', 'POST', { 'Authorization': 'Bearer secret_evict_b' }, { browser_id: 'client_evict_b', tab_id: 'tab_b', req_id: 'req_evict_b' });
 
     // Wait until client A acquires turn
-    const statusA = await queryGateway('/queue/status?req_id=req_evict_a');
+    const statusA = await queryGateway('/queue/status?req_id=req_evict_a&browser_id=client_evict_a', 'GET', { 'Authorization': 'Bearer secret_evict_a' });
     assert.strictEqual(statusA.data.status, 'your_turn', "Client A must immediately acquire generation turn");
 
     const requestOptions = {
@@ -353,10 +353,10 @@ test("NovelAI Gateway Phase 1 Comprehensive Security & Resilience Gate", async (
     await new Promise(r => setTimeout(r, 50));
 
     // Assert Client B was promoted promptly without multi-second polling fallbacks
-    const statusB = await queryGateway('/queue/status?req_id=req_evict_b');
+    const statusB = await queryGateway('/queue/status?req_id=req_evict_b&browser_id=client_evict_b', 'GET', { 'Authorization': 'Bearer secret_evict_b' });
     assert.strictEqual(statusB.data.status, 'your_turn', "Client B must immediately be promoted to processing upon Client A's connection sever");
 
-    await queryGateway('/queue/complete', 'POST', {}, { req_id: 'req_evict_b' });
+    await queryGateway('/queue/complete', 'POST', { 'Authorization': 'Bearer secret_evict_b' }, { req_id: 'req_evict_b', browser_id: 'client_evict_b' });
   });
 
   // 3. Channel B (Text Generation) Concurrency Limits (Max 3 slots, 4th rejected with 429)
@@ -409,7 +409,7 @@ test("NovelAI Gateway Phase 1 Comprehensive Security & Resilience Gate", async (
     const joinAndWait = async (reqId) => {
       await queryGateway('/queue/join', 'POST', { 'Authorization': 'Bearer secret_firewall' }, { browser_id: 'client_firewall', tab_id: 'tab_fw', req_id: reqId });
       while (true) {
-        const { data } = await queryGateway(`/queue/status?req_id=${reqId}`);
+        const { data } = await queryGateway(`/queue/status?req_id=${reqId}&browser_id=client_firewall`, 'GET', { 'Authorization': 'Bearer secret_firewall' });
         if (data.status === 'your_turn') break;
         await new Promise(r => setTimeout(r, 50));
       }
@@ -540,7 +540,7 @@ test("NovelAI Gateway Phase 1 Comprehensive Security & Resilience Gate", async (
 
     await queryGateway('/queue/join', 'POST', { 'Authorization': 'Bearer secret_stream' }, { browser_id: 'client_stream', tab_id: 'tab_stream', req_id: 'req_stream_test' });
     while (true) {
-      const { data } = await queryGateway('/queue/status?req_id=req_stream_test');
+      const { data } = await queryGateway('/queue/status?req_id=req_stream_test&browser_id=client_stream', 'GET', { 'Authorization': 'Bearer secret_stream' });
       if (data.status === 'your_turn') break;
       await new Promise(r => setTimeout(r, 50));
     }
@@ -590,7 +590,7 @@ test("NovelAI Gateway Phase 1 Comprehensive Security & Resilience Gate", async (
 
     await queryGateway('/queue/join', 'POST', { 'Authorization': 'Bearer secret_spoof' }, { browser_id: 'client_spoof', tab_id: 'tab_spoof', req_id: 'req_spoof_primary' });
     while (true) {
-      const { data } = await queryGateway('/queue/status?req_id=req_spoof_primary');
+      const { data } = await queryGateway('/queue/status?req_id=req_spoof_primary&browser_id=client_spoof', 'GET', { 'Authorization': 'Bearer secret_spoof' });
       if (data.status === 'your_turn') break;
       await new Promise(r => setTimeout(r, 50));
     }
@@ -620,8 +620,8 @@ test("NovelAI Gateway Phase 1 Comprehensive Security & Resilience Gate", async (
     assert.strictEqual(attemptRejoin.status, 403, "Banned device must be rejected immediately at queue join");
 
     // 3. INVARIANT ASSERTION: Verify the malicious client's footprint was completely purged from memory queue RAM
-    const taskStatus = await queryGateway('/queue/status?req_id=req_spoof_primary');
-    assert.strictEqual(taskStatus.status, 404, "Spoofing client's task footprint must be evicted from active queue RAM");
+    const taskStatus = await queryGateway('/queue/status?req_id=req_spoof_primary&browser_id=client_spoof', 'GET', { 'Authorization': 'Bearer secret_spoof' });
+    assert.strictEqual(taskStatus.status, 403, "Spoofing client's task footprint must be evicted from active queue RAM");
   });
 
   // 9. Upstream Disruption Handling
@@ -631,7 +631,7 @@ test("NovelAI Gateway Phase 1 Comprehensive Security & Resilience Gate", async (
 
     await queryGateway('/queue/join', 'POST', { 'Authorization': 'Bearer secret_sever' }, { browser_id: 'client_sever', tab_id: 'tab_sever', req_id: 'req_sever_test' });
     while (true) {
-      const { data } = await queryGateway('/queue/status?req_id=req_sever_test');
+      const { data } = await queryGateway('/queue/status?req_id=req_sever_test&browser_id=client_sever', 'GET', { 'Authorization': 'Bearer secret_sever' });
       if (data.status === 'your_turn') break;
       await new Promise(r => setTimeout(r, 50));
     }

@@ -5,6 +5,7 @@
  * Implements:
  * - Explicit Configuration Ingestion via Level 1 Engine
  * - Sequential Promise DB Startup Guard with Resilient Warm-Boot Sync
+ * - Synchronous RAM Queue Coordination via Level 3 Engine
  * - Event-Driven Master Account V5 Protection Layer
  * - Preserved Fractional Token Accumulation (RAM-bound)
  * - Safe Boundary-Sliced Multipart JSON Parser for Background Post-Audits
@@ -19,6 +20,7 @@ const https = require('https');
 const crypto = require('crypto');
 const { loadConfig } = require('./config');
 const { initDatabase, closeDatabase, run, get, all } = require('./database');
+const queueManager = require('./queueManager');
 
 // Explicit Configuration Bootstrap
 const config = loadConfig(process.env);
@@ -27,7 +29,6 @@ const ADMIN_SECRET_KEY = config.ADMIN_SECRET_KEY;
 const TIER_CONFIGS = config.TIER_CONFIGS;
 const PROXY_PATH_WHITELIST = config.PROXY_PATH_WHITELIST;
 const SUBDOMAIN_WHITELIST = config.SUBDOMAIN_WHITELIST;
-const MAX_CONCURRENT_TEXT_GENS = config.MAX_CONCURRENT_TEXT_GENS;
 
 const app = express();
 
@@ -37,24 +38,16 @@ let last_fetched_at = 0;
 let is_hard_locked = false;
 let is_fetching = false;
 
-// Volatile token buckets and queues (RAM-bound to maximize throughput and avoid I/O bottlenecks)
-const deviceBuckets = new Map();
-// In-Memory Queue State for Channel A (Exclusive Generation Slot)
-let queue = [];
-
-// Channel B Concurrency State (Shared Text Generation Slots)
-let activeTextGenerations = 0;
-
 // Cryptographic Salt for IP hashing.
 // Regenerating this on startup ensures maximum privacy: hashes remain identical 
 // during runtime (allowing you to track/rate-limit a session), but become 
 // completely un-reconstructible if log files are ever leaked.
 const IP_SALT = crypto.randomBytes(16).toString('hex');
 
-// Stateful ephemeral in-memory RAM cache to track device online/offline status (no I/O strain)
-const activeSessions = new Map(); // browserId -> lastActiveTimestamp
-
 let serverInstance = null;
+
+// Start Queue Scavenger GC cycle
+queueManager.startGc();
 
 /**
  * Lazy-refills and updates the database-backed tier token bucket.
@@ -132,17 +125,6 @@ async function getNextRefillTime(browserId, tier) {
 }
 
 /**
- * Registers device pings in RAM to avoid database I/O bottlenecks.
- *
- * @param {string} browserId - Unique device browser footprint.
- */
-function pingDevice(browserId) {
-  if (browserId) {
-    activeSessions.set(browserId, Date.now());
-  }
-}
-
-/**
  * Computes a secure, salted SHA-256 hash of an IP address.
  * Takes the first 12 characters to keep terminal telemetry readable.
  *
@@ -154,37 +136,6 @@ function hashIP(ip) {
     return 'local/unknown';
   }
   return crypto.createHash('sha256').update(ip + IP_SALT).digest('hex').substring(0, 12);
-}
-
-/**
- * Volatile dynamic token-bucket retriever implementing lazy math refills on-demand.
- * Preserves fractional token accumulation drift and guards against division by zero.
- *
- * @param {string} browserId - Device footprint.
- * @param {string} tier - Allocation tier of the device.
- * @returns {object|null} Evaluated bucket reference.
- */
-function getOrInitBucket(browserId, tier) {
-  const tierConfig = TIER_CONFIGS[tier];
-  if (!tierConfig || tierConfig.maxBurst === Infinity) return null;
-
-  let bucket = deviceBuckets.get(browserId);
-  const now = Date.now();
-  if (!bucket) {
-    bucket = {
-      tokens: tierConfig.maxBurst,
-      lastTx: now
-    };
-    deviceBuckets.set(browserId, bucket);
-  } else {
-    const elapsed = now - bucket.lastTx;
-    if (tierConfig.refillRate > 0 && elapsed >= tierConfig.refillRate) {
-      const gained = Math.floor(elapsed / tierConfig.refillRate);
-      bucket.tokens = Math.min(tierConfig.maxBurst, bucket.tokens + gained);
-      bucket.lastTx += gained * tierConfig.refillRate; // Keeps exact fractional remainder alignment
-    }
-  }
-  return bucket;
 }
 
 /**
@@ -358,51 +309,6 @@ app.use((req, res, next) => {
   next();
 });
 
-/**
- * Dynamically updates effective queue priorities using dynamic linear aging decay (Fast vs Base slopes).
- * Evaluates step-function promotions (AUTO) at configured thresholds.
- */
-function processQueue() {
-  const activeImageTask = queue.find(t => t.status === 'processing');
-  if (activeImageTask) return; 
-  if (queue.length === 0) return;
-
-  const now = Date.now();
-  const pendingTasks = queue.filter(t => t.status === 'pending');
-  if (pendingTasks.length === 0) return;
-
-  pendingTasks.forEach(task => {
-    const elapsedSeconds = (now - task.timestamp) / 1000;
-    
-    // Dynamic Step-Function Jump (AUTO state promotion)
-    if (!task.has_burst_boost && elapsedSeconds >= config.QUEUE_AUTO_BOOST_SECONDS) {
-      const bucket = getOrInitBucket(task.browser_id, task.priority_tier);
-      if (bucket && bucket.tokens >= 1.0) {
-        bucket.tokens -= 1.0;
-        task.has_burst_boost = true;
-        console.log(`[VPS Queue AUTO] Task "${task.req_id}" hit ${config.QUEUE_AUTO_BOOST_SECONDS}s threshold. Promoting to Fast Slope.`);
-      }
-    }
-
-    let p = 0;
-    if (task.has_burst_boost) {
-      const base = (task.priority_tier === 'Admin') ? 30 : 20;
-      p = base + Math.floor(elapsedSeconds / config.QUEUE_FAST_SLOPE_DIVISOR);
-    } else {
-      const tierConfig = TIER_CONFIGS[task.priority_tier] || TIER_CONFIGS['Normal'];
-      p = tierConfig.basePriority + Math.floor(elapsedSeconds / config.QUEUE_BASE_SLOPE_DIVISOR);
-    }
-    
-    task.effective_priority = p;
-  });
-
-  pendingTasks.sort((a, b) => b.effective_priority - a.effective_priority || a.timestamp - b.timestamp);
-
-  const nextTask = pendingTasks[0];
-  nextTask.status = 'processing';
-  nextTask.started_processing_at = Date.now();
-}
-
 // ----------------- SECURE SWAP PROXY HANDLER (NO BODY PARSERS PRE-MOUNTED) -----------------
 // Declarative routing here prevents Express middleware from destroying boundary/binary formats.
 app.all('/proxy/:subdomain/{*splat}', async (req, res) => {
@@ -433,7 +339,7 @@ app.all('/proxy/:subdomain/{*splat}', async (req, res) => {
   }
   const deviceSecret = clientAuth.split(' ')[1];
 
-  pingDevice(browserId);
+  queueManager.ping(browserId);
 
   const isImageGen = pathPart === 'ai/generate-image' || pathPart === 'ai/generate-image-stream';
   const genModelHeader = req.headers['x-gen-model'];
@@ -444,6 +350,7 @@ app.all('/proxy/:subdomain/{*splat}', async (req, res) => {
   let cleanupExecuted = false;
   let isTextGenClaimed = false;
   let isTextGen = false;
+  let textGenLockId = null;
 
   // Single-Path Resource Cleanup logic to mitigate duplicate execution and race conditions.
   const executeCleanup = () => {
@@ -454,17 +361,13 @@ app.all('/proxy/:subdomain/{*splat}', async (req, res) => {
       try { upstreamReq.destroy(); } catch (err) {}
     }
 
-    if (isTextGen && isTextGenClaimed) {
-      activeTextGenerations = Math.max(0, activeTextGenerations - 1);
+    if (isTextGen && isTextGenClaimed && textGenLockId) {
+      queueManager.releaseTextSlot(textGenLockId);
     }
 
     if (activeTask) {
-      const idx = queue.findIndex(t => t.req_id === activeTask.req_id);
-      if (idx !== -1) {
-        queue.splice(idx, 1);
-        console.log(`[VPS Telemetry] Stream cleaned up. Slot released for request: "${activeTask.req_id}"`);
-        processQueue();
-      }
+      queueManager.complete(activeTask.req_id, browserId);
+      console.log(`[VPS Telemetry] Stream cleaned up. Slot released for request: "${activeTask.req_id}"`);
     }
 
     // v5 Protection Layer: Trigger Telemetry Harvester on natural V5 completion
@@ -569,7 +472,7 @@ app.all('/proxy/:subdomain/{*splat}', async (req, res) => {
       const requestId = req.headers['x-request-id'];
       if (!requestId) return res.status(400).json({ error: 'Missing request ID.' });
 
-      activeTask = queue.find(t => t.req_id === requestId && t.browser_id === browserId && t.status === 'processing');
+      activeTask = queueManager.getProcessingTask(requestId, browserId);
       if (!activeTask) {
         return res.status(403).json({
           statusCode: 403,
@@ -613,10 +516,10 @@ app.all('/proxy/:subdomain/{*splat}', async (req, res) => {
       }
     } else if (isTextGen) {
       // Channel B Fast-Track Concurrency Limit Execution
-      if (activeTextGenerations >= MAX_CONCURRENT_TEXT_GENS) {
+      textGenLockId = req.headers['x-request-id'] || crypto.randomUUID();
+      if (!queueManager.acquireTextSlot(textGenLockId)) {
         return res.status(429).json({ error: 'Text processing pipelines saturated. Retry request.' });
       }
-      activeTextGenerations++;
       isTextGenClaimed = true; // Mark as successfully allocated
     }
 
@@ -728,7 +631,9 @@ app.all('/proxy/:subdomain/{*splat}', async (req, res) => {
 
       // Disable Nagle's algorithm on outbound request connection to minimize upstream latency
       upstreamReq.setNoDelay(true);
-      if (activeTask) activeTask.upstreamReq = upstreamReq;
+      if (activeTask) {
+        queueManager.attachUpstreamRequest(activeTask.req_id, upstreamReq);
+      }
 
       // Transmit the accumulated body buffer directly and end the socket cleanly
       upstreamReq.write(payloadBuffer);
@@ -819,7 +724,7 @@ app.get('/auth/status', async (req, res) => {
     return res.status(401).json({ error: 'Unauthenticated status query' });
   }
 
-  pingDevice(browser_id);
+  queueManager.ping(browser_id);
 
   try {
     let row;
@@ -874,7 +779,7 @@ app.post('/queue/join', async (req, res) => {
   const authHeader = req.headers['authorization'];
   const device_secret = authHeader?.split(' ')[1];
 
-  pingDevice(browser_id);
+  queueManager.ping(browser_id);
 
   try {
     let device;
@@ -904,51 +809,14 @@ app.post('/queue/join', async (req, res) => {
       console.log(`[VPS Session Check] Browser ${browser_id} verified with ${allowance} remaining tokens.`);
     }
 
-    // 1-request-per-user limit: Enforce queue concurrency check on discord_id, NOT browser_id
-    const existingIdx = queue.findIndex(t => {
-      if (device.discord_id && device.discord_id !== 'admin' && t.discord_id === device.discord_id) return true;
-      return t.browser_id === browser_id;
-    });
-
-    if (existingIdx !== -1) {
-      if (queue[existingIdx].upstreamReq) queue[existingIdx].upstreamReq.destroy();
-      const evictedTarget = queue[existingIdx].discord_id || queue[existingIdx].browser_id;
-      queue.splice(existingIdx, 1);
-      console.log(`[VPS Telemetry] Concurrency eviction: Terminated active lock for user/device: ${evictedTarget}`);
-    }
-
-    let hasBurstBoost = false;
-
-    if (tierConfig.maxBurst === Infinity) {
-      hasBurstBoost = true;
-    } else {
-      const bucket = getOrInitBucket(browser_id, device.priority_tier);
-      if (bucket && bucket.tokens >= 1.0) {
-        bucket.tokens -= 1.0; 
-        hasBurstBoost = true;
-        console.log(`[VPS Token Bucket] Allocated 1.0 token. Browser: ${browser_id}. Tokens remaining: ${bucket.tokens}`);
-      } else {
-        hasBurstBoost = false;
-        console.log(`[VPS Token Bucket] Saturated bucket. Defaulting ${browser_id} to Base Slope.`);
-      }
-    }
-
-    queue.push({
+    queueManager.join({
       browser_id,
       tab_id,
       req_id,
-      discord_id: device.discord_id, // Lock queue item directly to Discord identity
       priority_tier: device.priority_tier,
-      timestamp: Date.now(),
-      last_polled_at: Date.now(),
-      status: 'pending',
-      started_processing_at: null,
-      upstreamReq: null,
-      has_burst_boost: hasBurstBoost
+      discord_id: device.discord_id
     });
 
-    console.log(`[VPS Telemetry] Device "${browser_id}" (User: "${device.discord_id}") joined queue. ReqId: "${req_id}". Tier: "${device.priority_tier}"`);
-    processQueue();
     res.json({ success: true });
   } catch (err) {
     console.error('[VPS Telemetry] Queue join process exception:', err);
@@ -957,51 +825,68 @@ app.post('/queue/join', async (req, res) => {
 });
 
 app.get('/queue/status', async (req, res) => {
-  const { req_id } = req.query;
-  const task = queue.find(t => t.req_id === req_id);
-  if (!task) return res.status(404).json({ error: 'Task missing' });
+  const { req_id, browser_id } = req.query;
+  const authHeader = req.headers['authorization'];
+  const device_secret = authHeader?.split(' ')[1];
 
-  task.last_polled_at = Date.now();
-  pingDevice(task.browser_id);
+  if (!req_id || !browser_id || !device_secret) {
+    return res.status(400).json({ error: 'Missing parameters or authorization context' });
+  }
 
-  if (task.status === 'processing') return res.json({ status: 'your_turn' });
-
-  const now = Date.now();
-  const tempPending = queue.filter(t => t.status === 'pending');
-  tempPending.forEach(t => {
-    const elapsedSeconds = (now - t.timestamp) / 1000;
-    if (!t.has_burst_boost && elapsedSeconds >= config.QUEUE_AUTO_BOOST_SECONDS) {
-      const bucket = getOrInitBucket(t.browser_id, t.priority_tier);
-      if (bucket && bucket.tokens >= 1.0) {
-        bucket.tokens -= 1.0;
-        t.has_burst_boost = true;
-      }
-    }
-    let p = 0;
-    if (t.has_burst_boost) {
-      const base = (t.priority_tier === 'Admin') ? 30 : 20;
-      p = base + Math.floor(elapsedSeconds / config.QUEUE_FAST_SLOPE_DIVISOR);
+  try {
+    let device;
+    if (device_secret === ADMIN_SECRET_KEY) {
+      device = { approved: 1, banned: 0 };
     } else {
-      const tierConfig = TIER_CONFIGS[t.priority_tier] || TIER_CONFIGS['Normal'];
-      p = tierConfig.basePriority + Math.floor(elapsedSeconds / config.QUEUE_BASE_SLOPE_DIVISOR);
+      device = await get('SELECT approved, banned FROM devices WHERE browser_id = ? AND device_secret = ?', [browser_id, device_secret]);
     }
-    t.effective_priority = p;
-  });
+    
+    if (!device) return res.status(401).json({ error: 'Unauthorized' });
+    if (device.banned === 1) return res.status(403).json({ error: 'Banned' });
+    if (device.approved !== 1) return res.status(401).json({ error: 'Unapproved' });
 
-  tempPending.sort((a, b) => b.effective_priority - a.effective_priority || a.timestamp - b.timestamp);
-  res.json({ status: 'waiting', position: tempPending.findIndex(t => t.req_id === req_id) + 1 });
+    const pollResult = queueManager.poll(req_id, browser_id);
+    if (!pollResult) {
+      return res.status(404).json({ error: 'Task missing' });
+    }
+
+    if (pollResult.status === 'your_turn') {
+      return res.json({ status: 'your_turn' });
+    }
+
+    res.json({ status: 'waiting', position: pollResult.position });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
 });
 
 app.post('/queue/complete', async (req, res) => {
-  const { req_id } = req.body;
-  const idx = queue.findIndex(t => t.req_id === req_id);
-  if (idx !== -1) {
-    if (queue[idx].upstreamReq) queue[idx].upstreamReq.destroy();
-    queue.splice(idx, 1);
-    console.log(`[VPS Telemetry] Received manual complete message. Dropping request: "${req_id}"`);
+  const { req_id, browser_id } = req.body;
+  const authHeader = req.headers['authorization'];
+  const device_secret = authHeader?.split(' ')[1];
+
+  if (!req_id || !browser_id || !device_secret) {
+    return res.status(400).json({ error: 'Missing parameters or authorization context' });
   }
-  processQueue();
-  res.json({ success: true });
+
+  try {
+    let device;
+    if (device_secret === ADMIN_SECRET_KEY) {
+      device = { approved: 1, banned: 0 };
+    } else {
+      device = await get('SELECT approved, banned FROM devices WHERE browser_id = ? AND device_secret = ?', [browser_id, device_secret]);
+    }
+    
+    if (!device) return res.status(401).json({ error: 'Unauthorized' });
+    if (device.banned === 1) return res.status(403).json({ error: 'Banned' });
+    if (device.approved !== 1) return res.status(401).json({ error: 'Unapproved' });
+
+    queueManager.complete(req_id, browser_id);
+    console.log(`[VPS Telemetry] Received verified completion bounds. Dropping request: "${req_id}"`);
+    res.json({ success: true });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
 });
 
 // Admin Devices endpoint
@@ -1011,8 +896,8 @@ app.get('/admin/devices', verifyAdmin, async (req, res) => {
     const groups = {};
     for (const row of rows) {
       const key = row.discord_id || `unlinked:${row.browser_id}`;
-      const lastActive = activeSessions.get(row.browser_id) || row.last_active_at || 0;
-      const isOnline = (Date.now() - lastActive) < config.ACTIVE_SESSION_TTL_MS;
+      const lastActive = queueManager.getLastActive(row.browser_id) || row.last_active_at || 0;
+      const isOnline = queueManager.isDeviceOnline(row.browser_id);
       
       let meteredAllowance = null;
       const tierConfig = TIER_CONFIGS[row.priority_tier];
@@ -1146,26 +1031,12 @@ app.post('/admin/ban', verifyAdmin, async (req, res) => {
       ]);
       await run('UPDATE devices SET banned = 1 WHERE discord_id = ?', [discord_id]);
       console.log(`[VPS Telemetry Admin] Banned Discord Account: "${discord_id}"`);
-      // Force-evict banned users from the running queue
-      queue = queue.filter(t => {
-        if (t.discord_id === discord_id) {
-          if (t.upstreamReq) t.upstreamReq.destroy();
-          return false;
-        }
-        return true;
-      });
+      queueManager.evict({ discord_id });
     } else if (browser_id) {
       await run('UPDATE devices SET banned = 1 WHERE browser_id = ?', [browser_id]);
       console.log(`[VPS Telemetry Admin] Banned Unlinked Browser: "${browser_id}"`);
-      queue = queue.filter(t => {
-        if (t.browser_id === browser_id) {
-          if (t.upstreamReq) t.upstreamReq.destroy();
-          return false;
-        }
-        return true;
-      });
+      queueManager.evict({ browser_id });
     }
-    processQueue();
     res.json({ success: true });
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -1369,38 +1240,6 @@ app.get('/admin/global-stats', verifyAdmin, async (req, res) => {
   }
 });
 
-// Scavenger Loop (TTL Maintenance)
-// unref() ensures this background interval does not block the Node.js event loop from cleanly terminating in test harnesses
-const gcInterval = setInterval(() => {
-  const now = Date.now();
-  let stateChanged = false;
-  
-  queue = queue.filter(t => {
-    // Drop clients failing to poll within configured threshold
-    if (t.status === 'pending' && (now - t.last_polled_at > config.QUEUE_POLL_TIMEOUT_MS)) {
-      stateChanged = true;
-      console.warn(`[Nai-Gateway GC] Discarding inactive pending client: BrowserId: ${t.browser_id}`);
-      return false; 
-    }
-    // Forcefully drop processing connections stuck/hung for over spec-configured TTL
-    if (t.status === 'processing' && (now - t.started_processing_at > config.QUEUE_PROCESSING_TIMEOUT_MS)) {
-      if (t.upstreamReq) t.upstreamReq.destroy();
-      stateChanged = true;
-      console.warn(`[Nai-Gateway GC] Terminating hung generation lock. Extinguished active socket for: ${t.browser_id}`);
-      return false;
-    }
-    return true;
-  });
-
-  if (stateChanged) {
-    processQueue();
-  }
-}, config.QUEUE_GC_INTERVAL_MS);
-
-if (gcInterval.unref) {
-  gcInterval.unref();
-}
-
 /**
  * Format-agnostic parameter extractor.
  * Safely parses JSON blocks or Multi-part streams, identifying active Precise character references.
@@ -1534,30 +1373,13 @@ async function runBackgroundAudit(browserId, payloadBuffer, clientReportedV5) {
           banReason
         ]);
         await run('UPDATE devices SET banned = 1 WHERE discord_id = ?', [device.discord_id]);
-        
-        // EVICT ALL LINKED SESSIONS FROM RUNNING QUEUE
-        queue = queue.filter(t => {
-          if (t.discord_id === device.discord_id) {
-            if (t.upstreamReq) t.upstreamReq.destroy();
-            return false;
-          }
-          return true;
-        });
+        queueManager.evict({ discord_id: device.discord_id });
       } else {
         console.warn(`[VPS Security Audit] Revoking browser_id directly: "${browserId}"`);
         await run('UPDATE devices SET banned = 1 WHERE browser_id = ?', [browserId]);
-
-        // EVICT DIRECT BROWSER REGISTRATION FROM RUNNING QUEUE
-        queue = queue.filter(t => {
-          if (t.browser_id === browserId) {
-            if (t.upstreamReq) t.upstreamReq.destroy();
-            return false;
-          }
-          return true;
-        });
+        queueManager.evict({ browser_id });
       }
       
-      processQueue();
       console.log(`[VPS Security Audit] Success. Ban and queue eviction completed for "${browserId}".`);
     } catch (dbErr) {
       console.error('[VPS Security Audit] Failed to execute database ban:', dbErr);
@@ -1588,5 +1410,8 @@ module.exports = {
   get server() {
     return serverInstance;
   },
-  gcInterval
+  get gcInterval() {
+    return queueManager.gcInterval;
+  },
+  queueManager
 };
