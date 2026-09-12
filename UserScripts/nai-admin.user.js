@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         NovelAI Split-Token Gateway Coordinator (Admin Panel)
 // @namespace    http://tampermonkey.net/
-// @version      4.0.2
+// @version      4.1.0
 // @description  Secure administration panel, telemetry dashboard, and session token injector
 // @author       Minco
 // @match        https://novelai.net/*
