@@ -24,6 +24,15 @@
  * 8. Full Admin Plane Integrity:
  *    - Confirms all admin endpoints exist and enforce admin passkey authentication.
  *    - Asserts /admin/approve safely falls back to 'Normal' priority tier when parameter is omitted.
+ * 9. Hell Path: Bilateral Mutual-Consent Diagnostic Telemetry Enforcement:
+ *    - Client intent signaling: verifies POST /auth/debug-intent records intent in RAM and emits state.
+ *    - Data Sovereignty Check: Admin armed + Client NOT consenting -> SUPPRESSED (No clandestine admin wiretapping).
+ *    - Host Protection Check: Client consenting + Admin NOT armed -> SUPPRESSED (No client-directed log flood DoS).
+ *    - Bilateral Execution Check: Client consenting + Admin armed -> LOGGED (Bilateral mutual-consent satisfied).
+ *    - Client Revocation Check: Client toggles intent off -> Immediately suppresses subsequent generation logs.
+ *    - Admin Disarm Check: Admin revokes window -> Immediately suppresses subsequent generation logs.
+ *    - Scavenger GC Sweeper Expiration: TTL expiration cleans authorization and halts logging automatically.
+ *    - Admin Tier Inherent Authority: Device with priority_tier 'Admin' logs directly when x-debug-mode is true.
  */
 
 'use strict';
@@ -417,7 +426,8 @@ test("Phase 5: Stream Safety Invariants & Complete Gateway Integration", async (
       { path: '/admin/devices', method: 'GET' },
       { path: '/admin/user-devices?discord_id=123', method: 'GET' },
       { path: '/admin/unnotified-bans', method: 'GET' },
-      { path: '/admin/global-stats', method: 'GET' }
+      { path: '/admin/global-stats', method: 'GET' },
+      { path: '/admin/debug-targets', method: 'GET' }
     ];
 
     for (const ep of endpoints) {
@@ -429,5 +439,205 @@ test("Phase 5: Stream Safety Invariants & Complete Gateway Integration", async (
     // Assert unauthenticated admin access is rejected
     const unauthRes = await queryGateway('/admin/devices', 'GET');
     assert.strictEqual(unauthRes.status, 401);
+  });
+
+  await t.test("Hell Path: Bilateral Mutual-Consent Diagnostic Telemetry Enforcement", async () => {
+    const adminHeaders = { 'Authorization': 'Bearer proxy_secret_key_123' };
+
+    // 1. Provision target devices in the database
+    await queryGateway('/auth/register', 'POST', {}, { browser_id: 'unauthorized_guest', device_secret: 'sec_unauth', label: 'Unauth Guest' });
+    await queryGateway('/admin/approve', 'POST', adminHeaders, { browser_id: 'unauthorized_guest', priority_tier: 'Normal' });
+
+    await queryGateway('/auth/register', 'POST', {}, { browser_id: 'bilateral_guest', device_secret: 'sec_bilateral', label: 'Bilateral Guest' });
+    await queryGateway('/admin/approve', 'POST', adminHeaders, { browser_id: 'bilateral_guest', priority_tier: 'Normal' });
+
+    await queryGateway('/auth/register', 'POST', {}, { browser_id: 'admin_device_op', device_secret: 'sec_admin_op', label: 'Operator Device' });
+    await queryGateway('/admin/approve', 'POST', adminHeaders, { browser_id: 'admin_device_op', priority_tier: 'Admin' });
+
+    // 2. Intercept stdout stream to assert logging outcomes deterministically
+    let capturedLogs = '';
+    const originalConsoleLog = console.log;
+    console.log = function(...args) {
+      capturedLogs += args.join(' ') + '\n';
+      originalConsoleLog.apply(console, args);
+    };
+
+    try {
+      // -------------------------------------------------------------------------
+      // Test A: In-Band Client Intent Signaling (POST /auth/debug-intent)
+      // -------------------------------------------------------------------------
+      const intentRes = await queryGateway('/auth/debug-intent', 'POST', {
+        'Authorization': 'Bearer sec_bilateral'
+      }, { browser_id: 'bilateral_guest', enabled: true });
+
+      assert.strictEqual(intentRes.status, 200);
+      assert.strictEqual(intentRes.data.debug_intent, true);
+      assert.strictEqual(intentRes.data.is_authorized, false, "Client intent alone must NOT authorize logging");
+
+      // Verify intent state reflects in /auth/status
+      const statusRes = await queryGateway('/auth/status?browser_id=bilateral_guest', 'GET', {
+        'Authorization': 'Bearer sec_bilateral'
+      });
+      assert.strictEqual(statusRes.status, 200);
+      assert.strictEqual(statusRes.data.debug_intent, true);
+      assert.strictEqual(statusRes.data.debug_authorized, false);
+
+      // Verify admin /admin/devices reflects intent badge data
+      const adminDevicesRes = await queryGateway('/admin/devices', 'GET', adminHeaders);
+      assert.strictEqual(adminDevicesRes.status, 200);
+      const matchedGroup = adminDevicesRes.data.find(g => g.devices.some(d => d.browser_id === 'bilateral_guest'));
+      assert.ok(matchedGroup, "Target device must exist in administrative listing");
+      assert.strictEqual(matchedGroup.has_debug_intent, true, "Admin console must surface client debug intent signal");
+
+      // -------------------------------------------------------------------------
+      // Test B: Client Consent Active, but Admin NOT Authorized -> MUST SUPPRESS
+      // (Host Protection: Protects against unapproved client-directed log flood DoS)
+      // -------------------------------------------------------------------------
+      capturedLogs = '';
+      queueManager.join({ browser_id: 'bilateral_guest', tab_id: 'tab_b1', req_id: 'req_unarmed_test', priority_tier: 'Normal' });
+      const resUnarmed = await queryGateway('/proxy/image/ai/generate-image', 'POST', {
+        'Authorization': 'Bearer sec_bilateral',
+        'X-Browser-Id': 'bilateral_guest',
+        'X-Request-Id': 'req_unarmed_test',
+        'X-Gen-Model': 'legacy',
+        'X-Debug-Mode': 'true' // Client asserting consent
+      }, { parameters: { width: 512, height: 512, prompt: "SUPPRESSED_UNARMED_PROMPT" } });
+
+      assert.strictEqual(resUnarmed.status, 200);
+      assert.strictEqual(capturedLogs.includes('SUPPRESSED_UNARMED_PROMPT'), false, 
+        "Host Protection Invariant: Telemetry MUST be suppressed when admin authorization is absent, even if client requests it");
+
+      // -------------------------------------------------------------------------
+      // Test C: Admin Authorized, but Client Consent ABSENT -> MUST SUPPRESS
+      // (Data Sovereignty: Prevents clandestine administrative surveillance)
+      // -------------------------------------------------------------------------
+      // Admin arms the inspection window
+      const armRes = await queryGateway('/admin/debug-target', 'POST', adminHeaders, {
+        browser_id: 'bilateral_guest',
+        enable: true,
+        ttl_ms: 600000 // 10 minutes
+      });
+      assert.strictEqual(armRes.status, 200);
+      assert.strictEqual(armRes.data.is_debug_enabled, true);
+
+      // Client sends generation request WITHOUT X-Debug-Mode header
+      capturedLogs = '';
+      queueManager.join({ browser_id: 'bilateral_guest', tab_id: 'tab_b2', req_id: 'req_unconsenting_test', priority_tier: 'Normal' });
+      const resNoConsent = await queryGateway('/proxy/image/ai/generate-image', 'POST', {
+        'Authorization': 'Bearer sec_bilateral',
+        'X-Browser-Id': 'bilateral_guest',
+        'X-Request-Id': 'req_unconsenting_test',
+        'X-Gen-Model': 'legacy'
+        // Omits X-Debug-Mode
+      }, { parameters: { width: 512, height: 512, prompt: "SUPPRESSED_NO_CONSENT_PROMPT" } });
+
+      assert.strictEqual(resNoConsent.status, 200);
+      assert.strictEqual(capturedLogs.includes('SUPPRESSED_NO_CONSENT_PROMPT'), false, 
+        "Data Sovereignty Invariant: Telemetry MUST be suppressed when client consent header is absent, even if admin authorized it");
+
+      // -------------------------------------------------------------------------
+      // Test D: Bilateral Mutual-Consent Condition Satisfied -> MUST LOG
+      // (Simultaneous assertion: Client Active Consent AND Admin Active Authorization)
+      // -------------------------------------------------------------------------
+      capturedLogs = '';
+      queueManager.join({ browser_id: 'bilateral_guest', tab_id: 'tab_b3', req_id: 'req_bilateral_pass', priority_tier: 'Normal' });
+      const resBilateral = await queryGateway('/proxy/image/ai/generate-image', 'POST', {
+        'Authorization': 'Bearer sec_bilateral',
+        'X-Browser-Id': 'bilateral_guest',
+        'X-Request-Id': 'req_bilateral_pass',
+        'X-Gen-Model': 'legacy',
+        'X-Debug-Mode': 'true'
+      }, { parameters: { width: 512, height: 512, prompt: "AUTHORIZED_MUTUAL_CONSENT_PAYLOAD" } });
+
+      assert.strictEqual(resBilateral.status, 200);
+      assert.strictEqual(capturedLogs.includes('AUTHORIZED_MUTUAL_CONSENT_PAYLOAD'), true, 
+        "Mutual-Consent Invariant: Payload MUST be logged when both client consent and admin authorization are asserted");
+
+      // -------------------------------------------------------------------------
+      // Test E: Client Revocation -> Immediate Log Suppression
+      // -------------------------------------------------------------------------
+      // Client disables debug intent
+      const revokeIntentRes = await queryGateway('/auth/debug-intent', 'POST', {
+        'Authorization': 'Bearer sec_bilateral'
+      }, { browser_id: 'bilateral_guest', enabled: false });
+      assert.strictEqual(revokeIntentRes.status, 200);
+      assert.strictEqual(revokeIntentRes.data.debug_intent, false);
+
+      // Client stops transmitting the debug header on generation
+      capturedLogs = '';
+      queueManager.join({ browser_id: 'bilateral_guest', tab_id: 'tab_b4', req_id: 'req_client_revoked', priority_tier: 'Normal' });
+      await queryGateway('/proxy/image/ai/generate-image', 'POST', {
+        'Authorization': 'Bearer sec_bilateral',
+        'X-Browser-Id': 'bilateral_guest',
+        'X-Request-Id': 'req_client_revoked',
+        'X-Gen-Model': 'legacy'
+        // Header omitted
+      }, { parameters: { width: 512, height: 512, prompt: "SUPPRESSED_POST_CLIENT_REVOCATION" } });
+
+      assert.strictEqual(capturedLogs.includes('SUPPRESSED_POST_CLIENT_REVOCATION'), false,
+        "Revocation Invariant: Immediate suppression when client revokes consent");
+
+      // -------------------------------------------------------------------------
+      // Test F: Administrator Disarm -> Immediate Log Suppression
+      // -------------------------------------------------------------------------
+      // Re-enable client intent and header
+      await queryGateway('/auth/debug-intent', 'POST', {
+        'Authorization': 'Bearer sec_bilateral'
+      }, { browser_id: 'bilateral_guest', enabled: true });
+
+      // Administrator explicitly disarms inspection window
+      const disarmRes = await queryGateway('/admin/debug-target', 'POST', adminHeaders, {
+        browser_id: 'bilateral_guest',
+        enable: false
+      });
+      assert.strictEqual(disarmRes.status, 200);
+      assert.strictEqual(disarmRes.data.is_debug_enabled, false);
+
+      // Client still transmits header, but admin window is closed
+      capturedLogs = '';
+      queueManager.join({ browser_id: 'bilateral_guest', tab_id: 'tab_b5', req_id: 'req_admin_disarmed', priority_tier: 'Normal' });
+      await queryGateway('/proxy/image/ai/generate-image', 'POST', {
+        'Authorization': 'Bearer sec_bilateral',
+        'X-Browser-Id': 'bilateral_guest',
+        'X-Request-Id': 'req_admin_disarmed',
+        'X-Gen-Model': 'legacy',
+        'X-Debug-Mode': 'true'
+      }, { parameters: { width: 512, height: 512, prompt: "SUPPRESSED_POST_ADMIN_DISARM" } });
+
+      assert.strictEqual(capturedLogs.includes('SUPPRESSED_POST_ADMIN_DISARM'), false,
+        "Disarm Invariant: Immediate suppression when administrator revokes window");
+
+      // -------------------------------------------------------------------------
+      // Test G: Scavenger GC Sweeper Expiration (Auto-Cleanup)
+      // -------------------------------------------------------------------------
+      queueManager.setDebugTarget('ttl_guest_test', 50); // 50ms ephemeral TTL
+      assert.strictEqual(queueManager.isDebugEnabled('ttl_guest_test'), true);
+
+      await new Promise(r => setTimeout(r, 60));
+      queueManager.sweep();
+      assert.strictEqual(queueManager.isDebugEnabled('ttl_guest_test'), false, 
+        "Scavenger Invariant: Expired debug authorizations MUST be evicted by internal sweeper without process crashes");
+
+      // -------------------------------------------------------------------------
+      // Test H: Inherent Admin Authority Exemption
+      // (Administrator's own hardware logs directly upon sending X-Debug-Mode)
+      // -------------------------------------------------------------------------
+      capturedLogs = '';
+      queueManager.join({ browser_id: 'admin_device_op', tab_id: 'tab_adm', req_id: 'req_admin_inherent', priority_tier: 'Admin' });
+      const resAdminDirect = await queryGateway('/proxy/image/ai/generate-image', 'POST', {
+        'Authorization': 'Bearer sec_admin_op',
+        'X-Browser-Id': 'admin_device_op',
+        'X-Request-Id': 'req_admin_inherent',
+        'X-Gen-Model': 'legacy',
+        'X-Debug-Mode': 'true'
+      }, { parameters: { width: 512, height: 512, prompt: "ADMIN_OPERATOR_TELEMETRY" } });
+
+      assert.strictEqual(resAdminDirect.status, 200);
+      assert.strictEqual(capturedLogs.includes('ADMIN_OPERATOR_TELEMETRY'), true,
+        "Admin Exemption Invariant: Admin priority tier devices retain inherent right to inspect their own requests");
+
+    } finally {
+      console.log = originalConsoleLog;
+    }
   });
 });

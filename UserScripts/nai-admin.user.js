@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         NovelAI Split-Token Gateway Coordinator (Admin Panel)
 // @namespace    http://tampermonkey.net/
-// @version      4.1.0
-// @description  Secure administration panel, telemetry dashboard, and session token injector
+// @version      4.2.0
+// @description  Secure administration panel, telemetry dashboard, bilateral debug coordinator, and session token injector
 // @author       Minco
 // @match        https://novelai.net/*
 // @match        https://*.novelai.net/*
@@ -19,8 +19,8 @@
  * ADMINISTRATIVE UTILITY (nai-admin.user.js)
  *
  * Implements a high-security control and telemetry layout on top of the NovelAI Single Page App (SPA).
- * Intercepts outbound generation requests, manages dynamic FIFO queuing, and executes secure token swaps
- * over the VPS gateway while preserving local cryptographic database keystores.
+ * Intercepts outbound generation requests, manages dynamic FIFO queuing, executes secure token swaps,
+ * and coordinates the bilateral mutual-consent diagnostic debug authorization gate.
  *
  * SECURITY DESIGN PRINCIPLE:
  * Outbound requests targeting the VPS `/proxy/` and `/queue/` endpoints are routed using Tampermonkey's
@@ -344,7 +344,7 @@
 
     /**
      * Renders the administrative dashboard interface.
-     * Evaluates grouping and sorting sequences, and handles collapsible card transitions.
+     * Evaluates grouping and sorting sequences, and handles bilateral diagnostic debug arming.
      */
     async function renderAdminUI() {
         const modal = document.getElementById("vps-admin-panel");
@@ -453,6 +453,14 @@
                         ? `<span style="background:#c0392b; color:#fff; font-size:8px; padding:1px 4px; border-radius:2px; font-weight:bold; margin-left:6px; letter-spacing:0.5px;">BANNED</span>` 
                         : '';
 
+                    // In-band debug intent badge indicator on header
+                    let headerDebugBadge = '';
+                    if (group.has_debug_authorized) {
+                        headerDebugBadge = `<span style="background:#27ae60; color:#fff; font-size:8px; padding:1px 4px; border-radius:2px; font-weight:bold; margin-left:6px;">DEBUG ACTIVE</span>`;
+                    } else if (group.has_debug_intent) {
+                        headerDebugBadge = `<span style="background:#e67e22; color:#fff; font-size:8px; padding:1px 4px; border-radius:2px; font-weight:bold; margin-left:6px;">DEBUG REQUESTED</span>`;
+                    }
+
                     // Collapsed condensed header markup
                     el.innerHTML = `
                         <div class="client-card-header" data-key="${selectorId}" style="padding:12px; cursor:pointer; display:flex; align-items:center; justify-content:space-between; background:#1e1e1e; user-select:none;">
@@ -460,6 +468,7 @@
                                 <div style="width:7px; height:7px; border-radius:50%; background:${statusDotColor};" title="${statusTitle}"></div>
                                 <span style="font-weight:bold; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; color:#fff;">${group.discord_username}</span>
                                 ${bannedBadge}
+                                ${headerDebugBadge}
                             </div>
                             <div style="font-size:10px; color:#aaa; display:flex; gap:10px; align-items:center;">
                                 <span style="color:#00bc8c; font-weight:bold;">${group.anlas_consumed}A</span>
@@ -479,13 +488,30 @@
                             const devOnlineColor = d.is_online ? "#2ecc71" : "#7f8c8d";
                             const devBannedBadge = d.banned === 1 ? `<span style="color:#e74c3c; font-weight:bold; margin-left:4px;">(BANNED)</span>` : '';
                             const allowanceBadge = d.metered_allowance !== null ? `<span style="color:#f39c12; font-weight:bold; margin-left:6px;">[${d.metered_allowance}/100 Imgs]</span>` : '';
+                            
+                            // Bilateral Debug Status Badges & Action Buttons
+                            let devDebugBadge = '';
+                            let devDebugBtn = '';
+
+                            if (d.debug_authorized) {
+                                const minsLeft = (d.debug_expires_in_ms / 60000).toFixed(1);
+                                devDebugBadge = `<span style="background:#27ae60; color:#fff; font-size:8px; padding:1px 4px; border-radius:2px; font-weight:bold; margin-left:4px;">DEBUG ACTIVE (${minsLeft}m)</span>`;
+                                devDebugBtn = `<button class="btn-toggle-debug" data-id="${d.browser_id}" data-action="disarm" style="background:#e67e22; border:none; color:#fff; padding:2px 6px; font-size:9px; cursor:pointer; border-radius:2px; font-weight:bold; flex-shrink:0;">DISARM</button>`;
+                            } else if (d.debug_intent) {
+                                devDebugBadge = `<span style="background:#e74c3c; color:#fff; font-size:8px; padding:1px 4px; border-radius:2px; font-weight:bold; margin-left:4px;">⚠️ DEBUG REQUESTED</span>`;
+                                devDebugBtn = `<button class="btn-toggle-debug" data-id="${d.browser_id}" data-action="arm" style="background:#2980b9; border:none; color:#fff; padding:2px 6px; font-size:9px; cursor:pointer; border-radius:2px; font-weight:bold; flex-shrink:0;">AUTHORIZE (10M)</button>`;
+                            }
+
                             devicesHtml += `
                                 <div style="font-size:10px; color:#ccc; padding:6px 0; border-bottom:1px solid #444; display:flex; justify-content:space-between; align-items:center; gap:10px;">
                                     <div style="display:flex; align-items:center; gap:6px; min-width:0; flex:1;">
                                         <div style="width:5px; height:5px; border-radius:50%; background:${devOnlineColor};"></div>
-                                        <span style="overflow:hidden; text-overflow:ellipsis; white-space:nowrap;"><strong>${d.label}</strong> ${devBannedBadge}${allowanceBadge} <code style="color:#666;">(${d.browser_id.substring(0,8)}...)</code></span>
+                                        <span style="overflow:hidden; text-overflow:ellipsis; white-space:nowrap;"><strong>${d.label}</strong> ${devBannedBadge}${allowanceBadge}${devDebugBadge} <code style="color:#666;">(${d.browser_id.substring(0,8)}...)</code></span>
                                     </div>
-                                    <button class="btn-prune-dev" data-id="${d.browser_id}" style="background:#8e44ad; border:none; color:#fff; padding:2px 6px; font-size:9px; cursor:pointer; border-radius:2px; font-weight:bold; flex-shrink:0;">PRUNE</button>
+                                    <div style="display:flex; gap:4px; align-items:center;">
+                                        ${devDebugBtn}
+                                        <button class="btn-prune-dev" data-id="${d.browser_id}" style="background:#8e44ad; border:none; color:#fff; padding:2px 6px; font-size:9px; cursor:pointer; border-radius:2px; font-weight:bold; flex-shrink:0;">PRUNE</button>
+                                    </div>
                                 </div>
                             `;
                         });
@@ -539,6 +565,23 @@
                             expandedKeys.add(key);
                         }
                         renderAdminUI();
+                    };
+                });
+
+                // Bilateral Debug Arm/Disarm Action Button
+                container.querySelectorAll(".btn-toggle-debug").forEach(b => {
+                    b.onclick = async (e) => {
+                        const bid = e.currentTarget.getAttribute("data-id");
+                        const action = e.currentTarget.getAttribute("data-action");
+                        const enable = action === "arm";
+
+                        const actionRes = await backgroundRequest({
+                            method: "POST",
+                            url: `${VPS_HOST}/admin/debug-target`,
+                            headers: { "Content-Type": "application/json", "Authorization": `Bearer ${deviceSecret}` },
+                            data: JSON.stringify({ browser_id: bid, enable, ttl_ms: 600000 })
+                        });
+                        if (actionRes.status === 200) renderAdminUI();
                     };
                 });
 
@@ -1388,8 +1431,8 @@
                     "remaining_text_actions": 50,
                     "used_image_actions": 0,
                     "remaining_image_actions": 50,
-                    "eligible_for_text_gens": true,
-                    "eligible_for_image_gens": true,
+                    "eligible_for_text_gens": false,
+                    "eligible_for_image_gens": false,
                     "trial_activated": true
                 };
                 return new Response(JSON.stringify(mockTrial), {

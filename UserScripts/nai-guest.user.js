@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         NovelAI Split-Token Gateway Coordinator (Guest)
 // @namespace    http://tampermonkey.net/
-// @version      4.1.0
+// @version      4.2.0
 // @description  FIFO queue coordination, rolling allowance telemetry visualization, and background stream proxy pipeline
 // @author       Minco
 // @match        https://novelai.net/*
@@ -27,6 +27,7 @@
  * 3. Hijacks unsafeWindow.fetch calls to mock tier-specific capabilities.
  * 4. Extends image request lifecycles to complete validation queue phases 
  *    before passing raw data streams up to the secure VPS.
+ * 5. Manages in-band diagnostic intent signaling over the bilateral consent gate.
  */
 
 (function() {
@@ -423,8 +424,8 @@
         if (document.getElementById("vps-debug-badge")) return;
         const badge = document.createElement("div");
         badge.id = "vps-debug-badge";
-        badge.innerHTML = "⚠️ VPS DEBUG MODE ACTIVE";
-        badge.style.cssText = "position:fixed; top:10px; left:50%; transform:translateX(-50%); background:#e74c3c; color:#fff; font-weight:bold; font-size:11px; padding:6px 12px; border-radius:4px; z-index:99999; box-shadow:0 2px 8px rgba(0,0,0,0.4); pointer-events:none;";
+        badge.innerHTML = "⚠️ VPS DEBUG INTENT ACTIVE";
+        badge.style.cssText = "position:fixed; top:10px; left:50%; transform:translateX(-50%); background:#e67e22; color:#fff; font-weight:bold; font-size:11px; padding:6px 12px; border-radius:4px; z-index:99999; box-shadow:0 2px 8px rgba(0,0,0,0.4); pointer-events:none;";
         document.documentElement.appendChild(badge);
     }
 
@@ -463,6 +464,7 @@
         let preciseLimit = "Loading...";
         let sessionStatus = "Loading...";
         let linkedDevicesList = '';
+        let debugStatusMsg = debugActive ? '✓ Intent active. Awaiting admin authorization.' : 'Disabled';
 
         try {
             const res = await backgroundRequest({
@@ -474,12 +476,11 @@
                 const data = JSON.parse(res.responseText);
                 tier = data.tier || "Normal";
                 anlasConsumed = data.anlas_consumed || 0;
-                // Map unlimited precise boundaries to display string
                 preciseLimit = data.precise_limit === "Unlimited" ? "Unlimited" : `${data.precise_limit} Refs`;
                 
                 if (data.session) {
                     const allowance = data.session.allowance;
-                    const maxAllowance = data.session.max || 100; // Safe dynamic denominator fallback
+                    const maxAllowance = data.session.max || 100;
                     const refillInMins = (data.session.next_refill_in / 1000 / 60).toFixed(1);
                     const refillText = allowance < maxAllowance ? `(Next refill in ${refillInMins}m)` : '(Fully Charged)';
                     sessionStatus = `<span style="color:#2ecc71; font-weight:bold;">${allowance}/${maxAllowance} Images</span> <span style="font-size:10px; color:#aaa;">${refillText}</span>`;
@@ -491,6 +492,15 @@
                     linkedDevicesList = data.linked_devices.map(d => `- \`${d.id.substring(0, 10)}...\` (${d.label})`).join('<br>');
                 } else {
                     linkedDevicesList = 'No other active links.';
+                }
+
+                if (data.debug_authorized) {
+                    const mins = (data.debug_expires_in_ms / 60000).toFixed(1);
+                    debugStatusMsg = `<span style="color:#2ecc71; font-weight:bold;">🟢 Authorized by Administrator (${mins}m remaining)</span>`;
+                } else if (data.debug_intent) {
+                    debugStatusMsg = `<span style="color:#f39c12; font-weight:bold;">⏳ Intent Active. Waiting for Administrator Authorization.</span>`;
+                } else {
+                    debugStatusMsg = `<span style="color:#888;">Disabled</span>`;
                 }
             } else {
                 tier = "Unknown";
@@ -546,8 +556,9 @@
                     <input type="checkbox" id="settings-debug" ${debugActive ? 'checked' : ''} style="cursor:pointer;">
                     ENABLE DIAGNOSTIC PROMPT DEBUGGING
                 </label>
+                <div id="debug-intent-status" style="margin-top:6px; font-size:11px; font-family:sans-serif;">${debugStatusMsg}</div>
                 <div id="debug-consent" style="color:#999; margin-top:6px; line-height:1.4; background:#222; padding:8px; border-radius:4px; border-left:2px solid #f39c12; font-size:10px;">
-                    <strong>Privacy transparency:</strong> Enabling debugging uploads raw generation payloads to gateway logs for performance troubleshooting. Text prompt contexts, settings, and resolutions will be saved on the VPS. Personal tokens and encrypted databases remain strictly isolated.
+                    <strong>Privacy transparency:</strong> Enabling debugging uploads raw generation payloads to gateway logs for performance troubleshooting. Text prompt contexts, settings, and resolutions will be saved on the VPS. Personal tokens and encrypted databases remain strictly isolated. (Even when checked, diagnostic payloads are <strong>never</strong> recorded unless an administrator also arms a temporary 10-minute inspection window. You may revoke consent at any time by unchecking this box.)
                 </div>
             </div>
         `;
@@ -560,6 +571,7 @@
         const domInput = modal.querySelector("#settings-domain");
         const saveDomBtn = modal.querySelector("#btn-save-domain");
         const debugCheckbox = modal.querySelector("#settings-debug");
+        const debugIntentStatus = modal.querySelector("#debug-intent-status");
 
         saveNickBtn.onclick = async () => {
             const nickname = nickInput.value.trim();
@@ -606,11 +618,46 @@
             window.location.reload();
         };
 
-        debugCheckbox.onchange = () => {
+        debugCheckbox.onchange = async () => {
             const checked = debugCheckbox.checked;
             GM_setValue("debug_mode", checked);
             if (checked) injectWarningBadge();
             else removeWarningBadge();
+
+            debugIntentStatus.style.display = "block";
+            debugIntentStatus.style.color = "#f39c12";
+            debugIntentStatus.innerHTML = checked 
+                ? "⏳ Synchronizing diagnostic debug intent with gateway..." 
+                : "⏳ Revoking diagnostic debug intent on gateway...";
+
+            try {
+                const res = await backgroundRequest({
+                    method: "POST",
+                    url: `${domain}/auth/debug-intent`,
+                    headers: { "Content-Type": "application/json", "Authorization": `Bearer ${deviceSecret}` },
+                    data: JSON.stringify({ browser_id: browserId, enabled: checked })
+                });
+
+                if (res.status === 200) {
+                    const data = JSON.parse(res.responseText);
+                    if (data.is_authorized) {
+                        const mins = (data.expires_in_ms / 60000).toFixed(1);
+                        debugIntentStatus.style.color = "#2ecc71";
+                        debugIntentStatus.innerHTML = `✓ Authorized by Administrator (${mins}m remaining). Telemetry logging active.`;
+                    } else if (checked) {
+                        debugIntentStatus.style.color = "#f39c12";
+                        debugIntentStatus.innerHTML = "✓ Intent registered on gateway. Awaiting administrator authorization.";
+                    } else {
+                        debugIntentStatus.style.color = "#888";
+                        debugIntentStatus.innerHTML = "✓ Diagnostic debug intent revoked. Logging disabled.";
+                    }
+                } else {
+                    throw new Error("Synchronization rejected");
+                }
+            } catch (err) {
+                debugIntentStatus.style.color = "#e74c3c";
+                debugIntentStatus.innerHTML = "✗ Failed to synchronize debug intent with gateway.";
+            }
         };
     }
 
@@ -1006,7 +1053,7 @@
                         // Fallback evaluation for legacy engines
                         if (responseDetails.readyState >= 2) {
                             if (await tryResolveProxyResponse(responseDetails, resolve, true, false)) {
-                                            hasResolved = true;
+                                hasResolved = true;
                             }
                         }
                     },
@@ -1185,9 +1232,9 @@
                     "remaining_text_actions": 50,
                     "used_image_actions": 0,
                     "remaining_image_actions": 50,
-                    "eligible_for_text_gens": true,
-                    "eligible_for_image_gens": true,
-                    "trial_activated": true
+                    "eligible_for_text_gens": false, //False to disable trial mode UI (Maybe?)
+                    "eligible_for_image_gens": false, //False to disable trial mode UI (Maybe?)
+                    "trial_activated": true //True to prevent trial activation prompt from appearing (Probably?)
                 };
                 return new Response(JSON.stringify(mockTrial), {
                     status: 200,
@@ -1205,7 +1252,7 @@
                 return handleGenerationIntercept(urlString, config);
             }
 
-            // Route both legacy and new OpenAI-compatible text generation endpoints through our secure fast-track text queue
+            // Route both legacy and new OpenAI-compatible text generation endpoints through secure fast-track text queue
             if (urlString.includes('/ai/generate-stream') || urlString.includes('/oa/v1/completions')) {
                 return handleTextGenerationIntercept(urlString, config);
             }

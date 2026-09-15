@@ -6,7 +6,7 @@
  * 1. Zero Event-Emitters: Eliminates non-deterministic microtask scheduling delays.
  *    All queue state transitions occur synchronously within a single event-loop tick.
  * 2. Strict Encapsulation: Protects Channel A (exclusive image queue), Channel B (shared
- *    text slots), burst token-buckets, and session presence maps from ambient leakage.
+ *    text slots), burst token-buckets, session presence maps, and diagnostic debug targets from ambient leakage.
  * 3. Immediate Socket Destruction: Abrupt disconnects, concurrency collisions, and GC
  *    sweeps immediately terminate upstream sockets via .destroy() to prevent ghost locks.
  * 4. Dual-Slope Priority Aging: Evaluates dynamic linear priority decay on-the-fly with
@@ -15,6 +15,8 @@
  *    a target browser footprint or Discord identity upon policy or audit violations.
  * 6. Command Query Separation (CQS): Polling (read) operations compute theoretical 
  *    trajectories for telemetry. They NEVER mutate financial token states.
+ * 7. Bilateral Ephemeral Diagnostics: Manages client-side debug intents and administrator
+ *    inspection authorizations with deterministic millisecond TTL bounds swept automatically by the scavenger loop.
  */
 
 'use strict';
@@ -68,6 +70,109 @@ class QueueCoordinator {
     this.deviceBuckets = new Map();
     this.activeSessions = new Map();
     this.activeTextLocks = new Map(); // Channel B explicitly tracked locks: req_id -> timestamp
+    this.debugTargets = new Map();    // Ephemeral administrative authorizations: browser_id -> expires_at
+    this.debugIntents = new Map();    // In-band client diagnostic intents: browser_id -> timestamp
+  }
+
+  /**
+   * Registers or clears client-side diagnostic debug intent in RAM.
+   *
+   * @param {string} browserId - Target device browser footprint.
+   * @param {boolean} [enabled=true] - Intent state.
+   */
+  setDebugIntent(browserId, enabled = true) {
+    if (!browserId || typeof browserId !== 'string') return;
+    if (enabled) {
+      this.debugIntents.set(browserId, Date.now());
+    } else {
+      this.debugIntents.delete(browserId);
+    }
+  }
+
+  /**
+   * Checks whether a client has actively signaled diagnostic debug intent.
+   *
+   * @param {string} browserId - Target device browser footprint.
+   * @returns {boolean} True if client has registered active intent.
+   */
+  hasDebugIntent(browserId) {
+    if (!browserId || typeof browserId !== 'string') return false;
+    return this.debugIntents.has(browserId);
+  }
+
+  /**
+   * Authorizes a device browser footprint for temporary verbose telemetry inspection.
+   *
+   * @param {string} browserId - Target device browser footprint.
+   * @param {number} [ttlMs=600000] - Duration of authorized inspection in milliseconds (default: 10m).
+   */
+  setDebugTarget(browserId, ttlMs = 600000) {
+    if (!browserId || typeof browserId !== 'string') return;
+    const boundedTtl = (typeof ttlMs === 'number' && Number.isFinite(ttlMs) && ttlMs > 0) ? ttlMs : 600000;
+    this.debugTargets.set(browserId, Date.now() + boundedTtl);
+  }
+
+  /**
+   * Revokes an active diagnostic debug inspection target immediately.
+   *
+   * @param {string} browserId - Target device browser footprint.
+   * @returns {boolean} True if target was present and removed; false otherwise.
+   */
+  removeDebugTarget(browserId) {
+    return this.debugTargets.delete(browserId);
+  }
+
+  /**
+   * Evaluates whether a device is currently authorized by an administrator for diagnostic debug inspection.
+   *
+   * @param {string} browserId - Target device browser footprint.
+   * @returns {boolean} True if authorized and TTL has not expired.
+   */
+  isDebugEnabled(browserId) {
+    if (!browserId || !this.debugTargets.has(browserId)) return false;
+    const expiresAt = this.debugTargets.get(browserId);
+    if (Date.now() > expiresAt) {
+      this.debugTargets.delete(browserId);
+      return false;
+    }
+    return true;
+  }
+
+  /**
+   * Retrieves comprehensive bilateral diagnostic status for a device.
+   *
+   * @param {string} browserId - Target device browser footprint.
+   * @returns {{has_intent: boolean, is_authorized: boolean, expires_in_ms: number}}
+   */
+  getDebugTargetInfo(browserId) {
+    const now = Date.now();
+    const expiresAt = this.debugTargets.get(browserId) || 0;
+    const isAuthorized = expiresAt > now;
+    return {
+      has_intent: this.hasDebugIntent(browserId),
+      is_authorized: isAuthorized,
+      expires_in_ms: isAuthorized ? (expiresAt - now) : 0
+    };
+  }
+
+  /**
+   * Exposes active authorized diagnostic debug targets.
+   *
+   * @returns {Array<{browser_id: string, expires_in_ms: number, has_intent: boolean}>} Active targets list.
+   */
+  getDebugTargets() {
+    const now = Date.now();
+    const active = [];
+    for (const [browserId, expiresAt] of this.debugTargets.entries()) {
+      if (expiresAt > now) {
+        active.push({
+          browser_id: browserId,
+          expires_in_ms: expiresAt - now,
+          has_intent: this.hasDebugIntent(browserId)
+        });
+      }
+    }
+    return active;
   }
 
   /**
@@ -470,7 +575,21 @@ class QueueCoordinator {
       }
     }
 
-    // 4. Queue state lifecycle bounds
+    // 4. Ephemeral Diagnostic Debug Inspection Targets & Stale Intents Watchdog
+    for (const [browserId, expiresAt] of this.debugTargets.entries()) {
+      if (now > expiresAt) {
+        this.debugTargets.delete(browserId);
+        console.log(`[Nai-Gateway GC] Diagnostic debug authorization TTL expired for browser: "${browserId}". Revoked.`);
+      }
+    }
+
+    for (const [browserId, timestamp] of this.debugIntents.entries()) {
+      if (now - timestamp > 86400000) { // 24-hour retention ceiling for client debug intents
+        this.debugIntents.delete(browserId);
+      }
+    }
+
+    // 5. Queue state lifecycle bounds
     this.queue = this.queue.filter(t => {
       // Drop clients failing to poll within configured threshold
       if (t.status === 'pending' && (now - t.last_polled_at > this.config.QUEUE_POLL_TIMEOUT_MS)) {
