@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         NovelAI Split-Token Gateway Coordinator (Guest)
 // @namespace    http://tampermonkey.net/
-// @version      4.2.0
+// @version      4.2.1
 // @description  FIFO queue coordination, rolling allowance telemetry visualization, and background stream proxy pipeline
 // @author       Minco
 // @match        https://novelai.net/*
@@ -482,7 +482,7 @@
                     const allowance = data.session.allowance;
                     const maxAllowance = data.session.max || 100;
                     const refillInMins = (data.session.next_refill_in / 1000 / 60).toFixed(1);
-                    const refillText = allowance < maxAllowance ? `(Next refill in ${refillInMins}m)` : '(Fully Charged)';
+                    const refillText = allowance < maxAllowance ? `(+1 image in ${refillInMins}m)` : '(Fully Charged)';
                     sessionStatus = `<span style="color:#2ecc71; font-weight:bold;">${allowance}/${maxAllowance} Images</span> <span style="font-size:10px; color:#aaa;">${refillText}</span>`;
                 } else {
                     sessionStatus = `<span style="color:#00bc8c; font-weight:bold;">Exempt (Unlimited)</span>`;
