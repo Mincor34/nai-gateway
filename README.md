@@ -1,4 +1,4 @@
-# NovelAI Split-Token Gateway Coordinator (nai-gateway)
+# GuildWeave (nai-gateway)
 
 A single-concurrency transaction queue and split-token reverse proxy designed to coordinate a shared, paid NovelAI Opus-tier session across a verified user group without exposing the master account credentials.
 
