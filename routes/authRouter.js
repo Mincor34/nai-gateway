@@ -1,6 +1,6 @@
 /**
  * LEVEL 4: AUTHENTICATION ROUTER (routes/authRouter.js)
- * Manages device registration, nicknames, and client authorization queries.
+ * Manages device registration, nicknames, client authorization queries, and in-band diagnostic intent signaling.
  */
 
 'use strict';
@@ -55,6 +55,44 @@ router.post('/update-label', async (req, res) => {
   }
 });
 
+/**
+ * In-band Client Diagnostic Debug Intent Registration.
+ * Allows an authenticated guest to actively declare diagnostic consent directly over the API.
+ */
+router.post('/debug-intent', async (req, res) => {
+  const { browser_id, enabled } = req.body;
+  const authHeader = req.headers['authorization'];
+  const device_secret = authHeader?.split(' ')[1];
+
+  if (!browser_id || typeof browser_id !== 'string') {
+    return res.status(400).json({ error: 'Missing or invalid browser_id parameter.' });
+  }
+
+  try {
+    const auth = await auditEngine.verifyDevice(browser_id, device_secret, { requireApproval: false });
+    if (!auth.ok) {
+      return res.status(auth.status).json({ error: auth.error });
+    }
+
+    const intentState = Boolean(enabled);
+    queueManager.setDebugIntent(browser_id, intentState);
+    console.log(`[VPS Telemetry] Device "${browser_id}" registered diagnostic debug intent: ${intentState}`);
+
+    const debugInfo = queueManager.getDebugTargetInfo(browser_id);
+
+    res.json({
+      success: true,
+      browser_id,
+      debug_intent: intentState,
+      is_authorized: debugInfo.is_authorized,
+      expires_in_ms: debugInfo.expires_in_ms
+    });
+  } catch (err) {
+    console.error('[VPS Telemetry] Debug intent registration exception:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
 router.get('/status', async (req, res) => {
   const config = getConfig();
   const { browser_id } = req.query;
@@ -91,6 +129,8 @@ router.get('/status', async (req, res) => {
       linkedDevices = devices.map(d => ({ id: d.browser_id, label: d.label }));
     }
 
+    const debugInfo = queueManager.getDebugTargetInfo(browser_id);
+
     res.json({ 
       approved: !!row.approved, 
       tier: row.priority_tier,
@@ -98,7 +138,10 @@ router.get('/status', async (req, res) => {
       precise_limit: config.TIER_CONFIGS[row.priority_tier]?.preciseLimit === Infinity ? "Unlimited" : (config.TIER_CONFIGS[row.priority_tier]?.preciseLimit ?? 0),
       session: allowanceInfo,
       linked_devices: linkedDevices,
-      master_v5_percent: req.telemetry?.percent ?? 100
+      master_v5_percent: req.telemetry?.percent ?? 100,
+      debug_intent: debugInfo.has_intent,
+      debug_authorized: debugInfo.is_authorized,
+      debug_expires_in_ms: debugInfo.expires_in_ms
     });
   } catch (err) { 
     console.error('[VPS Telemetry] Authentication verification query failure:', err);

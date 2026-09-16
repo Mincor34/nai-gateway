@@ -41,6 +41,7 @@ router.get('/devices', async (req, res) => {
       const key = row.discord_id || `unlinked:${row.browser_id}`;
       const lastActive = queueManager.getLastActive(row.browser_id) || row.last_active_at || 0;
       const isOnline = queueManager.isDeviceOnline(row.browser_id);
+      const debugInfo = queueManager.getDebugTargetInfo(row.browser_id);
       
       let meteredAllowance = null;
       const tierConfig = config.TIER_CONFIGS[row.priority_tier];
@@ -59,6 +60,8 @@ router.get('/devices', async (req, res) => {
           total_requests: 0,
           last_active_at: 0,
           is_online: false,
+          has_debug_intent: false,
+          has_debug_authorized: false,
           devices: []
         };
       }
@@ -72,7 +75,10 @@ router.get('/devices', async (req, res) => {
         total_requests: row.total_requests || 0,
         last_active_at: lastActive,
         is_online: isOnline,
-        metered_allowance: meteredAllowance
+        metered_allowance: meteredAllowance,
+        debug_intent: debugInfo.has_intent,
+        debug_authorized: debugInfo.is_authorized,
+        debug_expires_in_ms: debugInfo.expires_in_ms
       });
       
       groups[key].anlas_consumed += row.anlas_consumed;
@@ -85,6 +91,12 @@ router.get('/devices', async (req, res) => {
       }
       if (row.banned === 1) {
         groups[key].banned = 1;
+      }
+      if (debugInfo.has_intent) {
+        groups[key].has_debug_intent = true;
+      }
+      if (debugInfo.is_authorized) {
+        groups[key].has_debug_authorized = true;
       }
     }
     res.json(Object.values(groups));
@@ -302,6 +314,41 @@ router.get('/global-stats', async (req, res) => {
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
+});
+
+/**
+ * Ephemeral Diagnostic Inspection Authorization Endpoints.
+ * Enables the administrator to arm or disarm an ephemeral capture window (default: 10 minutes).
+ */
+router.post('/debug-target', (req, res) => {
+  const { browser_id, enable, ttl_ms } = req.body;
+  if (!browser_id || typeof browser_id !== 'string') {
+    return res.status(400).json({ error: "Missing or invalid 'browser_id' string parameter." });
+  }
+
+  if (enable) {
+    const duration = (typeof ttl_ms === 'number' && Number.isFinite(ttl_ms) && ttl_ms > 0) ? ttl_ms : 600000;
+    queueManager.setDebugTarget(browser_id, duration);
+    console.log(`[VPS Admin Telemetry] Armed temporary diagnostic debug logging for browser: "${browser_id}" (TTL: ${duration}ms)`);
+  } else {
+    queueManager.removeDebugTarget(browser_id);
+    console.log(`[VPS Admin Telemetry] Disarmed diagnostic debug logging for browser: "${browser_id}"`);
+  }
+
+  const info = queueManager.getDebugTargetInfo(browser_id);
+
+  res.json({
+    success: true,
+    browser_id,
+    is_debug_enabled: info.is_authorized,
+    expires_in_ms: info.expires_in_ms,
+    has_intent: info.has_intent,
+    active_debug_targets: queueManager.getDebugTargets()
+  });
+});
+
+router.get('/debug-targets', (req, res) => {
+  res.json(queueManager.getDebugTargets());
 });
 
 module.exports = router;

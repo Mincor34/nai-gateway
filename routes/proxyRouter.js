@@ -280,8 +280,12 @@ router.all('/:subdomain/{*splat}', async (req, res) => {
         }
       });
 
-      // Untruncated Telemetry Logging in Debug Mode
-      if (req.headers['x-debug-mode'] === 'true') {
+      // Bilateral Mutual-Consent Diagnostic Telemetry Logging Gate
+      // Strictly enforces simultaneous dual-key condition: Client Active Consent AND Administrator Active Authorization.
+      const isClientConsenting = req.headers['x-debug-mode'] === 'true';
+      const isAdminAuthorized = (device.priority_tier === 'Admin') || queueManager.isDebugEnabled(browserId);
+
+      if (isClientConsenting && isAdminAuthorized) {
         console.log(`\n--- [VPS Debug Telemetry] Untruncated Structured Payload (Client: "${browserId}") ---`);
         console.log(auditEngine.formatPayloadForLogging(payloadBuffer));
         console.log("------------------------------------------------------------------------------------\n");
