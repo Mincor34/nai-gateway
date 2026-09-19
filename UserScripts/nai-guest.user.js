@@ -1,7 +1,7 @@
 // ==UserScript==
-// @name         NovelAI Split-Token Gateway Coordinator (Guest)
+// @name         GuildWeave Gateway
 // @namespace    http://tampermonkey.net/
-// @version      4.4.0
+// @version      5.0.0
 // @description  FIFO queue coordination, rolling allowance telemetry visualization, and background stream proxy pipeline
 // @author       Minco
 // @match        https://novelai.net/*

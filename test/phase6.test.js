@@ -1029,7 +1029,7 @@ test("Phase 6: UserScript Target Environment Verification (Tampermonkey Browser 
       assert.ok(code.includes('// ==/UserScript=='), `Artifact ${target.name} must terminate with // ==/UserScript==`);
 
       const headerBlock = code.slice(0, code.indexOf('// ==/UserScript=='));
-      assert.match(headerBlock, /@name\s+NovelAI/);
+      assert.match(headerBlock, /@name\s+GuildWeave/);
       assert.match(headerBlock, /@grant\s+GM_xmlhttpRequest/);
       assert.match(headerBlock, /@grant\s+GM_setValue/);
       assert.match(headerBlock, /@grant\s+GM_getValue/);
