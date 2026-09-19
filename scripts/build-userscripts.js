@@ -5,11 +5,12 @@ const path = require('path');
 const OUT_DIR = path.join(__dirname, '..', 'UserScripts');
 
 // TODO: Consider Github Releases instead of committing build artifacts to the repository.
+// TODO: Versioning and metadata don't belong in the build script.
 
 const adminBanner = `// ==UserScript==
 // @name         NovelAI Split-Token Gateway Coordinator (Admin Panel)
 // @namespace    http://tampermonkey.net/
-// @version      4.3.0
+// @version      4.4.0
 // @description  Secure administration panel, telemetry dashboard, bilateral debug coordinator, and session token injector
 // @author       Minco
 // @match        https://novelai.net/*
@@ -26,7 +27,7 @@ const adminBanner = `// ==UserScript==
 const guestBanner = `// ==UserScript==
 // @name         NovelAI Split-Token Gateway Coordinator (Guest)
 // @namespace    http://tampermonkey.net/
-// @version      4.3.0
+// @version      4.4.0
 // @description  FIFO queue coordination, rolling allowance telemetry visualization, and background stream proxy pipeline
 // @author       Minco
 // @match        https://novelai.net/*
@@ -67,7 +68,10 @@ async function build() {
       outfile: target.outfile,
       banner: { js: target.banner },
       target: 'es2020',
-      format: 'iife'
+      format: 'iife',
+      loader: {
+        '.svg': 'text'
+      }
     });
   }
 }

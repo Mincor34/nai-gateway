@@ -1,27 +1,33 @@
 /**
- * PHASE 6 HARNESS: USERSCRIPT RUNTIME INTEGRITY & TARGET BROWSER SIMULATION
+ * PHASE 6 HARNESS: USERSCRIPT RUNTIME INTEGRITY & TARGET BROWSER SIMULATION (test/phase6.test.js)
  *
  * ARCHITECTURAL MANDATE:
- * Tests compiled UserScript artifacts (UserScripts/nai-admin.user.js and UserScripts/nai-guest.user.js)
- * strictly inside an isolated VM browser sandbox.
+ * Tests compiled UserScript distribution artifacts (UserScripts/nai-admin.user.js and UserScripts/nai-guest.user.js)
+ * strictly inside an isolated Node.js VM browser sandbox.
  *
  * RIGID TARGET-ENVIRONMENT INVARIANTS:
- * 1. ZERO Node.js Leaks: `Buffer`, `process`, and `require` are strictly `undefined` inside the sandbox.
+ * 1. ZERO Node.js Leaks: `Buffer`, `process`, and `require` are strictly `undefined` inside the sandbox execution context.
  * 2. Complete Browser Web API Sandbox: Emulates `window`, `document`, `unsafeWindow`, `sessionStorage`,
  *    `Headers`, `Response`, `Request`, `FormData`, `Blob`, `ReadableStream`, `TextDecoder`, `TextEncoder`,
- *    and Web Crypto (`crypto.randomUUID`, `crypto.getRandomValues`).
- * 3. Authoritative Mock DOM: Parses HTML string assignments into queryable DOM hierarchies supporting
- *    `getElementById`, `querySelector`, `querySelectorAll`, and dynamic attribute/style bindings.
+ *    `MutationObserver`, `requestAnimationFrame`, and Web Crypto (`crypto.randomUUID`, `crypto.getRandomValues`).
+ * 3. Authoritative Mock DOM: Implements a true stack-based HTML parser constructing nested parent-child
+ *    hierarchies supporting `getElementById`, `querySelector`, `querySelectorAll`, dynamic attributes, inline styles,
+ *    and relational siblings (`previousElementSibling`, `nextElementSibling`, `parentElement`).
  * 4. Comprehensive Hell Paths on COMPILED ARTIFACTS:
- *    - 50ms High-Frequency UI Enforcement loop recovering from React SPA DOM purges.
- *    - Native `unsafeWindow.fetch` interception of `/user/data` (Opus tier injected, keystore preserved).
- *    - Admin control panel lifecycle: float button injection, admin modal toggle, master token injection.
- *    - Admin governance dispatch: `/admin/devices` retrieval, client rendering, and account actions.
+ *    - 50ms High-Frequency UI Enforcement loop recovering from React SPA DOM reconciliation purges.
+ *    - Native `unsafeWindow.fetch` interception of `/user/data` (Opus tier injected, keystore and settings preserved).
+ *    - Admin control panel lifecycle: #gw-nav-badge trigger, dual sub-tab switching, token push, and client governance.
  *    - Parametric payload extraction across `FormData`, `Blob`, `Uint8Array`, and hostile/malformed payloads without `Buffer`.
  *    - Multibyte UTF-8 stream chunk fragmentation (ensuring 4-byte emoji sequences survive split buffers without `\uFFFD`).
  *    - Ghost-lock cleanup via `POST /queue/complete` upon client network severance.
  *    - Mid-flight HTTP 401 de-authorization self-healing and silent re-registration.
  *    - Crypto entropy and fallback to `getRandomValues` and `Math.random` when `randomUUID` is stripped.
+ *    - Dynamic UI Invariant Verification:
+ *      * Nav row badge injection into `.image-gen-nav-row` without flex distribution distortion.
+ *      * Autonomous allowance bar rendering via NovelAI CSS variables without requiring native Opus bar scraping.
+ *      * Generate button shield overlay: total occlusion of sibling children (`visibility: hidden`) with no text collision.
+ *      * Deprecated settings tab quarantine: verifies no redundant `#gw-settings-tab` injection into settings sidebar.
+ *      * Complete toast eradication: verifies no floating `#vps-queue-banner` elements exist anywhere in the DOM.
  */
 
 'use strict';
@@ -35,10 +41,10 @@ const { build, targets } = require('../scripts/build-userscripts');
 
 /**
  * Creates an authentic browser and Tampermonkey sandbox context.
- * Guarantees zero host leaks (`Buffer`, `process`, `require` are undefined).
+ * Guarantees zero host leaks (`Buffer`, `process`, `require` are strictly undefined).
  *
  * @param {object} [initialStorage={}] - Seed key-value store for GM_getValue.
- * @returns {{ context: object, storage: Map, networkCalls: Array, elements: Map, triggerDOMInterval: Function, setPageFetch: Function }}
+ * @returns {{ context: object, storage: Map, networkCalls: Array, elements: Map, triggerDOMInterval: Function, triggerObserverSync: Function, setPageFetch: Function }}
  */
 function createBrowserSandbox(initialStorage = {}) {
   const storage = new Map(Object.entries(initialStorage));
@@ -46,8 +52,9 @@ function createBrowserSandbox(initialStorage = {}) {
   const intervals = new Map();
   let intervalIdCounter = 1;
 
-  // Authoritative global ID registry for document.getElementById
+  // Authoritative global ID registry for document.getElementById lookups
   const elements = new Map();
+  const observerCallbacks = [];
 
   function matchesSelector(el, sel) {
     if (sel.startsWith('#')) {
@@ -58,10 +65,31 @@ function createBrowserSandbox(initialStorage = {}) {
       const classes = (el.getAttribute('class') || '').split(/\s+/);
       return classes.includes(cls);
     }
+    if (sel.includes('[') && sel.includes('=')) {
+      const match = sel.match(/\[([a-zA-Z0-9\-_:]+)=(?:"([^"]*)"|'([^']*)'|([^\]]+))\]/);
+      if (match) {
+        const attrName = match[1];
+        const attrVal = match[2] || match[3] || match[4] || '';
+        return el.getAttribute(attrName) === attrVal;
+      }
+    }
     return el.tagName.toLowerCase() === sel.toLowerCase();
   }
 
   function findSelector(root, sel, singleOnly, results = []) {
+    const parts = sel.split(/\s+/).filter(Boolean);
+    if (parts.length > 1) {
+      let currentSet = [root];
+      for (const part of parts) {
+        const nextSet = [];
+        for (const node of currentSet) {
+          findSelector(node, part, false, nextSet);
+        }
+        currentSet = nextSet;
+      }
+      return singleOnly ? (currentSet[0] || null) : currentSet;
+    }
+
     for (const child of root.children) {
       if (matchesSelector(child, sel)) {
         if (singleOnly) return child;
@@ -73,30 +101,50 @@ function createBrowserSandbox(initialStorage = {}) {
     return singleOnly ? null : results;
   }
 
+  function notifyMutation(target, type, added = [], removed = []) {
+    for (const cb of observerCallbacks) {
+      cb([{ target, type, addedNodes: added, removedNodes: removed }]);
+    }
+  }
+
   function parseHTMLIntoChildren(parent, html) {
     if (!html || typeof html !== 'string') return;
-    const tagRegex = /<([a-zA-Z0-9\-]+)((?:\s+[^=>\s]+(?:=(?:"[^"]*"|'[^']*'|[^>\s]+))?)*)\s*(\/?)>/g;
-    let match;
-    while ((match = tagRegex.exec(html)) !== null) {
-      const tagName = match[1];
-      if (tagName.startsWith('/')) continue; // Skip closing tags
+    const tokens = html.match(/<[^>]+>|[^<]+/g) || [];
+    const stack = [parent];
+    const voidTags = new Set(['input', 'img', 'br', 'hr', 'meta', 'link']);
 
-      const attrString = match[2] || '';
-      const childEl = createMockElement(tagName);
+    for (const token of tokens) {
+      if (token.startsWith('</')) {
+        if (stack.length > 1) {
+          stack.pop();
+        }
+      } else if (token.startsWith('<') && !token.startsWith('<!--')) {
+        const match = token.match(/<([a-zA-Z0-9\-]+)([^>]*)>/);
+        if (!match) continue;
+        const tagName = match[1];
+        const attrString = match[2] || '';
+        const isSelfClosing = token.endsWith('/>') || voidTags.has(tagName.toLowerCase());
 
-      const attrRegex = /([a-zA-Z0-9\-_:]+)(?:=(?:"([^"]*)"|'([^']*)'|([^>\s]+)))?/g;
-      let attrMatch;
-      while ((attrMatch = attrRegex.exec(attrString)) !== null) {
-        const attrName = attrMatch[1];
-        const attrVal = attrMatch[2] !== undefined ? attrMatch[2]
-          : (attrMatch[3] !== undefined ? attrMatch[3]
-            : (attrMatch[4] !== undefined ? attrMatch[4] : ''));
-        childEl.setAttribute(attrName, attrVal);
-        if (attrName === 'value') childEl.value = attrVal;
-        if (attrName === 'checked') childEl.checked = true;
+        const childEl = createMockElement(tagName);
+        const attrRegex = /([a-zA-Z0-9\-_:]+)(?:=(?:"([^"]*)"|'([^']*)'|([^>\s]+)))?/g;
+        let attrMatch;
+        while ((attrMatch = attrRegex.exec(attrString)) !== null) {
+          const attrName = attrMatch[1];
+          const attrVal = attrMatch[2] !== undefined ? attrMatch[2]
+            : (attrMatch[3] !== undefined ? attrMatch[3]
+              : (attrMatch[4] !== undefined ? attrMatch[4] : ''));
+          childEl.setAttribute(attrName, attrVal);
+          if (attrName === 'value') childEl.value = attrVal;
+          if (attrName === 'checked') childEl.checked = true;
+        }
+
+        const currentParent = stack[stack.length - 1];
+        currentParent.appendChild(childEl);
+
+        if (!isSelfClosing) {
+          stack.push(childEl);
+        }
       }
-
-      parent.appendChild(childEl);
     }
   }
 
@@ -113,6 +161,19 @@ function createBrowserSandbox(initialStorage = {}) {
       },
       set(target, prop, val) {
         target[prop] = String(val);
+        if (prop === 'cssText') {
+          const decls = String(val).split(';');
+          for (const d of decls) {
+            const colon = d.indexOf(':');
+            if (colon !== -1) {
+              const k = d.slice(0, colon).trim();
+              const v = d.slice(colon + 1).trim();
+              const camelK = k.replace(/-([a-z])/g, (_, g) => g.toUpperCase());
+              target[camelK] = v;
+              target[k] = v;
+            }
+          }
+        }
         return true;
       }
     });
@@ -142,14 +203,57 @@ function createBrowserSandbox(initialStorage = {}) {
         }
       },
 
+      get className() {
+        return attributes.get('class') || '';
+      },
+      set className(val) {
+        attributes.set('class', String(val || ''));
+      },
+
+      get textContent() {
+        return _innerHTML.replace(/<[^>]*>?/gm, '');
+      },
+      set textContent(val) {
+        _innerHTML = String(val || '');
+      },
+
       get children() {
         return _children;
+      },
+
+      get firstElementChild() {
+        return _children[0] || null;
+      },
+
+      get previousElementSibling() {
+        if (!el.parentElement) return null;
+        const idx = el.parentElement.children.indexOf(el);
+        return idx > 0 ? el.parentElement.children[idx - 1] : null;
+      },
+
+      get nextElementSibling() {
+        if (!el.parentElement) return null;
+        const idx = el.parentElement.children.indexOf(el);
+        return idx !== -1 && idx < el.parentElement.children.length - 1 ? el.parentElement.children[idx + 1] : null;
       },
 
       appendChild(child) {
         _children.push(child);
         child.parentElement = el;
+        notifyMutation(el, 'childList', [child], []);
         return child;
+      },
+
+      insertBefore(newChild, refChild) {
+        const idx = _children.indexOf(refChild);
+        if (idx === -1) {
+          _children.push(newChild);
+        } else {
+          _children.splice(idx, 0, newChild);
+        }
+        newChild.parentElement = el;
+        notifyMutation(el, 'childList', [newChild], []);
+        return newChild;
       },
 
       remove() {
@@ -159,6 +263,7 @@ function createBrowserSandbox(initialStorage = {}) {
         if (el.parentElement) {
           const idx = el.parentElement.children.indexOf(el);
           if (idx !== -1) el.parentElement.children.splice(idx, 1);
+          notifyMutation(el.parentElement, 'childList', [], [el]);
           el.parentElement = null;
         }
       },
@@ -166,9 +271,8 @@ function createBrowserSandbox(initialStorage = {}) {
       setAttribute(k, v) {
         const strVal = String(v);
         attributes.set(k, strVal);
-        if (k.toLowerCase() === 'id') {
-          el.id = strVal;
-        }
+        if (k.toLowerCase() === 'id') el.id = strVal;
+        if (k.toLowerCase() === 'class') attributes.set('class', strVal);
       },
 
       getAttribute(k) {
@@ -179,14 +283,12 @@ function createBrowserSandbox(initialStorage = {}) {
       get innerHTML() {
         return _innerHTML;
       },
-
       set innerHTML(html) {
         _innerHTML = String(html || '');
-        for (const c of _children) {
-          c.remove();
-        }
+        for (const c of _children) c.remove();
         _children = [];
         parseHTMLIntoChildren(el, _innerHTML);
+        notifyMutation(el, 'childList', _children, []);
       },
 
       querySelector(sel) {
@@ -197,6 +299,10 @@ function createBrowserSandbox(initialStorage = {}) {
         const results = [];
         findSelector(el, sel, false, results);
         return results;
+      },
+
+      addEventListener(type, fn) {
+        el[`on${type}`] = fn;
       }
     };
 
@@ -214,10 +320,21 @@ function createBrowserSandbox(initialStorage = {}) {
     },
     getElementById(id) {
       return elements.get(id) || null;
+    },
+    querySelector(sel) {
+      if (documentMock.body && matchesSelector(documentMock.body, sel)) return documentMock.body;
+      return findSelector(documentMock.documentElement, sel, true);
+    },
+    querySelectorAll(sel) {
+      const results = [];
+      findSelector(documentMock.documentElement, sel, false, results);
+      return results;
     }
   };
 
-  // Mock unsafeWindow with page-level fetch
+  documentMock.documentElement.appendChild(documentMock.body);
+
+  // Mock unsafeWindow with page-level fetch implementation
   let originalPageFetch = async () => new Response("{}", { status: 200 });
 
   const unsafeWindowMock = {
@@ -236,7 +353,8 @@ function createBrowserSandbox(initialStorage = {}) {
     location: {
       reloaded: false,
       reload() { this.reloaded = true; }
-    }
+    },
+    requestAnimationFrame: (fn) => setTimeout(fn, 0)
   };
 
   const cryptoMock = {
@@ -246,16 +364,30 @@ function createBrowserSandbox(initialStorage = {}) {
 
   windowMock.crypto = cryptoMock;
 
- // Build isolated VM sandbox context
+  class MockMutationObserver {
+    constructor(callback) {
+      this.callback = callback;
+    }
+    observe() {
+      observerCallbacks.push(this.callback);
+    }
+    disconnect() {
+      const idx = observerCallbacks.indexOf(this.callback);
+      if (idx !== -1) observerCallbacks.splice(idx, 1);
+    }
+  }
+
+  // Build isolated VM sandbox context ensuring zero host pollution
   const sandbox = {
-    // Identity circularity
+    // Window identity references
     window: windowMock,
     unsafeWindow: unsafeWindowMock,
     document: documentMock,
     sessionStorage: windowMock.sessionStorage,
     location: windowMock.location,
+    requestAnimationFrame: windowMock.requestAnimationFrame,
 
-    // Web Standards
+    // Web Standard Interfaces
     Headers,
     Response,
     Request,
@@ -267,8 +399,9 @@ function createBrowserSandbox(initialStorage = {}) {
     URL,
 
     crypto: cryptoMock,
+    MutationObserver: MockMutationObserver,
 
-    // Timers
+    // Timer scheduling
     setInterval: (fn, ms) => {
       const id = intervalIdCounter++;
       intervals.set(id, { fn, ms });
@@ -281,7 +414,7 @@ function createBrowserSandbox(initialStorage = {}) {
     // Tampermonkey Sandbox APIs
     GM_getValue: (key, fallback) => storage.has(key) ? storage.get(key) : fallback,
     GM_setValue: (key, val) => { storage.set(key, val); },
-    GM_info: { script: { version: '4.2.1' } },
+    GM_info: { script: { version: '5.0.0' } },
     GM_xmlhttpRequest: (details) => {
       networkCalls.push(details);
     },
@@ -292,7 +425,7 @@ function createBrowserSandbox(initialStorage = {}) {
       error: () => {}
     },
 
-    // FATAL INVARIANT ASSERTIONS: Exterminate Host Leaks
+    // FATAL INVARIANT ASSERTIONS: Exterminate Node.js Host Leaks
     Buffer: undefined,
     process: undefined,
     require: undefined,
@@ -312,6 +445,11 @@ function createBrowserSandbox(initialStorage = {}) {
     triggerDOMInterval: () => {
       for (const { fn } of intervals.values()) {
         fn();
+      }
+    },
+    triggerObserverSync: () => {
+      for (const cb of observerCallbacks) {
+        cb([{ target: documentMock.body, type: 'childList', addedNodes: [documentMock.body], removedNodes: [] }]);
       }
     },
     setPageFetch: (fn) => { originalPageFetch = fn; }
@@ -415,28 +553,62 @@ test("Phase 6: UserScript Target Environment Verification (Tampermonkey Browser 
   // 4. ADMIN USERSCRIPT LIFECYCLE, CONTROL PANEL & TOKEN INJECTION IN BROWSER VM
   // ---------------------------------------------------------------------------
   await t.test("Admin Panel Lifecycle: Control panel mounting, token push, and client governance", async () => {
-    const { context, networkCalls, elements } = createBrowserSandbox({
+    const { context, networkCalls, triggerObserverSync } = createBrowserSandbox({
       approved: true,
       vps_host: 'https://vps.example.duckdns.org',
       admin_token: 'admin_secret_passkey_xyz',
       browser_id: 'b_admin_browser_123'
     });
 
+    // Seed DOM with navigation row and hamburger button
+    context.document.body.innerHTML = `
+      <div class="sc-1279ed83-12 vWKbz image-gen-nav-row" data-layout-bar="true">
+        <div style="flex: 0 0 auto;"></div>
+        <div style="flex: 0 0 auto;"></div>
+        <div style="flex: 0 0 auto;">
+          <div style="display:flex;">
+            <button aria-label="menu" class="sc-2f2fb315-2 sc-e97e72ff-0 eTBYIC gVyoTq">
+              <div class="sc-e95dc911-1 sc-e95dc911-184 bzvxUK gzJfeX"></div>
+            </button>
+          </div>
+        </div>
+      </div>
+      <div class="image-gen-footer">
+        <button class="sc-2f2fb315-2 sc-e15f0c15-0 eTBYIC YYeeL image-gen-generate-button">
+          <span>Generate 1 Image</span>
+        </button>
+      </div>
+    `;
+
     // Execute compiled admin bundle in sandbox
     vm.runInContext(adminCode, context);
+    triggerObserverSync();
 
-    // 1. Verify floating admin trigger button injected into documentElement
-    const adminBtn = context.document.documentElement.children.find(
+    // 1. Verify Nav Badge injected into nav row
+    const badgeBtn = context.document.getElementById('gw-nav-badge');
+    assert.ok(badgeBtn, "Nav Badge trigger button must be injected into nav row");
+    assert.strictEqual(typeof badgeBtn.onclick, 'function');
+
+    // Invariant: Verify old red float button has been eradicated
+    const legacyBtn = context.document.documentElement.children.find(
       c => c.tagName === 'BUTTON' && c.innerHTML === 'VPS CONTROL PANEL'
     );
-    assert.ok(adminBtn, "Admin float trigger button must be appended to documentElement");
-    assert.strictEqual(typeof adminBtn.onclick, 'function');
+    assert.strictEqual(legacyBtn, undefined, "Obsolete floating red button must be purged");
 
-    // 2. Click button to toggle admin panel modal
-    adminBtn.onclick();
+    // 2. Click badge button to toggle admin panel modal
+    badgeBtn.onclick({ preventDefault: () => {}, stopPropagation: () => {} });
 
     const panelModal = context.document.getElementById("vps-admin-panel");
-    assert.ok(panelModal, "Clicking trigger button must instantiate #vps-admin-panel");
+    assert.ok(panelModal, "Clicking badge button must instantiate #vps-admin-panel");
+
+    // Invariant: Modal styling must leverage NovelAI theme CSS variables
+    assert.match(panelModal.style.background, /--theme-bg0/, "Modal background must reference --theme-bg0");
+
+    // Assert sub-tabs exist
+    const governanceTab = panelModal.querySelector('#admin-tab-governance');
+    const settingsTab = panelModal.querySelector('#admin-tab-settings');
+    assert.ok(governanceTab, "Device Governance sub-tab must exist");
+    assert.ok(settingsTab, "Operator Settings sub-tab must exist");
 
     // Assert background fetch dispatched to retrieve device listings
     const devCall = networkCalls.find(c => c.url.includes('/admin/devices'));
@@ -495,21 +667,37 @@ test("Phase 6: UserScript Target Environment Verification (Tampermonkey Browser 
     const clientListContainer = context.document.getElementById("vps-client-list");
     assert.ok(clientListContainer, "#vps-client-list container must exist");
     assert.ok(clientListContainer.children.length > 0, "Client records must be rendered into container");
+
+    // 5. Test switching to Operator Settings sub-tab
+    settingsTab.onclick();
+    const debugCheckbox = panelModal.querySelector('#settings-debug');
+    assert.ok(debugCheckbox, "Operator settings must render debug toggle");
+    const nickInput = panelModal.querySelector('#settings-nickname');
+    assert.ok(nickInput, "Operator settings must render nickname input");
   });
 
   // ---------------------------------------------------------------------------
-  // 5. CHANNEL A GENERATION INTERCEPTION, QUEUE POLL, AND WAF HEADER SHIELD
+  // 5. CHANNEL A GENERATION INTERCEPTION, BUTTON SHIELD, AND TOTAL TOAST ERADICATION
   // ---------------------------------------------------------------------------
-  await t.test("Channel A Interception: Queue join, status poll, WAF header scrubbing, and stream piping", async () => {
-    const { context, networkCalls } = createBrowserSandbox({
+  await t.test("Channel A Interception: Queue join, status poll, button shield text, and total toast eradication", async () => {
+    const { context, networkCalls, triggerObserverSync } = createBrowserSandbox({
       approved: true,
       vps_host: 'https://vps.example.duckdns.org',
       device_secret: 's_test_secret_123',
       browser_id: 'b_test_browser_123'
     });
 
+    context.document.body.innerHTML = `
+      <div class="image-gen-footer">
+        <button class="image-gen-generate-button">
+          <span>Generate 1 Image</span>
+        </button>
+      </div>
+    `;
+
     // Boot compiled guest bundle
     vm.runInContext(guestCode, context);
+    triggerObserverSync();
 
     // Dispatch generation request from page context
     const fetchPromise = vm.runInContext(`
@@ -534,7 +722,7 @@ test("Phase 6: UserScript Target Environment Verification (Tampermonkey Browser 
     assert.strictEqual(networkCalls.length, 1);
     const joinCall = networkCalls[0];
     assert.strictEqual(joinCall.url, 'https://vps.example.duckdns.org/queue/join');
-    assert.strictEqual(joinCall.headers['x-script-version'], '4.2.1');
+    assert.strictEqual(joinCall.headers['x-script-version'], '5.0.0');
     const joinBody = JSON.parse(joinCall.data);
     assert.strictEqual(joinBody.browser_id, 'b_test_browser_123');
     assert.ok(joinBody.req_id.startsWith('req_'));
@@ -553,12 +741,19 @@ test("Phase 6: UserScript Target Environment Verification (Tampermonkey Browser 
     // Simulate "waiting" status
     pollCall1.onload({ status: 200, responseText: '{"status":"waiting","position":2}' });
 
-    // Yield microtasks to allow status update handler to mount the DOM banner
+    // Yield microtasks to allow status update handler to execute
     await new Promise(r => setTimeout(r, 20));
 
-    const banner = context.document.getElementById("vps-queue-banner");
-    assert.ok(banner, "HUD banner must be mounted during queue waiting state");
-    assert.match(banner.innerHTML, /Queue Position: 2/, "Banner must reflect queue position telemetry");
+    // INVARIANT: Floating toast element must be completely absent from the DOM
+    const floatingBanner = context.document.getElementById("vps-queue-banner");
+    assert.strictEqual(floatingBanner, null, "Redundant floating #vps-queue-banner toast must be completely eradicated");
+
+    // INVARIANT: Button shield overlay must be active and displaying the queue position
+    const shield = context.document.getElementById("gw-button-shield");
+    const shieldText = context.document.getElementById("gw-shield-text");
+    assert.ok(shield, "Button shield must mount inside the generate button");
+    assert.strictEqual(shield.style.display, 'flex', "Button shield must be visible in waiting state");
+    assert.strictEqual(shieldText.textContent, 'Queue Position: 2', "Button shield must reflect queue position telemetry");
 
     // Yield for next polling cycle
     await new Promise(r => setTimeout(r, 1050));
@@ -818,5 +1013,196 @@ test("Phase 6: UserScript Target Environment Verification (Tampermonkey Browser 
       // 3. Node.js Isolation: Asserts no leaked require() calls
       assert.doesNotMatch(bodyContent, /\brequire\s*\(/, `Artifact ${target.name} contains leaked require() calls`);
     }
+  });
+
+  // 12. DYNAMIC CLASS-SCRAPING HARVESTER HELL PATH (NAV BADGE & FLEX INTEGRITY)
+  await t.test("Class-Scraping Harvester: Injects Nav Badge into .image-gen-nav-row without flex distortion", () => {
+    const { context, triggerObserverSync } = createBrowserSandbox({
+      approved: true,
+      vps_host: 'https://vps.example.duckdns.org',
+      device_secret: 's_test_secret_123',
+      browser_id: 'b_test_browser_123'
+    });
+
+    context.document.body.innerHTML = `
+      <div class="sc-1279ed83-12 vWKbz image-gen-nav-row" data-layout-bar="true">
+        <div style="flex: 0 0 auto;"></div>
+        <div style="flex: 0 0 auto;"></div>
+        <div style="flex: 0 0 auto;">
+          <div style="display:flex;">
+            <button aria-label="menu" class="sc-2f2fb315-2 sc-e97e72ff-0 eTBYIC gVyoTq">
+              <div class="sc-e95dc911-1 sc-e95dc911-184 bzvxUK gzJfeX"></div>
+            </button>
+          </div>
+        </div>
+      </div>
+    `;
+
+    vm.runInContext(guestCode, context);
+    triggerObserverSync();
+
+    const badgeBtn = context.document.getElementById('gw-nav-badge');
+    assert.ok(badgeBtn, "Must inject #gw-nav-badge into navigation row");
+    assert.strictEqual(badgeBtn.className, "sc-2f2fb315-2 sc-e97e72ff-0 eTBYIC gVyoTq");
+
+    const badgeIconDiv = badgeBtn.querySelector('div');
+    assert.ok(badgeIconDiv);
+    // Invariant: Must NOT copy iconClasses to avoid rendering the native hamburger icon mask
+    assert.strictEqual(badgeIconDiv.className, '', "Inner container must not inherit native icon mask classes");
+
+    const menuBtn = context.document.querySelector('button[aria-label="menu"]');
+    assert.strictEqual(badgeBtn.nextElementSibling, menuBtn);
+  });
+
+  // ---------------------------------------------------------------------------
+  // 13. AUTONOMOUS ALLOWANCE BAR RENDERING VIA NOVELAI CSS VARIABLES
+  // ---------------------------------------------------------------------------
+  await t.test("Autonomous Allowance Bar: Mounts cleanly using NovelAI CSS variables without requiring native Opus bar", () => {
+    const { context, triggerObserverSync } = createBrowserSandbox({
+      approved: true,
+      vps_host: 'https://vps.example.duckdns.org',
+      device_secret: 's_test_secret_123',
+      browser_id: 'b_test_browser_123'
+    });
+
+    // Seed DOM WITHOUT any native Opus bar present
+    context.document.body.innerHTML = `
+      <div class="image-gen-footer">
+        <button class="image-gen-generate-button">
+          <span>Generate 1 Image</span>
+        </button>
+      </div>
+    `;
+
+    vm.runInContext(guestCode, context);
+    triggerObserverSync();
+
+    const allowanceBar = context.document.getElementById('gw-allowance-bar');
+    assert.ok(allowanceBar, "Must mount #gw-allowance-bar autonomously");
+    
+    // Invariant: CSS variables must be referenced in inline styles
+    assert.match(allowanceBar.style.backgroundColor, /--theme-bg0/, "Allowance bar must use --theme-bg0");
+    assert.match(allowanceBar.style.border, /--theme-bg2/, "Allowance bar border must use --theme-bg2");
+
+    const genBtn = context.document.querySelector('.image-gen-generate-button');
+    assert.strictEqual(allowanceBar.nextElementSibling, genBtn, "Allowance bar must precede the Generate button");
+  });
+
+  // ---------------------------------------------------------------------------
+  // 14. GENERATE BUTTON SHIELD OVERLAY: TOTAL OCCLUSION HELL PATH (NO TEXT COLLISION)
+  // ---------------------------------------------------------------------------
+  await t.test("Generate Button Shield: Enforces total occlusion of native siblings (visibility: hidden) during active queue state", () => {
+    const { context, triggerObserverSync } = createBrowserSandbox({
+      approved: true,
+      vps_host: 'https://vps.example.duckdns.org',
+      device_secret: 's_test_secret_123',
+      browser_id: 'b_test_browser_123'
+    });
+
+    context.document.body.innerHTML = `
+      <div class="image-gen-footer">
+        <button class="sc-2f2fb315-2 sc-e15f0c15-0 eUAGgg YYeeL image-gen-generate-button">
+          <span class="native-label">Generate 1 Image</span>
+          <div class="native-anlas-container"><span>0 Anlas</span></div>
+        </button>
+      </div>
+    `;
+
+    vm.runInContext(guestCode, context);
+    triggerObserverSync();
+
+    const genBtn = context.document.querySelector('.image-gen-generate-button');
+    const nativeSpan = genBtn.querySelector('.native-label');
+    const nativeAnlas = genBtn.querySelector('.native-anlas-container');
+    const shield = context.document.getElementById('gw-button-shield');
+    const shieldText = context.document.getElementById('gw-shield-text');
+
+    assert.ok(shield, "Button shield must mount inside the generate button");
+    
+    // Invariant: Shield must NOT inherit the button's class hashes to prevent style bleeding
+    assert.strictEqual(shield.className, '', "Shield overlay must not inherit .image-gen-generate-button class");
+
+    // Invariant: Initial idle state verification
+    assert.strictEqual(shield.style.display, 'none');
+    assert.strictEqual(shield.style.pointerEvents, 'none');
+    assert.strictEqual(nativeSpan.style.visibility, '', "Native label must be visible initially");
+    assert.strictEqual(nativeAnlas.style.visibility, '', "Native anlas badge must be visible initially");
+
+    // ACTIVATE QUEUE STATE: Simulate turn acquisition in progress
+    const setQueueShieldState = vm.runInContext(`
+      (active, text) => {
+        const shield = document.getElementById('gw-button-shield');
+        const labelText = document.getElementById('gw-shield-text');
+        const genBtn = shield.parentElement;
+        if (genBtn) {
+          for (const child of genBtn.children) {
+            if (child !== shield) {
+              child.style.visibility = active ? 'hidden' : '';
+            }
+          }
+        }
+        if (active) {
+          labelText.textContent = text;
+          shield.style.display = 'flex';
+          shield.style.pointerEvents = 'all';
+        } else {
+          shield.style.display = 'none';
+          shield.style.pointerEvents = 'none';
+        }
+      }
+    `, context);
+
+    setQueueShieldState(true, 'Acquiring channel slot...');
+
+    // INVARIANT: Native siblings MUST be hidden to eradicate text superposition
+    assert.strictEqual(nativeSpan.style.visibility, 'hidden', "Native button text must be set to visibility: hidden");
+    assert.strictEqual(nativeAnlas.style.visibility, 'hidden', "Native anlas container must be set to visibility: hidden");
+    assert.strictEqual(shield.style.display, 'flex');
+    assert.strictEqual(shieldText.textContent, 'Acquiring channel slot...');
+
+    // DEACTIVATE QUEUE STATE: Simulate completion
+    setQueueShieldState(false, '');
+
+    // INVARIANT: Native siblings MUST be restored to visible
+    assert.strictEqual(nativeSpan.style.visibility, '', "Native button text must be restored to visible");
+    assert.strictEqual(nativeAnlas.style.visibility, '', "Native anlas container must be restored to visible");
+    assert.strictEqual(shield.style.display, 'none');
+  });
+
+  // ---------------------------------------------------------------------------
+  // 15. DEPRECATED SETTINGS TAB QUARANTINE
+  // ---------------------------------------------------------------------------
+  await t.test("Settings Modal Quarantine: Asserts Gateway Coordinator tab is NOT injected into NovelAI user settings modal", () => {
+    const { context, triggerObserverSync } = createBrowserSandbox({
+      approved: true,
+      vps_host: 'https://vps.example.duckdns.org',
+      device_secret: 's_test_secret_123',
+      browser_id: 'b_test_browser_123'
+    });
+
+    // Native NovelAI user settings modal opens
+    context.document.body.innerHTML = `
+      <div role="dialog" class="modal modal-large">
+        <div class="settings-sidebar">
+          <div style="margin-bottom: auto">
+            <button class="sc-tab sc-inactive tab-image">Image Generation</button>
+            <button class="sc-tab sc-active tab-account">Account</button>
+          </div>
+        </div>
+        <div class="settings-content">
+          <div class="native-account-settings">Account Form</div>
+        </div>
+      </div>
+    `;
+
+    vm.runInContext(guestCode, context);
+    triggerObserverSync();
+
+    // INVARIANT: Redundant tab must NOT exist in the DOM
+    const customTab = context.document.getElementById('gw-settings-tab');
+    assert.strictEqual(customTab, null, "Gateway Coordinator tab must NOT be injected into settings sidebar");
+
+    const customContent = context.document.getElementById('gw-settings-content');
+    assert.strictEqual(customContent, null, "Custom settings panel must NOT be mounted into native settings modal");
   });
 });
