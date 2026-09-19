@@ -1,6 +1,7 @@
 /**
  * LEVEL 4: QUEUE ROUTER (routes/queueRouter.js)
  * Coordinates single-concurrency Channel A locks and FIFO queue positions.
+ * Relational Normalization: Enforces concurrency and allowance checks on canonical user_id.
  */
 
 'use strict';
@@ -33,12 +34,13 @@ router.post('/join', async (req, res) => {
 
     const tierConfig = config.TIER_CONFIGS[device.priority_tier];
     if (tierConfig && tierConfig.maxAllowance !== Infinity) {
-      const allowance = await auditEngine.getOrUpdateAllowance(browser_id, device.priority_tier, false);
+      // Evaluate allowance against canonical user_id (shared pool across all user devices)
+      const allowance = await auditEngine.getOrUpdateAllowance(device.user_id, device.priority_tier, false);
       if (allowance < 1) {
-        console.warn(`[VPS Session Guard] User ${browser_id} allowance depleted.`);
+        console.warn(`[VPS Session Guard] User "${device.user_id}" (Device: ${browser_id}) allowance depleted.`);
         return res.status(403).json({ statusCode: 403, error: 'ALLOWANCE_EXHAUSTED' });
       }
-      console.log(`[VPS Session Check] Browser ${browser_id} verified with ${allowance} remaining tokens.`);
+      console.log(`[VPS Session Check] User "${device.user_id}" verified with ${allowance} remaining tokens.`);
     }
 
     queueManager.join({
@@ -46,7 +48,7 @@ router.post('/join', async (req, res) => {
       tab_id,
       req_id,
       priority_tier: device.priority_tier,
-      discord_id: device.discord_id
+      user_id: device.user_id
     });
 
     res.json({ success: true });

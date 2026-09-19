@@ -3,6 +3,7 @@
  * 
  * Enforces strict req.pause() Stream Safety before executing database transactions.
  * Orchestrates payload WAF buffering, upstream piping, and asynchronous security auditing.
+ * Relational Normalization: Deducts allowances, charges Anlas, and evaluates bans against canonical user_id.
  */
 
 'use strict';
@@ -105,7 +106,7 @@ router.all('/:subdomain/{*splat}', async (req, res) => {
   res.on('finish', executeCleanup);
 
   try {
-    // Authoritative Centralized Verification Gate
+    // Authoritative Centralized Verification Gate: Resolves canonical user identity
     const auth = await auditEngine.verifyDevice(browserId, deviceSecret, { requireApproval: true });
     if (!auth.ok) {
       return sendEarlyError(auth.status, { error: auth.error });
@@ -268,11 +269,7 @@ router.all('/:subdomain/{*splat}', async (req, res) => {
           if (isImageGen && deviceSecret !== config.ADMIN_SECRET_KEY) {
             const auditResult = await auditEngine.runBackgroundAudit(browserId, payloadBuffer, genModelHeader === 'V5');
             if (auditResult && auditResult.banned) {
-              if (auditResult.discordId) {
-                queueManager.evict({ discord_id: auditResult.discordId });
-              } else {
-                queueManager.evict({ browser_id: auditResult.browserId });
-              }
+              queueManager.evict({ user_id: auditResult.userId });
             }
           }
         } catch (err) {
@@ -321,8 +318,9 @@ router.all('/:subdomain/{*splat}', async (req, res) => {
         if (upstreamRes.statusCode === 200 && isImageGen && tierConfig && tierConfig.maxAllowance !== Infinity) {
           setImmediate(async () => {
             try {
-              const remaining = await auditEngine.getOrUpdateAllowance(browserId, device.priority_tier, true);
-              console.log(`[VPS Audit Ledger] Deducted 1 token for "${browserId}" (${device.priority_tier}). Remaining balance: ${remaining}`);
+              // Deduct allowance from canonical user_id (affects all user devices synchronously)
+              const remaining = await auditEngine.getOrUpdateAllowance(device.user_id, device.priority_tier, true);
+              console.log(`[VPS Audit Ledger] Deducted 1 token for User "${device.user_id}" (${device.priority_tier}). Remaining balance: ${remaining}`);
             } catch (err) {
               console.error('[VPS Audit] Failed to deduct metered token:', err);
             }

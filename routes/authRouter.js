@@ -1,6 +1,7 @@
 /**
  * LEVEL 4: AUTHENTICATION ROUTER (routes/authRouter.js)
  * Manages device registration, nicknames, client authorization queries, and in-band diagnostic intent signaling.
+ * Relational Normalization: Integrates canonical users and physical devices tables.
  */
 
 'use strict';
@@ -20,11 +21,25 @@ function getConfig() {
 router.post('/register', async (req, res) => {
   const { browser_id, device_secret, label } = req.body;
   if (!browser_id || !device_secret) return res.status(400).json({ error: 'Bad parameters' });
+  
   try {
+    const now = Date.now();
+    // 1. Ensure canonical unlinked user principal exists
     await run(
-      'INSERT OR IGNORE INTO devices (browser_id, device_secret, label, priority_tier, approved, banned, anlas_consumed, total_requests, last_active_at, metered_allowance, last_allowance_update_at) VALUES (?, ?, ?, ?, 0, 0, 0, 0, ?, 100, ?)',
-      [browser_id, device_secret, label || 'Guest Instance', 'Normal', Date.now(), Date.now()]
+      `INSERT OR IGNORE INTO users (
+        user_id, priority_tier, banned, anlas_consumed, metered_allowance, last_allowance_update_at
+      ) VALUES (?, 'Normal', 0, 0, 100, ?)`,
+      [browser_id, now]
     );
+
+    // 2. Register hardware device pointing to initial self user_id
+    await run(
+      `INSERT OR IGNORE INTO devices (
+        browser_id, user_id, device_secret, label, approved, total_requests, last_active_at
+      ) VALUES (?, ?, ?, ?, 0, 0, ?)`,
+      [browser_id, browser_id, device_secret, label || 'Guest Instance', now]
+    );
+
     res.json({ success: true });
   } catch (err) { 
     console.error('[VPS Telemetry] Registration exception:', err);
@@ -109,13 +124,14 @@ router.get('/status', async (req, res) => {
     if (!auth.ok) {
       return res.status(auth.status).json({ error: auth.error });
     }
-    const row = auth.device;
+    const device = auth.device;
 
     let allowanceInfo = null;
-    const tierConfig = config.TIER_CONFIGS[row.priority_tier];
+    const tierConfig = config.TIER_CONFIGS[device.priority_tier];
     if (tierConfig && tierConfig.maxAllowance !== Infinity) {
-      const allowance = await auditEngine.getOrUpdateAllowance(browser_id, row.priority_tier, false);
-      const nextRefillAt = await auditEngine.getNextRefillTime(browser_id, row.priority_tier);
+      // Evaluate allowance against canonical user_id (shared pool across all user devices)
+      const allowance = await auditEngine.getOrUpdateAllowance(device.user_id, device.priority_tier, false);
+      const nextRefillAt = await auditEngine.getNextRefillTime(device.user_id, device.priority_tier);
       allowanceInfo = {
         allowance,
         max: tierConfig.maxAllowance,
@@ -124,18 +140,21 @@ router.get('/status', async (req, res) => {
     }
 
     let linkedDevices = [];
-    if (row.discord_id && row.discord_id !== 'admin') {
-      const devices = await all('SELECT browser_id, label FROM devices WHERE discord_id = ? AND approved = 1', [row.discord_id]);
+    if (device.user_id && device.user_id !== 'admin') {
+      const devices = await all(
+        'SELECT browser_id, label FROM devices WHERE user_id = ? AND approved = 1', 
+        [device.user_id]
+      );
       linkedDevices = devices.map(d => ({ id: d.browser_id, label: d.label }));
     }
 
     const debugInfo = queueManager.getDebugTargetInfo(browser_id);
 
     res.json({ 
-      approved: !!row.approved, 
-      tier: row.priority_tier,
-      anlas_consumed: row.anlas_consumed || 0,
-      precise_limit: config.TIER_CONFIGS[row.priority_tier]?.preciseLimit === Infinity ? "Unlimited" : (config.TIER_CONFIGS[row.priority_tier]?.preciseLimit ?? 0),
+      approved: !!device.approved, 
+      tier: device.priority_tier,
+      anlas_consumed: device.anlas_consumed || 0,
+      precise_limit: config.TIER_CONFIGS[device.priority_tier]?.preciseLimit === Infinity ? "Unlimited" : (config.TIER_CONFIGS[device.priority_tier]?.preciseLimit ?? 0),
       session: allowanceInfo,
       linked_devices: linkedDevices,
       master_v5_percent: req.telemetry?.percent ?? 100,
