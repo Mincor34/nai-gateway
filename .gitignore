@@ -8,6 +8,11 @@ jspm_packages/
 *.db-shm
 *.db-wal
 data.db
+staging_data.db
+
+# Test sandboxes and ephemeral directories
+test/sandbox_*/
+test/*.db*
 
 # Environment configuration overrides (if added later)
 .env

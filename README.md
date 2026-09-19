@@ -1,6 +1,6 @@
 # GuildWeave (nai-gateway)
 
-A single-concurrency transaction queue and split-token reverse proxy designed to coordinate a shared, paid NovelAI Opus-tier session across a verified user group without exposing the master account credentials.
+A single-concurrency transaction queue and split-token reverse proxy designed to coordinate a shared, paid NovelAI Opus-tier session across a verified user group without exposing master account credentials.
 
 ## 1. System Architecture
 
@@ -26,7 +26,7 @@ A single-concurrency transaction queue and split-token reverse proxy designed to
 
 ### Key Security Safeguards
 * **Split-Token Execution Isolation:** Guests authenticate locally using their own free accounts. Cryptographic keystores, settings, and profile payloads bypass the VPS and connect natively to NovelAI.
-* **Request Buffer Accumulation (WAF Shield):** Incoming generation settings are fully buffered in memory on the VPS before being forwarded. This dynamically recalculates and hardcodes the `Content-Length` header, stripping any conflicting client-side headers to prevent HTTP Request Smuggling blocks from upstream security layers (Cloudflare WAF).
+* **Request Buffer Accumulation (WAF Shield):** Incoming generation settings are fully buffered in memory on the VPS before being forwarded. This dynamically recalculates and hardcodes the `Content-Length` header, stripping conflicting client-side headers to prevent HTTP Request Smuggling blocks from upstream security layers (Cloudflare WAF).
 * **Parametric Payload Firewall:** The proxy restricts incoming generation parameters strictly to $1024 \times 1024$ (1MP) total resolution, a maximum of 28 steps, and single-image generation to prevent unauthorized consumption of premium resources.
 * **SSRF Target Validation:** Subdomains are strictly whitelisted (`api`, `image`, `text`). Wildcard paths are constrained strictly to verified endpoints.
 * **Channel B Concurrency Limits:** Non-blocking text generation requests are fast-tracked through a separate shared lock channel restricted to `3` concurrent slots.
@@ -118,7 +118,7 @@ A single-concurrency transaction queue and split-token reverse proxy designed to
 
 **Never expose the Express application directly to the public internet on ports 3000 or 3001.** You must run a front-facing reverse proxy to enforce HTTPS and protect client authorization headers from eavesdropping.
 
-### Option A: Caddy (Highly Recommended)
+### Caddy Configuration
 Caddy automatically provisions, configures, and renews Let's Encrypt SSL certificates out-of-the-box with minimal overhead.
 
 Edit your system Caddy configuration file (`/etc/caddy/Caddyfile`):
@@ -161,65 +161,83 @@ your-staging-domain.duckdns.org {
 ```
 Restart Caddy: `systemctl restart caddy`
 
-
 ---
 
-## 4. Client UserScript Installation
+## 4. Client UserScript Architecture & Compilation
 
-Guests and administrators must install their respective browser scripts using Tampermonkey.
+The client scripts are authored as modular ES modules located in `src/userscripts/` and bundled into standalone browser IIFE distributions using `esbuild`.
 
-### Setup Instructions
+### Directory Structure
+```
+src/userscripts/
+├── admin/
+│   └── index.js         # Admin panel UI, token management, and account governance
+├── guest/
+│   └── index.js         # Guest HUD, allowance visualizer, and queue poller
+└── shared/
+    ├── crypto.js        # Web Crypto RFC 4122 v4 UUID generator (no hyphens)
+    ├── interceptor.js   # unsafeWindow.fetch hijacking & streaming pipeline
+    ├── network.js       # Privileged GM_xmlhttpRequest transport & stream decoders
+    ├── params.js        # Pure browser payload parameter extractor
+    └── ui.js            # HUD status banners and warning badges
+```
 
+### Compiling Client Scripts
+**Never edit `UserScripts/*.user.js` directly.** Modify the source files under `src/userscripts/` and execute the build task:
+
+```bash
+npm run build
+```
+
+This compiles the ES module tree into the production artifacts:
+* `UserScripts/nai-admin.user.js`
+* `UserScripts/nai-guest.user.js`
+
+*Note: Running `npm test` triggers `npm run build` automatically via the `pretest` lifecycle hook.*
+
+### Tampermonkey Installation
 1. **Install Tampermonkey** in the target browser.
-2. **Install Scripts:**
-   * **Guest Script:** Install `UserScripts/nai-guest.user.js` on guest browsers.
-   * **Admin Script:** Install `UserScripts/nai-admin.user.js` on your own administrator browser.
-3. **Change VPS URL Target:**
-   Open the installed scripts inside the Tampermonkey editor and modify the `VPS_HOST` variable to point to your respective production or staging domain:
-   ```javascript
-   const VPS_HOST = 'https://your-domain.duckdns.org';
-   ```
+2. **Install Compiled Scripts:**
+   * **Guest Users:** Install `UserScripts/nai-guest.user.js`.
+   * **Admin Users:** Install `UserScripts/nai-admin.user.js`.
+3. **Configure VPS Target:**
+   On initial page boot, the embedded setup wizard will appear. Enter your gateway domain (`https://your-domain.duckdns.org`) and your passkey/nickname.
 
 ---
 
 ## 5. Split-Token Authentication & Spoofing Flow
 
-Guests log in natively with their own personal, free NovelAI accounts. All profile loading, story database reads, settings updates, and cryptographic E2EE decryption occur natively on their own local accounts. The UserScript interceptor tricks the local Single Page Application (SPA) into unlocking premium generation interfaces, while the VPS proxy transparently swaps their personal tokens for the master paid token exclusively on outgoing generation requests.
+Guests log in natively with their own personal, free NovelAI accounts. All profile loading, story database reads, settings updates, and cryptographic E2EE decryption occur natively on their own local accounts. The UserScript interceptor tricks the local Single Page Application (SPA) into unlocking premium generation interfaces, while the VPS proxy transparently swaps personal tokens for the master paid token exclusively on outgoing generation requests.
 
 ### The Administrator Flow
-1. **Admin Key Entry:** Press `Ctrl + Shift + A` on the NovelAI interface to set and save your administrator API secret.
+1. **Admin Key Entry:** Press `Ctrl + Shift + A` on the NovelAI interface (or use the Setup Wizard) to set and save your administrator API secret.
 2. **Admin UI Access:** Click the red "VPS CONTROL PANEL" floating action button.
 3. **Approve/Revoke with Priority Assignment:**
-   * *Approve:* Click "Approve" next to a pending device and assign a **Priority Tier** (`Low`, `Normal`, `High`, `Admin`).
-   * *Revoke:* Revoking deletes the validation record in SQLite. The guest's next proxied request will fail with an HTTP 401, wiping their approved status and blocking the UI.
-4. **Manual Token Push:** Input the paid master account's Bearer token and click "PUSH TO VPS STORAGE". This updates the master Bearer session key on the SQLite database securely.
+   * *Approve:* Click "Approve" next to a pending device and assign a **Priority Tier** (`Metered`, `Low`, `Normal`, `High`, `Admin`).
+   * *Revoke:* Revoking de-authorizes the device in SQLite. The guest's next proxied request will fail with an HTTP 401, restoring their setup lock.
+4. **Manual Token Push:** Input the paid master account's Bearer token and click "PUSH TO VPS STORAGE". This updates the master session key in SQLite securely.
 
 ---
 
 ## 6. Maintenance & Troubleshooting
 
 ### Viewing Server Diagnostics
-Centralized telemetry is printed to standard output in real-time. Use the PM2 CLI utility to trace incoming traffic and exceptions, specifying the process target:
+Centralized telemetry is printed to standard output in real-time. Use the PM2 CLI utility to trace incoming traffic and exceptions:
 
-* **Production Telemetry Logs:**
-  ```bash
-  pm2 logs nai-gateway-prod
-  ```
-* **Staging Telemetry Logs:**
-  ```bash
-  pm2 logs nai-gateway-staging
-  ```
+```bash
+# Production Telemetry Logs
+pm2 logs nai-gateway-prod
 
-Every request, database query, and proxy event is logged to standard output using the `[VPS Telemetry]` prefix.
+# Staging Telemetry Logs
+pm2 logs nai-gateway-staging
+```
 
 ### Troubleshooting Upstream Exceptions
-
-If PM2 outputs a log like:
-`[VPS Telemetry] Upstream connection socket exception occurred: Error: socket hang up` with code `ECONNRESET`
+If PM2 outputs `[VPS Telemetry] Upstream connection socket exception occurred: Error: socket hang up` with code `ECONNRESET`:
 
 1. **Verify Outbound Connectivity:** Ensure your VPS outbound port `443` is not restricted by cloud security lists.
-2. **Verify Session Token Integrity:** Cloudflare (which protects NovelAI) will forcefully drop connection sockets with a TCP reset (`ECONNRESET`) if your master token is expired, invalid, or malformed. Extract a fresh Bearer token from a paid Opus-tier account and push it to VPS storage via the control panel.
-3. **Trace Sandbox Violations:** If the client receives a status code error, the userscript normalizer intercepts raw exceptions and outputs the raw text received from the server directly to the console (`[Nai-Guest] Telemetry: Received raw error text:`), allowing you to pinpoint the exact reason for the failure.
+2. **Verify Session Token Integrity:** Cloudflare will forcefully drop connection sockets with a TCP reset (`ECONNRESET`) if your master token is expired, invalid, or malformed. Extract a fresh Bearer token from a paid Opus-tier account and push it to VPS storage via the control panel.
+3. **Trace Sandbox Violations:** If the client receives a status code error, the userscript normalizer intercepts raw exceptions and outputs the text directly to the browser console (`[VPS Gateway] Telemetry: Received raw error text:`).
 
 ### Recovering Hung Slots
-The server executes an automated TTL sweep every 5 seconds. In the event of a client freeze, the active generation lock will self-terminate after exactly 75 seconds, processing the next queued request automatically.
+The server executes an automated TTL sweep every 5 seconds. In the event of a client crash or tab closure, active image generation locks self-terminate after 75 seconds, promoting the next queued task automatically.

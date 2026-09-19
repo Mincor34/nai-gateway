@@ -4,6 +4,8 @@
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
+    "build": "node scripts/build-userscripts.js",
+    "pretest": "npm run build",
     "test": "node --test test/*.test.js"
   },
   "keywords": [
@@ -18,5 +20,8 @@
   "dependencies": {
     "express": "^5.2.1",
     "sqlite3": "^5.1.7"
+  },
+  "devDependencies": {
+    "esbuild": "^0.20.0"
   }
 }
