@@ -4,13 +4,15 @@ const path = require('path');
 
 const OUT_DIR = path.join(__dirname, '..', 'UserScripts');
 
-// TODO: Consider Github Releases instead of committing build artifacts to the repository.
+// TODO: Add warning to not edit the built files directly.
 // TODO: Versioning and metadata don't belong in the build script.
 
+// UserScript metadata banners for Tampermonkey
+// Adhere to SemVer versioning for the @version field
 const adminBanner = `// ==UserScript==
-// @name         NovelAI Split-Token Gateway Coordinator (Admin Panel)
+// @name         GuildWeave Gateway (Admin)
 // @namespace    http://tampermonkey.net/
-// @version      4.4.0
+// @version      5.0.0
 // @description  Secure administration panel, telemetry dashboard, bilateral debug coordinator, and session token injector
 // @author       Minco
 // @match        https://novelai.net/*
@@ -25,9 +27,9 @@ const adminBanner = `// ==UserScript==
 // ==/UserScript==\n`;
 
 const guestBanner = `// ==UserScript==
-// @name         NovelAI Split-Token Gateway Coordinator (Guest)
+// @name         GuildWeave Gateway
 // @namespace    http://tampermonkey.net/
-// @version      4.4.0
+// @version      5.0.0
 // @description  FIFO queue coordination, rolling allowance telemetry visualization, and background stream proxy pipeline
 // @author       Minco
 // @match        https://novelai.net/*
