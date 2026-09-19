@@ -1,6 +1,7 @@
 /**
  * LEVEL 4: ADMINISTRATIVE ROUTER (routes/adminRouter.js)
  * Isolates all privileged control panel, Discord bot, and management interactions.
+ * Relational Normalization: Operates on canonical users as parents and devices as children.
  */
 
 'use strict';
@@ -35,70 +36,67 @@ router.use(verifyAdmin);
 router.get('/devices', async (req, res) => {
   const config = getConfig();
   try { 
-    const rows = await all('SELECT * FROM devices');
+    const users = await all('SELECT * FROM users');
+    const devices = await all('SELECT * FROM devices');
+    
     const groups = {};
-    for (const row of rows) {
-      const key = row.discord_id || `unlinked:${row.browser_id}`;
-      const lastActive = queueManager.getLastActive(row.browser_id) || row.last_active_at || 0;
-      const isOnline = queueManager.isDeviceOnline(row.browser_id);
-      const debugInfo = queueManager.getDebugTargetInfo(row.browser_id);
-      
+    for (const u of users) {
+      const isLinked = !u.user_id.startsWith('b_');
       let meteredAllowance = null;
-      const tierConfig = config.TIER_CONFIGS[row.priority_tier];
+      const tierConfig = config.TIER_CONFIGS[u.priority_tier];
       if (tierConfig && tierConfig.maxAllowance !== Infinity) {
-        meteredAllowance = await getOrUpdateAllowance(row.browser_id, row.priority_tier, false);
+        meteredAllowance = await getOrUpdateAllowance(u.user_id, u.priority_tier, false);
       }
-      
-      if (!groups[key]) {
-        groups[key] = {
-          discord_id: row.discord_id || null,
-          discord_username: row.discord_username || (row.discord_id ? `User (${row.discord_id.substring(0, 6)})` : "Unlinked Device"),
-          priority_tier: row.priority_tier,
-          approved: row.approved,
-          banned: row.banned,
-          anlas_consumed: 0,
-          total_requests: 0,
-          last_active_at: 0,
-          is_online: false,
-          has_debug_intent: false,
-          has_debug_authorized: false,
-          devices: []
-        };
-      }
-      
-      groups[key].devices.push({
-        browser_id: row.browser_id,
-        label: row.label,
-        approved: row.approved,
-        banned: row.banned,
-        anlas_consumed: row.anlas_consumed,
-        total_requests: row.total_requests || 0,
+
+      groups[u.user_id] = {
+        discord_id: isLinked ? u.user_id : null,
+        discord_username: u.discord_username || (isLinked ? `User (${u.user_id.substring(0, 6)})` : "Unlinked Device"),
+        priority_tier: u.priority_tier,
+        approved: 0,
+        banned: u.banned,
+        anlas_consumed: u.anlas_consumed,
+        total_requests: 0,
+        last_active_at: 0,
+        is_online: false,
+        has_debug_intent: false,
+        has_debug_authorized: false,
+        metered_allowance: meteredAllowance,
+        devices: []
+      };
+    }
+
+    for (const d of devices) {
+      if (!groups[d.user_id]) continue;
+
+      const lastActive = queueManager.getLastActive(d.browser_id) || d.last_active_at || 0;
+      const isOnline = queueManager.isDeviceOnline(d.browser_id);
+      const debugInfo = queueManager.getDebugTargetInfo(d.browser_id);
+
+      groups[d.user_id].devices.push({
+        browser_id: d.browser_id,
+        label: d.label,
+        approved: d.approved,
+        banned: groups[d.user_id].banned,
+        anlas_consumed: groups[d.user_id].anlas_consumed,
+        total_requests: d.total_requests || 0,
         last_active_at: lastActive,
         is_online: isOnline,
-        metered_allowance: meteredAllowance,
+        metered_allowance: groups[d.user_id].metered_allowance,
         debug_intent: debugInfo.has_intent,
         debug_authorized: debugInfo.is_authorized,
         debug_expires_in_ms: debugInfo.expires_in_ms
       });
-      
-      groups[key].anlas_consumed += row.anlas_consumed;
-      groups[key].total_requests += (row.total_requests || 0);
-      if (lastActive > groups[key].last_active_at) {
-        groups[key].last_active_at = lastActive;
+
+      groups[d.user_id].total_requests += (d.total_requests || 0);
+      if (d.approved === 1) groups[d.user_id].approved = 1;
+      if (lastActive > groups[d.user_id].last_active_at) {
+        groups[d.user_id].last_active_at = lastActive;
       }
-      if (isOnline) {
-        groups[key].is_online = true;
-      }
-      if (row.banned === 1) {
-        groups[key].banned = 1;
-      }
-      if (debugInfo.has_intent) {
-        groups[key].has_debug_intent = true;
-      }
-      if (debugInfo.is_authorized) {
-        groups[key].has_debug_authorized = true;
-      }
+      if (isOnline) groups[d.user_id].is_online = true;
+      if (debugInfo.has_intent) groups[d.user_id].has_debug_intent = true;
+      if (debugInfo.is_authorized) groups[d.user_id].has_debug_authorized = true;
     }
+
     res.json(Object.values(groups));
   } catch (err) { 
     res.status(500).json({ error: err.message }); 
@@ -109,7 +107,13 @@ router.get('/user-devices', async (req, res) => {
   const { discord_id } = req.query;
   if (!discord_id) return res.status(400).json({ error: "Missing discord_id parameter" });
   try {
-    const devices = await all('SELECT browser_id, label, approved, banned, priority_tier, anlas_consumed, total_requests, last_active_at FROM devices WHERE discord_id = ?', [discord_id]);
+    const devices = await all(
+      `SELECT d.browser_id, d.label, d.approved, u.banned, u.priority_tier, u.anlas_consumed, d.total_requests, d.last_active_at 
+       FROM devices d 
+       JOIN users u ON d.user_id = u.user_id 
+       WHERE d.user_id = ?`, 
+      [discord_id]
+    );
     res.json(devices);
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -118,7 +122,7 @@ router.get('/user-devices', async (req, res) => {
 
 router.get('/unnotified-bans', async (req, res) => {
   try {
-    const bans = await all('SELECT discord_id, reason FROM banned_discords WHERE is_notified = 0');
+    const bans = await all('SELECT user_id AS discord_id, ban_reason AS reason FROM users WHERE banned = 1 AND ban_notified = 0');
     res.json(bans);
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -129,7 +133,7 @@ router.post('/mark-ban-notified', async (req, res) => {
   const { discord_id } = req.body;
   if (!discord_id) return res.status(400).json({ error: "Missing discord_id parameter" });
   try {
-    await run('UPDATE banned_discords SET is_notified = 1 WHERE discord_id = ?', [discord_id]);
+    await run('UPDATE users SET ban_notified = 1 WHERE user_id = ?', [discord_id]);
     res.json({ success: true });
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -138,13 +142,18 @@ router.post('/mark-ban-notified', async (req, res) => {
 
 router.post('/approve', async (req, res) => {
   const { browser_id, discord_id, priority_tier } = req.body;
-  const targetTier = priority_tier || 'Normal'; // Enforce fallback to prevent SQLite NOT NULL constraints
+  const targetTier = priority_tier || 'Normal';
   try {
     if (discord_id) {
-      await run('UPDATE devices SET approved = 1, priority_tier = ? WHERE discord_id = ?', [targetTier, discord_id]);
+      await run('UPDATE users SET priority_tier = ? WHERE user_id = ?', [targetTier, discord_id]);
+      await run('UPDATE devices SET approved = 1 WHERE user_id = ?', [discord_id]);
       console.log(`[VPS Telemetry Admin] Approved Discord Account: "${discord_id}". Priority: "${targetTier}"`);
-    } else {
-      await run('UPDATE devices SET approved = 1, priority_tier = ? WHERE browser_id = ?', [targetTier, browser_id]);
+    } else if (browser_id) {
+      const dev = await get('SELECT user_id FROM devices WHERE browser_id = ?', [browser_id]);
+      if (dev) {
+        await run('UPDATE users SET priority_tier = ? WHERE user_id = ?', [targetTier, dev.user_id]);
+      }
+      await run('UPDATE devices SET approved = 1 WHERE browser_id = ?', [browser_id]);
       console.log(`[VPS Telemetry Admin] Approved Unlinked Browser: "${browser_id}". Priority: "${targetTier}"`);
     }
     res.json({ success: true });
@@ -155,9 +164,9 @@ router.post('/revoke', async (req, res) => {
   const { browser_id, discord_id } = req.body;
   try {
     if (discord_id) {
-      await run('UPDATE devices SET approved = 0 WHERE discord_id = ?', [discord_id]);
+      await run('UPDATE devices SET approved = 0 WHERE user_id = ?', [discord_id]);
       console.log(`[VPS Telemetry Admin] Revoked access for Discord Account: "${discord_id}"`);
-    } else {
+    } else if (browser_id) {
       await run('UPDATE devices SET approved = 0 WHERE browser_id = ?', [browser_id]);
       console.log(`[VPS Telemetry Admin] Revoked access for Unlinked Browser: "${browser_id}"`);
     }
@@ -169,17 +178,17 @@ router.post('/ban', async (req, res) => {
   const { discord_id, browser_id, reason } = req.body;
   try {
     const banReason = reason || "Banned via Admin Console";
-    if (discord_id) {
-      await run('INSERT OR REPLACE INTO banned_discords (discord_id, banned_at, reason, is_notified) VALUES (?, ?, ?, 0)', [
-        discord_id, Date.now(), banReason
-      ]);
-      await run('UPDATE devices SET banned = 1 WHERE discord_id = ?', [discord_id]);
-      console.log(`[VPS Telemetry Admin] Banned Discord Account: "${discord_id}"`);
-      queueManager.evict({ discord_id });
-    } else if (browser_id) {
-      await run('UPDATE devices SET banned = 1 WHERE browser_id = ?', [browser_id]);
-      console.log(`[VPS Telemetry Admin] Banned Unlinked Browser: "${browser_id}"`);
-      queueManager.evict({ browser_id });
+    let targetUserId = discord_id;
+
+    if (!targetUserId && browser_id) {
+      const dev = await get('SELECT user_id FROM devices WHERE browser_id = ?', [browser_id]);
+      if (dev) targetUserId = dev.user_id;
+    }
+
+    if (targetUserId) {
+      await run('UPDATE users SET banned = 1, ban_reason = ?, ban_notified = 0 WHERE user_id = ?', [banReason, targetUserId]);
+      console.log(`[VPS Telemetry Admin] Banned Canonical User: "${targetUserId}"`);
+      queueManager.evict({ user_id: targetUserId });
     }
     res.json({ success: true });
   } catch (err) {
@@ -190,11 +199,15 @@ router.post('/ban', async (req, res) => {
 router.post('/unban', async (req, res) => {
   const { discord_id, browser_id } = req.body;
   try {
-    if (discord_id) {
-      await run('DELETE FROM banned_discords WHERE discord_id = ?', [discord_id]);
-      await run('UPDATE devices SET banned = 0 WHERE discord_id = ?', [discord_id]);
-    } else if (browser_id) {
-      await run('UPDATE devices SET banned = 0 WHERE browser_id = ?', [browser_id]);
+    let targetUserId = discord_id;
+    if (!targetUserId && browser_id) {
+      const dev = await get('SELECT user_id FROM devices WHERE browser_id = ?', [browser_id]);
+      if (dev) targetUserId = dev.user_id;
+    }
+
+    if (targetUserId) {
+      await run('UPDATE users SET banned = 0, ban_reason = NULL, ban_notified = 0 WHERE user_id = ?', [targetUserId]);
+      console.log(`[VPS Telemetry Admin] Unbanned Canonical User: "${targetUserId}"`);
     }
     res.json({ success: true });
   } catch (err) {
@@ -225,21 +238,42 @@ router.post('/link', async (req, res) => {
   if (!browser_id || !discord_id || !priority_tier) return res.status(400).json({ error: "Missing required linking parameters." });
 
   try {
-    const isBanned = await get('SELECT 1 FROM banned_discords WHERE discord_id = ?', [discord_id]);
-    if (isBanned) return res.status(403).json({ error: "This Discord account is permanently blacklisted." });
-
-    const device = await get('SELECT 1 FROM devices WHERE browser_id = ?', [browser_id]);
-    if (!device) return res.status(404).json({ error: "Device ID not recognized. Open NovelAI to register the client." });
-
-    const existingLinks = await all('SELECT browser_id FROM devices WHERE discord_id = ? AND approved = 1 ORDER BY ROWID ASC', [discord_id]);
-    if (existingLinks.length >= config.MAX_LINKED_DEVICES_PER_USER) {
-      const oldestDevice = existingLinks[0].browser_id;
-      await run('UPDATE devices SET approved = 0, discord_id = NULL, discord_username = NULL WHERE browser_id = ?', [oldestDevice]);
-      console.log(`[VPS Admin API] Automatically pruned oldest linked browser ID: ${oldestDevice} for user ${discord_id}`);
+    // 1. Assert user ban state
+    const existingUser = await get('SELECT banned FROM users WHERE user_id = ?', [discord_id]);
+    if (existingUser && existingUser.banned === 1) {
+      return res.status(403).json({ error: "This Discord account is permanently blacklisted." });
     }
 
-    await run('UPDATE devices SET approved = 1, banned = 0, priority_tier = ?, discord_id = ?, discord_username = ? WHERE browser_id = ?', 
-      [priority_tier, discord_id, discord_username || null, browser_id]);
+    // 2. Assert device exists
+    const device = await get('SELECT browser_id, user_id FROM devices WHERE browser_id = ?', [browser_id]);
+    if (!device) return res.status(404).json({ error: "Device ID not recognized. Open NovelAI to register the client." });
+
+    // 3. Guarantee canonical Discord user record exists
+    await run(
+      `INSERT INTO users (user_id, priority_tier, banned, discord_username, metered_allowance, last_allowance_update_at)
+       VALUES (?, ?, 0, ?, 100, ?)
+       ON CONFLICT(user_id) DO UPDATE SET
+         priority_tier = excluded.priority_tier,
+         discord_username = COALESCE(excluded.discord_username, users.discord_username)`,
+      [discord_id, priority_tier, discord_username || null, Date.now()]
+    );
+
+    // 4. Enforce MAX_LINKED_DEVICES_PER_USER
+    const existingLinks = await all('SELECT browser_id FROM devices WHERE user_id = ? AND approved = 1 ORDER BY ROWID ASC', [discord_id]);
+    if (existingLinks.length >= config.MAX_LINKED_DEVICES_PER_USER) {
+      const oldestDevice = existingLinks[0].browser_id;
+      await run('UPDATE devices SET approved = 0 WHERE browser_id = ?', [oldestDevice]);
+      console.log(`[VPS Admin API] Automatically de-authorized oldest linked browser ID: ${oldestDevice} for user ${discord_id}`);
+    }
+
+    // 5. Transfer hardware device pointer to canonical Discord user_id
+    await run('UPDATE devices SET user_id = ?, approved = 1 WHERE browser_id = ?', [discord_id, browser_id]);
+    
+    // Clean up abandoned unlinked user record if it exists
+    if (device.user_id !== discord_id && device.user_id.startsWith('b_')) {
+      await run('DELETE FROM users WHERE user_id = ?', [device.user_id]);
+    }
+
     console.log(`[VPS Admin API] Linked Discord ID ${discord_id} to browser ${browser_id} (${priority_tier})`);
     res.json({ success: true });
   } catch (err) { res.status(500).json({ error: err.message }); }
@@ -253,7 +287,7 @@ router.post('/sync-usernames', async (req, res) => {
 
   try {
     for (const m of mappings) {
-      await run('UPDATE devices SET discord_username = ? WHERE discord_id = ?', [m.discord_username, m.discord_id]);
+      await run('UPDATE users SET discord_username = ? WHERE user_id = ?', [m.discord_username, m.discord_id]);
     }
     console.log(`[VPS Admin] Successfully batch synced usernames for ${mappings.length} Discord accounts.`);
     res.json({ success: true });
@@ -268,11 +302,11 @@ router.post('/sync-tier', async (req, res) => {
   if (!discord_id || !priority_tier) return res.status(400).json({ error: "Missing sync parameters." });
 
   try {
-    const isBanned = await get('SELECT 1 FROM banned_discords WHERE discord_id = ?', [discord_id]);
-    if (isBanned) return res.status(403).json({ error: "This Discord account is blacklisted." });
+    const user = await get('SELECT banned FROM users WHERE user_id = ?', [discord_id]);
+    if (user && user.banned === 1) return res.status(403).json({ error: "This Discord account is blacklisted." });
 
-    await run('UPDATE devices SET approved = 1, priority_tier = ? WHERE discord_id = ?', [priority_tier, discord_id]);
-    console.log(`[VPS Admin API] Updated tiers for devices mapped to Discord ID ${discord_id} to ${priority_tier}`);
+    await run('UPDATE users SET priority_tier = ? WHERE user_id = ?', [priority_tier, discord_id]);
+    console.log(`[VPS Admin API] Updated tier for canonical user ${discord_id} to ${priority_tier}`);
     res.json({ success: true });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
@@ -282,7 +316,7 @@ router.post('/revoke-discord', async (req, res) => {
   if (!discord_id) return res.status(400).json({ error: "Missing discord_id parameter." });
 
   try {
-    await run('UPDATE devices SET approved = 0, discord_id = NULL, discord_username = NULL WHERE discord_id = ?', [discord_id]);
+    await run('UPDATE devices SET approved = 0 WHERE user_id = ?', [discord_id]);
     console.log(`[VPS Admin API] Deauthorized all devices registered to Discord ID ${discord_id}`);
     res.json({ success: true });
   } catch (err) { res.status(500).json({ error: err.message }); }
@@ -291,15 +325,15 @@ router.post('/revoke-discord', async (req, res) => {
 router.get('/global-stats', async (req, res) => {
   try {
     const devicesCount = await get('SELECT COUNT(*) as count FROM devices');
-    const linkedUsersCount = await get('SELECT COUNT(DISTINCT discord_id) as count FROM devices WHERE discord_id IS NOT NULL');
-    const totalAnlas = await get('SELECT SUM(anlas_consumed) as sum FROM devices');
+    const linkedUsersCount = await get("SELECT COUNT(*) as count FROM users WHERE user_id NOT LIKE 'b_%'");
+    const totalAnlas = await get('SELECT SUM(anlas_consumed) as sum FROM users');
     const totalRequests = await get('SELECT SUM(total_requests) as sum FROM devices');
     
-    const topAnlas = await all('SELECT discord_id, discord_username, SUM(anlas_consumed) as anlas FROM devices WHERE discord_id IS NOT NULL GROUP BY discord_id ORDER BY anlas DESC LIMIT 5');
-    const topRequests = await all('SELECT discord_id, discord_username, SUM(total_requests) as reqs FROM devices WHERE discord_id IS NOT NULL GROUP BY discord_id ORDER BY reqs DESC LIMIT 5');
+    const topAnlas = await all("SELECT user_id as discord_id, discord_username, anlas_consumed as anlas FROM users WHERE user_id NOT LIKE 'b_%' ORDER BY anlas DESC LIMIT 5");
+    const topRequests = await all("SELECT d.user_id as discord_id, u.discord_username, SUM(d.total_requests) as reqs FROM devices d JOIN users u ON d.user_id = u.user_id WHERE d.user_id NOT LIKE 'b_%' GROUP BY d.user_id ORDER BY reqs DESC LIMIT 5");
     
-    const bannedCount = await get('SELECT COUNT(*) as count FROM banned_discords');
-    const bannedList = await all('SELECT discord_id, reason FROM banned_discords');
+    const bannedCount = await get('SELECT COUNT(*) as count FROM users WHERE banned = 1');
+    const bannedList = await all('SELECT user_id as discord_id, ban_reason as reason FROM users WHERE banned = 1');
 
     res.json({
       total_devices: devicesCount.count,

@@ -12,11 +12,13 @@
  * 4. Dual-Slope Priority Aging: Evaluates dynamic linear priority decay on-the-fly with
  *    step-function AUTO promotions at configured thresholds.
  * 5. Deterministic Eviction: Immediately purges all pending or processing tasks matching
- *    a target browser footprint or Discord identity upon policy or audit violations.
+ *    a target browser footprint or canonical user identity upon policy or audit violations.
  * 6. Command Query Separation (CQS): Polling (read) operations compute theoretical 
  *    trajectories for telemetry. They NEVER mutate financial token states.
  * 7. Bilateral Ephemeral Diagnostics: Manages client-side debug intents and administrator
  *    inspection authorizations with deterministic millisecond TTL bounds swept automatically by the scavenger loop.
+ * 8. Principal-Keyed Token Buckets: All burst token allocations and concurrency deduplications operate
+ *    strictly on canonical user_id (Security Principal) while preserving deviceBuckets interface compatibility.
  */
 
 'use strict';
@@ -67,11 +69,18 @@ class QueueCoordinator {
    */
   reset() {
     this.queue = [];
-    this.deviceBuckets = new Map();
-    this.activeSessions = new Map();
-    this.activeTextLocks = new Map(); // Channel B explicitly tracked locks: req_id -> timestamp
-    this.debugTargets = new Map();    // Ephemeral administrative authorizations: browser_id -> expires_at
-    this.debugIntents = new Map();    // In-band client diagnostic intents: browser_id -> timestamp
+    this.deviceBuckets = new Map();    // Stores burst buckets keyed by principal (user_id || browser_id)
+    this.activeSessions = new Map();   // browser_id -> last_active_at
+    this.activeTextLocks = new Map();  // req_id -> timestamp
+    this.debugTargets = new Map();     // browser_id -> expires_at
+    this.debugIntents = new Map();     // browser_id -> timestamp
+  }
+
+  /**
+   * Exposes principalBuckets alias for architectural clarity without breaking deviceBuckets tests.
+   */
+  get principalBuckets() {
+    return this.deviceBuckets;
   }
 
   /**
@@ -177,17 +186,18 @@ class QueueCoordinator {
 
   /**
    * Volatile dynamic token-bucket retriever implementing lazy math refills on-demand.
+   * Keyed by canonical principalId to unify burst pools across devices.
    * Preserves fractional token accumulation drift and guards against division by zero.
    *
-   * @param {string} browserId - Unique device browser footprint.
-   * @param {string} tier - Allocation tier of the device.
+   * @param {string} principalId - Canonical user_id or browser footprint.
+   * @param {string} tier - Allocation tier of the entity.
    * @returns {object|null} Evaluated bucket reference or null if tier is exempt.
    */
-  getOrInitBucket(browserId, tier) {
+  getOrInitBucket(principalId, tier) {
     const tierConfig = this.tierConfigs[tier];
     if (!tierConfig || tierConfig.maxBurst === Infinity) return null;
 
-    let bucket = this.deviceBuckets.get(browserId);
+    let bucket = this.deviceBuckets.get(principalId);
     const now = Date.now();
 
     if (!bucket) {
@@ -195,13 +205,13 @@ class QueueCoordinator {
         tokens: tierConfig.maxBurst,
         lastTx: now
       };
-      this.deviceBuckets.set(browserId, bucket);
+      this.deviceBuckets.set(principalId, bucket);
     } else {
       const elapsed = now - bucket.lastTx;
       if (tierConfig.refillRate > 0 && elapsed >= tierConfig.refillRate) {
         const gained = Math.floor(elapsed / tierConfig.refillRate);
         bucket.tokens = Math.min(tierConfig.maxBurst, bucket.tokens + gained);
-        bucket.lastTx += gained * tierConfig.refillRate; // Keeps exact fractional remainder alignment
+        bucket.lastTx += gained * tierConfig.refillRate;
       }
     }
 
@@ -292,16 +302,16 @@ class QueueCoordinator {
 
     pendingTasks.forEach(task => {
       const elapsedSeconds = (now - task.timestamp) / 1000;
+      const targetPrincipal = task.user_id || task.discord_id || task.browser_id;
 
       // Dynamic Step-Function Jump (AUTO state promotion)
-      // Token mutation isolated strictly to this boundary crossing
       if (!task.has_burst_boost && elapsedSeconds >= this.config.QUEUE_AUTO_BOOST_SECONDS) {
-        const bucket = this.getOrInitBucket(task.browser_id, task.priority_tier);
+        const bucket = this.getOrInitBucket(targetPrincipal, task.priority_tier);
         if (bucket && bucket.tokens >= 1.0) {
           bucket.tokens -= 1.0;
           task.has_burst_boost = true;
           stateChanged = true;
-          console.log(`[VPS Queue AUTO] Task "${task.req_id}" hit ${this.config.QUEUE_AUTO_BOOST_SECONDS}s threshold. Promoting to Fast Slope.`);
+          console.log(`[VPS Queue AUTO] Task "${task.req_id}" hit ${this.config.QUEUE_AUTO_BOOST_SECONDS}s threshold. Promoting User "${targetPrincipal}" to Fast Slope.`);
         }
       }
 
@@ -349,7 +359,7 @@ class QueueCoordinator {
 
   /**
    * Places an authenticated client request into the Channel A generation queue.
-   * Enforces 1-request-per-user limits and terminates prior upstream sockets on collision.
+   * Enforces 1-request-per-user limits on user_id / discord_id, terminating prior upstream sockets on collision.
    *
    * @param {object} taskOptions - Parameters defining the queue task.
    * @param {string} taskOptions.browser_id - Target browser footprint.
@@ -357,10 +367,11 @@ class QueueCoordinator {
    * @param {string} [taskOptions.tab_id] - Ephemeral tab tracking UUID.
    * @param {string} [taskOptions.priority_tier='Normal'] - Target priority tier.
    * @param {string|null} [taskOptions.discord_id=null] - Linked Discord identity.
+   * @param {string|null} [taskOptions.user_id=null] - Canonical user identifier.
    * @returns {object} Registered task record in queue.
    * @throws {Error} If mandatory arguments are missing.
    */
-  join({ browser_id, tab_id = null, req_id, priority_tier = 'Normal', discord_id = null }) {
+  join({ browser_id, tab_id = null, req_id, priority_tier = 'Normal', discord_id = null, user_id = null }) {
     if (!browser_id || typeof browser_id !== 'string') {
       throw new Error("[Queue Error] browser_id is mandatory for queue registration.");
     }
@@ -368,11 +379,16 @@ class QueueCoordinator {
       throw new Error("[Queue Error] req_id is mandatory for queue registration.");
     }
 
+    const effectiveDiscordId = discord_id || (user_id && !user_id.startsWith('b_') ? user_id : null);
+    const principalId = user_id || discord_id || browser_id;
     this.ping(browser_id);
 
-    // 1-request-per-user limit: Enforce queue concurrency check on discord_id, NOT browser_id
+    // 1-request-per-user limit: Check on canonical identity
     const existingIdx = this.queue.findIndex(t => {
-      if (discord_id && discord_id !== 'admin' && t.discord_id === discord_id) return true;
+      if (effectiveDiscordId && effectiveDiscordId !== 'admin') {
+        if (t.discord_id === effectiveDiscordId || t.user_id === effectiveDiscordId) return true;
+      }
+      if (user_id && user_id !== 'admin' && t.user_id === user_id) return true;
       return t.browser_id === browser_id;
     });
 
@@ -381,7 +397,7 @@ class QueueCoordinator {
       if (priorTask.upstreamReq) {
         try { priorTask.upstreamReq.destroy(); } catch (_) {}
       }
-      const evictedTarget = priorTask.discord_id || priorTask.browser_id;
+      const evictedTarget = priorTask.user_id || priorTask.discord_id || priorTask.browser_id;
       this.queue.splice(existingIdx, 1);
       console.log(`[VPS Telemetry] Concurrency eviction: Terminated active lock for user/device: ${evictedTarget}`);
     }
@@ -392,14 +408,14 @@ class QueueCoordinator {
     if (tierConfig.maxBurst === Infinity) {
       hasBurstBoost = true;
     } else {
-      const bucket = this.getOrInitBucket(browser_id, priority_tier);
+      const bucket = this.getOrInitBucket(principalId, priority_tier);
       if (bucket && bucket.tokens >= 1.0) {
         bucket.tokens -= 1.0;
         hasBurstBoost = true;
-        console.log(`[VPS Token Bucket] Allocated 1.0 token. Browser: ${browser_id}. Tokens remaining: ${bucket.tokens}`);
+        console.log(`[VPS Token Bucket] Allocated 1.0 token to Principal "${principalId}". Tokens remaining: ${bucket.tokens}`);
       } else {
         hasBurstBoost = false;
-        console.log(`[VPS Token Bucket] Saturated bucket. Defaulting ${browser_id} to Base Slope.`);
+        console.log(`[VPS Token Bucket] Saturated bucket for Principal "${principalId}". Defaulting to Base Slope.`);
       }
     }
 
@@ -407,7 +423,8 @@ class QueueCoordinator {
       browser_id,
       tab_id,
       req_id,
-      discord_id,
+      user_id: principalId,
+      discord_id: effectiveDiscordId,
       priority_tier,
       timestamp: Date.now(),
       last_polled_at: Date.now(),
@@ -419,7 +436,7 @@ class QueueCoordinator {
     };
 
     this.queue.push(task);
-    console.log(`[VPS Telemetry] Device "${browser_id}" (User: "${discord_id}") joined queue. ReqId: "${req_id}". Tier: "${priority_tier}"`);
+    console.log(`[VPS Telemetry] Device "${browser_id}" (User: "${principalId}") joined queue. ReqId: "${req_id}". Tier: "${priority_tier}"`);
     this.processQueue();
     return task;
   }
@@ -485,20 +502,24 @@ class QueueCoordinator {
 
   /**
    * Authoritative eviction engine. Immediately finds all pending or active requests matching
-   * a given browser footprint or Discord identity, destroys active upstream sockets, and promotes the queue.
+   * a given browser footprint or Discord/user identity, destroys active upstream sockets, and promotes the queue.
    *
    * @param {object} target - Target identifiers.
    * @param {string} [target.browser_id] - Browser footprint to purge.
    * @param {string} [target.discord_id] - Discord identity to purge.
+   * @param {string} [target.user_id] - Canonical user identity to purge.
    * @returns {number} Count of evicted tasks.
    */
-  evict({ browser_id = null, discord_id = null }) {
+  evict({ browser_id = null, discord_id = null, user_id = null }) {
+    const targetUserId = user_id || discord_id;
     let evictedCount = 0;
+
     this.queue = this.queue.filter(t => {
-      const matchDiscord = discord_id && t.discord_id === discord_id;
+      const matchDiscord = discord_id && (t.discord_id === discord_id || t.user_id === discord_id);
+      const matchUser = targetUserId && (t.user_id === targetUserId || t.discord_id === targetUserId);
       const matchBrowser = browser_id && t.browser_id === browser_id;
 
-      if (matchDiscord || matchBrowser) {
+      if (matchDiscord || matchUser || matchBrowser) {
         if (t.upstreamReq) {
           try { t.upstreamReq.destroy(); } catch (_) {}
         }
@@ -509,7 +530,7 @@ class QueueCoordinator {
     });
 
     if (evictedCount > 0) {
-      console.warn(`[VPS Queue Evict] Purged ${evictedCount} tasks for Browser: "${browser_id}", Discord: "${discord_id}"`);
+      console.warn(`[VPS Queue Evict] Purged ${evictedCount} tasks for Browser: "${browser_id}", Discord/User: "${targetUserId}"`);
       this.processQueue();
     }
     return evictedCount;
@@ -561,9 +582,9 @@ class QueueCoordinator {
     }
 
     // 2. Evict dormant token buckets to prevent OOM (Buckets > 1hr old are fully refilled and safe to drop)
-    for (const [browserId, bucket] of this.deviceBuckets.entries()) {
+    for (const [principalId, bucket] of this.deviceBuckets.entries()) {
       if (now - bucket.lastTx > 3600000) {
-        this.deviceBuckets.delete(browserId);
+        this.deviceBuckets.delete(principalId);
       }
     }
     

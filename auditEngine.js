@@ -4,7 +4,9 @@
  * Strict unidirectional constraints:
  * - Imports Level 0 (database.js) and Level 1 (config.js).
  * - Blind to HTTP transport (Express), socket streams, and queue RAM states.
- * - Handles parameter parsing, security auditing, Anlas tracking, and authoritative device authentication.
+ * - Handles parameter parsing, security auditing, Anlas tracking, and authoritative principal authentication.
+ * - Relational Normalization: Evaluates quotas, allowances, Anlas deductions, and bans strictly
+ *   against the canonical user_id (Security Principal), eliminating multi-device quota inflation.
  */
 
 'use strict';
@@ -24,7 +26,7 @@ function getConfig() {
 /**
  * Authoritative Device Authentication & Identity Gatekeeper.
  * Centralizes credential validation, administrative bypass, and hierarchical ban enforcement.
- * (Technically violates SRP, but abstracting a single function into a new root file is pendantic and premature.)
+ * Resolves physical hardware credentials to canonical Security Principals in the users table.
  * 
  * @param {string} browserId - Unique device browser footprint.
  * @param {string} deviceSecret - Secret passkey or admin secret.
@@ -41,24 +43,55 @@ async function verifyDevice(browserId, deviceSecret, { requireApproval = true } 
   let device;
 
   if (deviceSecret === config.ADMIN_SECRET_KEY) {
-    device = { approved: 1, banned: 0, priority_tier: 'Admin', discord_id: 'admin', anlas_consumed: 0 };
+    device = { 
+      browser_id: browserId,
+      user_id: 'admin',
+      label: 'Admin Terminal',
+      approved: 1, 
+      banned: 0, 
+      priority_tier: 'Admin', 
+      discord_id: 'admin',
+      discord_username: 'Administrator',
+      anlas_consumed: 0,
+      metered_allowance: Infinity
+    };
   } else {
     device = await get(
-      'SELECT approved, banned, priority_tier, discord_id, anlas_consumed FROM devices WHERE browser_id = ? AND device_secret = ?',
+      `SELECT 
+        d.browser_id, d.device_secret, d.label, d.approved, d.total_requests, d.last_active_at,
+        d.discord_id as legacy_discord_id, d.priority_tier as legacy_tier, d.banned as legacy_banned,
+        d.user_id as d_user_id,
+        u.priority_tier as u_tier, u.banned as u_banned, u.ban_reason, u.anlas_consumed as u_anlas,
+        u.metered_allowance as u_allowance, u.last_allowance_update_at as u_update_at, u.discord_username as u_username
+      FROM devices d
+      LEFT JOIN users u ON u.user_id = COALESCE(d.user_id, d.discord_id, d.browser_id)
+      WHERE d.browser_id = ? AND d.device_secret = ?`,
       [browserId, deviceSecret]
     );
+
+    if (device) {
+      device.user_id = device.d_user_id || device.legacy_discord_id || device.browser_id;
+      device.priority_tier = device.u_tier || device.legacy_tier || 'Normal';
+      device.banned = (device.u_banned === 1 || device.legacy_banned === 1) ? 1 : 0;
+      device.discord_id = device.legacy_discord_id || (device.user_id && !device.user_id.startsWith('b_') ? device.user_id : null);
+      device.anlas_consumed = device.u_anlas !== undefined && device.u_anlas !== null ? device.u_anlas : (device.anlas_consumed || 0);
+      device.metered_allowance = device.u_allowance !== undefined && device.u_allowance !== null ? device.u_allowance : (device.metered_allowance || 100);
+      device.last_allowance_update_at = device.u_update_at || device.last_allowance_update_at || Date.now();
+      device.discord_username = device.u_username || device.discord_username || null;
+    }
   }
 
   if (!device) {
     return { ok: false, status: 401, error: 'Access Denied: Device credentials rejected.' };
   }
 
-  // Authoritative Identity Hierarchy: Evaluate Discord ID blacklist before device-level flags
+  // Check Discord blacklist table for legacy backwards compatibility
   if (device.discord_id && device.discord_id !== 'admin') {
     const isBannedUser = await get('SELECT 1 FROM banned_discords WHERE discord_id = ?', [device.discord_id]);
     if (isBannedUser) {
       if (device.banned !== 1) {
-        await run('UPDATE devices SET banned = 1 WHERE discord_id = ?', [device.discord_id]);
+        await run('UPDATE users SET banned = 1 WHERE user_id = ?', [device.discord_id]);
+        await run('UPDATE devices SET banned = 1 WHERE discord_id = ? OR user_id = ?', [device.discord_id, device.discord_id]);
       }
       return { ok: false, status: 403, error: 'Access Denied: Your Discord identity is permanently banned.' };
     }
@@ -235,6 +268,7 @@ function formatPayloadForLogging(buffer) {
 /**
  * Executes deep background auditing on transmitted payload buffers.
  * Detects model spoofing bypass attempts and hard-limit violations.
+ * Updates both the canonical user record and device records for zero-regression reporting.
  * 
  * @param {string} browserId - Unique device key.
  * @param {Buffer} payloadBuffer - Accumulated outbound parameters buffer.
@@ -243,7 +277,7 @@ function formatPayloadForLogging(buffer) {
  */
 async function runBackgroundAudit(browserId, payloadBuffer, clientReportedV5) {
   const actualParams = extractParametersFromRawBody(payloadBuffer);
-  if (!actualParams) return { banned: false, discordId: null, browserId };
+  if (!actualParams) return { banned: false, discordId: null, userId: null, browserId };
 
   const { width, height, steps, n_samples, precise_ref_count, model } = actualParams;
   
@@ -252,11 +286,20 @@ async function runBackgroundAudit(browserId, payloadBuffer, clientReportedV5) {
   const actualSamples = n_samples || 1;
   const actualRefs = precise_ref_count || 0;
 
-  const device = await get('SELECT priority_tier, discord_id FROM devices WHERE browser_id = ?', [browserId]);
-  if (!device) return { banned: false, discordId: null, browserId };
+  const device = await get(
+    `SELECT d.user_id, d.discord_id, d.priority_tier as legacy_tier, u.priority_tier as u_tier 
+     FROM devices d 
+     LEFT JOIN users u ON u.user_id = COALESCE(d.user_id, d.discord_id, d.browser_id) 
+     WHERE d.browser_id = ?`, 
+    [browserId]
+  );
+  if (!device) return { banned: false, discordId: null, userId: null, browserId };
+
+  const targetUserId = device.user_id || device.discord_id || browserId;
+  const effectiveTier = device.u_tier || device.legacy_tier || 'Normal';
 
   const config = getConfig();
-  const tierConfig = config.TIER_CONFIGS[device.priority_tier] || config.TIER_CONFIGS['Normal'];
+  const tierConfig = config.TIER_CONFIGS[effectiveTier] || config.TIER_CONFIGS['Normal'];
   
   // Header Spoofing Detection
   const isViolation = (actualPixels > config.FIREWALL_MAX_PIXELS) || 
@@ -268,39 +311,40 @@ async function runBackgroundAudit(browserId, payloadBuffer, clientReportedV5) {
   const isV5Model = typeof model === 'string' && /[-_]5[-_]/i.test(model) && !model.includes('4-5');
   const bypassViolation = isV5Model && !clientReportedV5;
 
-  // Ledger execution (5 Anlas per character reference)
+  // Normalized Ledger execution: update canonical user and device rows
   const anlasSpent = actualRefs * 5;
   if (anlasSpent > 0) {
+    await run('UPDATE users SET anlas_consumed = anlas_consumed + ? WHERE user_id = ?', [anlasSpent, targetUserId]);
     await run('UPDATE devices SET anlas_consumed = anlas_consumed + ? WHERE browser_id = ?', [anlasSpent, browserId]);
-    console.log(`[VPS Audit Ledger] Deducted ${anlasSpent} Anlas on user profile ${device.discord_id || browserId} (refs used: ${actualRefs})`);
+    console.log(`[VPS Audit Ledger] Deducted ${anlasSpent} Anlas on user profile ${targetUserId} (refs used: ${actualRefs})`);
   }
 
   // Punitive execution on hostile mismatch
   if (isViolation || bypassViolation) {
     console.warn(`\x1b[31m[VPS SECURITY AUDIT] !!! HOSTILE PAYLOAD SPOOFING DETECTED !!!\x1b[0m`);
-    console.warn(`[VPS Security Audit] Device: "${browserId}", Tier: "${device.priority_tier}"`);
+    console.warn(`[VPS Security Audit] Device: "${browserId}", User: "${targetUserId}", Tier: "${effectiveTier}"`);
     
     try {
       const banReason = bypassViolation 
         ? `Firewall Bypass Violation: Client generated with V5 model ("${model}") but suppressed X-Gen-Model header.`
         : `Firewall Bypass Violation: Client spoofed headers to bypass ingress limits. Actual Body Payload: Pixels=${actualPixels}, Steps=${actualSteps}, Refs=${actualRefs}`;
 
+      // Update users table, devices table, and legacy banned_discords table
+      await run('UPDATE users SET banned = 1, ban_reason = ?, ban_notified = 0 WHERE user_id = ?', [banReason, targetUserId]);
+      await run('UPDATE devices SET banned = 1 WHERE browser_id = ? OR discord_id = ? OR user_id = ?', [browserId, targetUserId, targetUserId]);
+
       if (device.discord_id) {
-        console.warn(`[VPS Security Audit] Revoking all devices linked to Discord ID: "${device.discord_id}"`);
         await run('INSERT OR REPLACE INTO banned_discords (discord_id, banned_at, reason, is_notified) VALUES (?, ?, ?, 0)', [
           device.discord_id, Date.now(), banReason
         ]);
-        await run('UPDATE devices SET banned = 1 WHERE discord_id = ?', [device.discord_id]);
-      } else {
-        console.warn(`[VPS Security Audit] Revoking browser_id directly: "${browserId}"`);
-        await run('UPDATE devices SET banned = 1 WHERE browser_id = ?', [browserId]);
       }
       
-      console.log(`[VPS Security Audit] Success. Database ban committed for "${browserId}".`);
+      console.log(`[VPS Security Audit] Success. Database ban committed for "${targetUserId}".`);
       return {
         banned: true,
         reason: banReason,
         discordId: device.discord_id || null,
+        userId: targetUserId,
         browserId
       };
     } catch (dbErr) {
@@ -308,19 +352,20 @@ async function runBackgroundAudit(browserId, payloadBuffer, clientReportedV5) {
     }
   }
 
-  return { banned: false, discordId: device.discord_id || null, browserId };
+  return { banned: false, discordId: device.discord_id || null, userId: targetUserId, browserId };
 }
 
 /**
  * Lazy-refills and updates the database-backed tier token bucket.
+ * Operates authoritatively on the canonical user_id while synchronizing across linked devices.
  * Accounts for elapsed time while preserving fractional timing remainder.
  *
- * @param {string} browserId - Unique device browser footprint.
- * @param {string} tier - Device priority tier mapping.
+ * @param {string} id - Either a canonical user_id or a physical browser_id.
+ * @param {string} tier - Allocation tier mapping.
  * @param {boolean} [deduct=false] - True if 1 token should be consumed atomically.
  * @returns {Promise<number>} Evaluated current metered token balance.
  */
-async function getOrUpdateAllowance(browserId, tier, deduct = false) {
+async function getOrUpdateAllowance(id, tier, deduct = false) {
   const config = getConfig();
   const tierConfig = config.TIER_CONFIGS[tier];
   if (!tierConfig) return 0;
@@ -329,7 +374,21 @@ async function getOrUpdateAllowance(browserId, tier, deduct = false) {
     return Infinity;
   }
 
-  const row = await get('SELECT metered_allowance, last_allowance_update_at FROM devices WHERE browser_id = ?', [browserId]);
+  // Resolve canonical user_id
+  let canonicalId = id;
+  let row = await get('SELECT metered_allowance, last_allowance_update_at FROM users WHERE user_id = ?', [canonicalId]);
+
+  if (!row) {
+    const devRow = await get('SELECT user_id, discord_id, metered_allowance, last_allowance_update_at FROM devices WHERE browser_id = ?', [id]);
+    if (devRow) {
+      canonicalId = devRow.user_id || devRow.discord_id || id;
+      row = await get('SELECT metered_allowance, last_allowance_update_at FROM users WHERE user_id = ?', [canonicalId]);
+      if (!row) {
+        row = { metered_allowance: devRow.metered_allowance, last_allowance_update_at: devRow.last_allowance_update_at };
+      }
+    }
+  }
+
   if (!row) return 0;
 
   let allowance = row.metered_allowance;
@@ -342,27 +401,33 @@ async function getOrUpdateAllowance(browserId, tier, deduct = false) {
   if (allowance === null || lastUpdate === null) {
     allowance = maxAllowance;
     lastUpdate = now;
-    await run('UPDATE devices SET metered_allowance = ?, last_allowance_update_at = ? WHERE browser_id = ?', [maxAllowance, now, browserId]);
-  }
+  } else {
+    const elapsed = Math.max(0, now - lastUpdate);
+    const gained = refillRate > 0 ? Math.floor(elapsed / refillRate) : 0;
 
-  const elapsed = Math.max(0, now - lastUpdate);
-  const gained = refillRate > 0 ? Math.floor(elapsed / refillRate) : 0;
-
-  if (gained > 0) {
-    allowance = Math.min(maxAllowance, allowance + gained);
-    lastUpdate = lastUpdate + (gained * refillRate);
+    if (gained > 0) {
+      allowance = Math.min(maxAllowance, allowance + gained);
+      lastUpdate = lastUpdate + (gained * refillRate);
+    }
   }
 
   if (deduct) {
     if (allowance >= 1) {
       allowance -= 1;
-      await run('UPDATE devices SET metered_allowance = ?, last_allowance_update_at = ? WHERE browser_id = ?', [allowance, lastUpdate, browserId]);
     } else {
       return -1;
     }
-  } else if (gained > 0) {
-    await run('UPDATE devices SET metered_allowance = ?, last_allowance_update_at = ? WHERE browser_id = ?', [allowance, lastUpdate, browserId]);
   }
+
+  // Synchronize across both canonical user and all matching device records
+  await run(
+    'UPDATE users SET metered_allowance = ?, last_allowance_update_at = ? WHERE user_id = ?',
+    [allowance, lastUpdate, canonicalId]
+  );
+  await run(
+    'UPDATE devices SET metered_allowance = ?, last_allowance_update_at = ? WHERE browser_id = ? OR user_id = ? OR discord_id = ?',
+    [allowance, lastUpdate, id, canonicalId, canonicalId]
+  );
 
   return allowance;
 }
@@ -370,16 +435,19 @@ async function getOrUpdateAllowance(browserId, tier, deduct = false) {
 /**
  * Calculates the exact millisecond epoch for the user's next rolling allowance refill.
  *
- * @param {string} browserId - Unique device browser footprint.
- * @param {string} tier - Device priority tier mapping.
+ * @param {string} id - Either a canonical user_id or a physical browser_id.
+ * @param {string} tier - Allocation tier mapping.
  * @returns {Promise<number|null>} Refill epoch or null if already capped.
  */
-async function getNextRefillTime(browserId, tier) {
+async function getNextRefillTime(id, tier) {
   const config = getConfig();
   const tierConfig = config.TIER_CONFIGS[tier];
   if (!tierConfig || tierConfig.maxAllowance === Infinity) return null;
 
-  const row = await get('SELECT metered_allowance, last_allowance_update_at FROM devices WHERE browser_id = ?', [browserId]);
+  let row = await get('SELECT metered_allowance, last_allowance_update_at FROM users WHERE user_id = ?', [id]);
+  if (!row) {
+    row = await get('SELECT metered_allowance, last_allowance_update_at FROM devices WHERE browser_id = ?', [id]);
+  }
   if (!row || row.metered_allowance === null || row.last_allowance_update_at === null) return null;
   if (row.metered_allowance >= tierConfig.maxAllowance) return null;
   return row.last_allowance_update_at + tierConfig.refillRateMs;

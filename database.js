@@ -12,6 +12,8 @@
  * 3. Strict State Enforcement: Fails fast on concurrent boot attempts and in-flight teardowns.
  * 4. TOCTOU-safe transactional migrations executed entirely under BEGIN IMMEDIATE.
  * 5. Strict encapsulation: suppresses raw handle leakage completely. Higher layers interact via run/get/all.
+ * 6. Relational Normalization (Option 1): Maintains canonical users table for authoritative principal state
+ *    while preserving legacy column contracts and synchronizing via SQLite triggers for complete zero-regression safety.
  */
 
 const sqlite3 = require('sqlite3').verbose();
@@ -113,13 +115,28 @@ const initDatabase = async (targetPath) => {
         }
 
         try {
-          // Enforce WAL mode and a 5000ms busy timeout to prevent SQLITE_BUSY crashes under concurrency
+          // Enforce WAL mode, foreign keys, and busy timeout
           await execRun(newDb, "PRAGMA journal_mode = WAL;");
           await execRun(newDb, "PRAGMA busy_timeout = 5000;");
+          await execRun(newDb, "PRAGMA foreign_keys = ON;");
 
-          // Canonical Devices Table: Created with all modern columns upfront
+          // Canonical Users Table: The authoritative entity for quotas, allowances, tiers, and bans
+          await execRun(newDb, `CREATE TABLE IF NOT EXISTS users (
+            user_id TEXT PRIMARY KEY,
+            priority_tier TEXT NOT NULL DEFAULT 'Normal',
+            banned INTEGER NOT NULL DEFAULT 0,
+            ban_reason TEXT,
+            ban_notified INTEGER NOT NULL DEFAULT 0,
+            anlas_consumed INTEGER NOT NULL DEFAULT 0,
+            metered_allowance INTEGER DEFAULT 100,
+            last_allowance_update_at INTEGER,
+            discord_username TEXT
+          )`);
+
+          // Canonical Devices Table: Created with complete column set to guarantee backwards compatibility
           await execRun(newDb, `CREATE TABLE IF NOT EXISTS devices (
             browser_id TEXT PRIMARY KEY,
+            user_id TEXT,
             device_secret TEXT NOT NULL,
             label TEXT,
             priority_tier TEXT NOT NULL DEFAULT 'Normal',
@@ -134,7 +151,7 @@ const initDatabase = async (targetPath) => {
             last_allowance_update_at INTEGER
           )`);
           
-          // Canonical Banned Discords Table
+          // Canonical Banned Discords Table: Preserved for legacy contract assertions
           await execRun(newDb, `CREATE TABLE IF NOT EXISTS banned_discords (
             discord_id TEXT PRIMARY KEY,
             banned_at INTEGER NOT NULL,
@@ -157,14 +174,14 @@ const initDatabase = async (targetPath) => {
             PRIMARY KEY (browser_id, session_date)
           )`);
 
-          // Backward-Compatibility Migrations for Legacy Schemas:
-          // Executed ENTIRELY inside BEGIN IMMEDIATE to eliminate TOCTOU inspection races
+          // Backward-Compatibility Migrations & Trigger Setup inside BEGIN IMMEDIATE
           await execRun(newDb, "BEGIN IMMEDIATE;");
           try {
             const deviceCols = await execAll(newDb, "PRAGMA table_info(devices)");
             const hasCol = (name) => deviceCols.some(row => row.name === name);
 
             const legacyDeviceColumns = [
+              { name: 'user_id', ddl: "ALTER TABLE devices ADD COLUMN user_id TEXT" },
               { name: 'discord_id', ddl: "ALTER TABLE devices ADD COLUMN discord_id TEXT" },
               { name: 'anlas_consumed', ddl: "ALTER TABLE devices ADD COLUMN anlas_consumed INTEGER NOT NULL DEFAULT 0" },
               { name: 'banned', ddl: "ALTER TABLE devices ADD COLUMN banned INTEGER NOT NULL DEFAULT 0" },
@@ -186,6 +203,82 @@ const initDatabase = async (targetPath) => {
             if (!hasBanCol('is_notified')) {
               await execRun(newDb, "ALTER TABLE banned_discords ADD COLUMN is_notified INTEGER NOT NULL DEFAULT 0");
             }
+
+            // Populate users table from any pre-existing devices records
+            await execRun(newDb, `
+              INSERT OR IGNORE INTO users (user_id, priority_tier, banned, anlas_consumed, metered_allowance, last_allowance_update_at, discord_username)
+              SELECT COALESCE(discord_id, browser_id), priority_tier, banned, anlas_consumed, COALESCE(metered_allowance, 100), last_allowance_update_at, discord_username
+              FROM devices
+            `);
+
+            await execRun(newDb, `
+              UPDATE devices SET user_id = COALESCE(discord_id, browser_id) WHERE user_id IS NULL
+            `);
+
+            // Bidirectional Synchronization Triggers
+            await execRun(newDb, `
+              CREATE TRIGGER IF NOT EXISTS trg_sync_devices_insert
+              AFTER INSERT ON devices
+              BEGIN
+                INSERT INTO users (
+                  user_id, priority_tier, banned, anlas_consumed, metered_allowance, last_allowance_update_at, discord_username
+                ) VALUES (
+                  COALESCE(NEW.user_id, NEW.discord_id, NEW.browser_id),
+                  COALESCE(NEW.priority_tier, 'Normal'),
+                  COALESCE(NEW.banned, 0),
+                  COALESCE(NEW.anlas_consumed, 0),
+                  COALESCE(NEW.metered_allowance, 100),
+                  COALESCE(NEW.last_allowance_update_at, CAST((julianday('now') - 2440587.5) * 86400000 AS INTEGER)),
+                  NEW.discord_username
+                )
+                ON CONFLICT(user_id) DO UPDATE SET
+                  banned = MAX(users.banned, excluded.banned),
+                  priority_tier = CASE WHEN excluded.priority_tier != 'Normal' THEN excluded.priority_tier ELSE users.priority_tier END;
+
+                UPDATE devices SET user_id = COALESCE(NEW.user_id, NEW.discord_id, NEW.browser_id)
+                WHERE browser_id = NEW.browser_id AND user_id IS NULL;
+              END;
+            `);
+
+            await execRun(newDb, `
+              CREATE TRIGGER IF NOT EXISTS trg_sync_devices_update_allowance
+              AFTER UPDATE OF metered_allowance, last_allowance_update_at ON devices
+              BEGIN
+                UPDATE users SET
+                  metered_allowance = NEW.metered_allowance,
+                  last_allowance_update_at = NEW.last_allowance_update_at
+                WHERE user_id = COALESCE(NEW.user_id, NEW.discord_id, NEW.browser_id);
+              END;
+            `);
+
+            await execRun(newDb, `
+              CREATE TRIGGER IF NOT EXISTS trg_sync_users_update_allowance
+              AFTER UPDATE OF metered_allowance, last_allowance_update_at ON users
+              BEGIN
+                UPDATE devices SET
+                  metered_allowance = NEW.metered_allowance,
+                  last_allowance_update_at = NEW.last_allowance_update_at
+                WHERE user_id = NEW.user_id OR discord_id = NEW.user_id;
+              END;
+            `);
+
+            await execRun(newDb, `
+              CREATE TRIGGER IF NOT EXISTS trg_sync_banned_discords_insert
+              AFTER INSERT ON banned_discords
+              BEGIN
+                UPDATE users SET banned = 1, ban_reason = NEW.reason, ban_notified = NEW.is_notified WHERE user_id = NEW.discord_id;
+                UPDATE devices SET banned = 1 WHERE discord_id = NEW.discord_id OR user_id = NEW.discord_id;
+              END;
+            `);
+
+            await execRun(newDb, `
+              CREATE TRIGGER IF NOT EXISTS trg_sync_banned_discords_delete
+              AFTER DELETE ON banned_discords
+              BEGIN
+                UPDATE users SET banned = 0, ban_reason = NULL, ban_notified = 0 WHERE user_id = OLD.discord_id;
+                UPDATE devices SET banned = 0 WHERE discord_id = OLD.discord_id OR user_id = OLD.discord_id;
+              END;
+            `);
 
             await execRun(newDb, "COMMIT;");
           } catch (txErr) {
