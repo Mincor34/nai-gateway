@@ -40,13 +40,31 @@ const nodeCrypto = require('node:crypto');
 const { build, targets } = require('../scripts/build-userscripts');
 
 /**
+ * Safely parses the authoritative @version declaration from a userscript metadata block.
+ * Hardened against arbitrary whitespace, tabs, and missing declarations.
+ * Constrained strictly within the // ==UserScript== and // ==/UserScript== boundaries.
+ *
+ * @param {string|null} source - Raw compiled userscript source code.
+ * @returns {string} Extracted version string or '0.0.0' on failure.
+ */
+function extractMetadataVersion(source) {
+  if (!source || typeof source !== 'string') return '0.0.0';
+  const headerMatch = source.match(/\/\/\s*==UserScript==([\s\S]*?)\/\/\s*==\/UserScript==/);
+  if (!headerMatch) return '0.0.0';
+  const versionMatch = headerMatch[1].match(/\/\/\s*@version\s+([^\r\n]+)/);
+  return versionMatch ? versionMatch[1].trim() : '0.0.0';
+}
+
+/**
  * Creates an authentic browser and Tampermonkey sandbox context.
  * Guarantees zero host leaks (`Buffer`, `process`, `require` are strictly undefined).
+ * Dynamically binds GM_info.script.version to the compiled artifact metadata.
  *
  * @param {object} [initialStorage={}] - Seed key-value store for GM_getValue.
+ * @param {string|null} [scriptSourceOrVersion=null] - Compiled script code or explicit version override.
  * @returns {{ context: object, storage: Map, networkCalls: Array, elements: Map, triggerDOMInterval: Function, triggerObserverSync: Function, setPageFetch: Function }}
  */
-function createBrowserSandbox(initialStorage = {}) {
+function createBrowserSandbox(initialStorage = {}, scriptSourceOrVersion = null) {
   const storage = new Map(Object.entries(initialStorage));
   const networkCalls = [];
   const intervals = new Map();
@@ -55,6 +73,11 @@ function createBrowserSandbox(initialStorage = {}) {
   // Authoritative global ID registry for document.getElementById lookups
   const elements = new Map();
   const observerCallbacks = [];
+
+  // Resolve authoritative userscript version dynamically from metadata
+  const resolvedVersion = typeof scriptSourceOrVersion === 'string'
+    ? (scriptSourceOrVersion.includes('==UserScript==') ? extractMetadataVersion(scriptSourceOrVersion) : scriptSourceOrVersion)
+    : '0.0.0';
 
   function matchesSelector(el, sel) {
     if (sel.startsWith('#')) {
@@ -414,7 +437,7 @@ function createBrowserSandbox(initialStorage = {}) {
     // Tampermonkey Sandbox APIs
     GM_getValue: (key, fallback) => storage.has(key) ? storage.get(key) : fallback,
     GM_setValue: (key, val) => { storage.set(key, val); },
-    GM_info: { script: { version: '5.0.0' } },
+    GM_info: { script: { version: resolvedVersion } },
     GM_xmlhttpRequest: (details) => {
       networkCalls.push(details);
     },
@@ -463,11 +486,18 @@ test("Phase 6: UserScript Target Environment Verification (Tampermonkey Browser 
   const adminCode = fs.readFileSync(targets.find(t => t.name === 'nai-admin').outfile, 'utf8');
   const guestCode = fs.readFileSync(targets.find(t => t.name === 'nai-guest').outfile, 'utf8');
 
+  // Authoritative dynamic metadata version extraction
+  const expectedGuestVersion = extractMetadataVersion(guestCode);
+  const expectedAdminVersion = extractMetadataVersion(adminCode);
+
+  assert.ok(expectedGuestVersion !== '0.0.0', "Guest artifact must contain valid @version metadata");
+  assert.ok(expectedAdminVersion !== '0.0.0', "Admin artifact must contain valid @version metadata");
+
   // ---------------------------------------------------------------------------
   // 1. ISOLATION & HOST LEAK EXTERMINATION INVARIANTS
   // ---------------------------------------------------------------------------
   await t.test("Runtime Isolation: Verifies pure browser environment devoid of Node globals", () => {
-    const { context } = createBrowserSandbox();
+    const { context } = createBrowserSandbox({}, guestCode);
 
     vm.runInContext(`
       if (typeof Buffer !== 'undefined') throw new Error("FATAL: Buffer leaked into UserScript sandbox!");
@@ -487,7 +517,7 @@ test("Phase 6: UserScript Target Environment Verification (Tampermonkey Browser 
       approved: false,
       vps_host: '',
       device_secret: ''
-    });
+    }, guestCode);
 
     // Execute compiled guest bundle
     vm.runInContext(guestCode, context);
@@ -517,7 +547,7 @@ test("Phase 6: UserScript Target Environment Verification (Tampermonkey Browser 
       vps_host: 'https://vps.example.duckdns.org',
       device_secret: 's_test_secret_123',
       browser_id: 'b_test_browser_123'
-    });
+    }, guestCode);
 
     // Mock native NovelAI server response for a free tier account
     const rawFreeUserData = {
@@ -558,7 +588,7 @@ test("Phase 6: UserScript Target Environment Verification (Tampermonkey Browser 
       vps_host: 'https://vps.example.duckdns.org',
       admin_token: 'admin_secret_passkey_xyz',
       browser_id: 'b_admin_browser_123'
-    });
+    }, adminCode);
 
     // Seed DOM with navigation row and hamburger button
     context.document.body.innerHTML = `
@@ -685,7 +715,7 @@ test("Phase 6: UserScript Target Environment Verification (Tampermonkey Browser 
       vps_host: 'https://vps.example.duckdns.org',
       device_secret: 's_test_secret_123',
       browser_id: 'b_test_browser_123'
-    });
+    }, guestCode);
 
     context.document.body.innerHTML = `
       <div class="image-gen-footer">
@@ -722,7 +752,12 @@ test("Phase 6: UserScript Target Environment Verification (Tampermonkey Browser 
     assert.strictEqual(networkCalls.length, 1);
     const joinCall = networkCalls[0];
     assert.strictEqual(joinCall.url, 'https://vps.example.duckdns.org/queue/join');
-    assert.strictEqual(joinCall.headers['x-script-version'], '5.0.0');
+    // Dynamic Invariant Assertion: Assert header transmitted matches true compiled artifact version
+    assert.strictEqual(
+      joinCall.headers['x-script-version'],
+      expectedGuestVersion,
+      `Network header x-script-version must dynamically equal compiled guest artifact version (${expectedGuestVersion})`
+    );
     const joinBody = JSON.parse(joinCall.data);
     assert.strictEqual(joinBody.browser_id, 'b_test_browser_123');
     assert.ok(joinBody.req_id.startsWith('req_'));
@@ -807,7 +842,7 @@ test("Phase 6: UserScript Target Environment Verification (Tampermonkey Browser 
       vps_host: 'https://vps.example.duckdns.org',
       device_secret: 's_test_secret_123',
       browser_id: 'b_test_browser_123'
-    });
+    }, guestCode);
 
     vm.runInContext(guestCode, context);
 
@@ -851,7 +886,7 @@ test("Phase 6: UserScript Target Environment Verification (Tampermonkey Browser 
       device_secret: 's_test_secret_123',
       browser_id: 'b_test_browser_123',
       device_nickname: 'TestUser'
-    });
+    }, guestCode);
 
     vm.runInContext(guestCode, context);
 
@@ -884,7 +919,7 @@ test("Phase 6: UserScript Target Environment Verification (Tampermonkey Browser 
   // 8. MULTIBYTE STREAM FRAGMENTATION HELL PATH
   // ---------------------------------------------------------------------------
   await t.test("Hell Path: Multibyte UTF-8 stream chunk fragmentation does not corrupt characters", async () => {
-    const { context } = createBrowserSandbox();
+    const { context } = createBrowserSandbox({}, guestCode);
 
     // 4-byte UTF-8 emoji: '😀' -> [0xF0, 0x9F, 0x98, 0x80]
     // Fragmented right through the middle of the byte sequence
@@ -917,7 +952,7 @@ test("Phase 6: UserScript Target Environment Verification (Tampermonkey Browser 
   // 9. PURE BROWSER CRYPTO PRNG & FALLBACK HELL PATH
   // ---------------------------------------------------------------------------
   await t.test("Crypto Unit: Generates valid 32-char hex and falls back through PRNG engines", () => {
-    const { context } = createBrowserSandbox();
+    const { context } = createBrowserSandbox({}, guestCode);
 
     const cryptoSrc = fs.readFileSync('src/userscripts/shared/crypto.js', 'utf8')
       .replace('export function generateUUID', 'function generateUUID');
@@ -952,7 +987,7 @@ test("Phase 6: UserScript Target Environment Verification (Tampermonkey Browser 
   // 10. HOSTILE PAYLOAD PARAMETER EXTRACTION HELL PATH
   // ---------------------------------------------------------------------------
   await t.test("Parameters Unit: Browser extraction without Buffer across hostile payloads", async () => {
-    const { context } = createBrowserSandbox();
+    const { context } = createBrowserSandbox({}, guestCode);
 
     // Verify extraction on ArrayBuffer, direct Blob, and corrupted inputs inside the sandbox
     const result = await vm.runInContext(`
@@ -1015,6 +1050,40 @@ test("Phase 6: UserScript Target Environment Verification (Tampermonkey Browser 
     }
   });
 
+  // ---------------------------------------------------------------------------
+  // 11b. HELL PATH: METADATA VERSION EXTRACTION PARSER BOUNDARY TESTING
+  // ---------------------------------------------------------------------------
+  await t.test("Hell Path: Metadata Version Parser verifies strict encapsulation and ignores body comments", () => {
+    // 1. Null and Empty checks
+    assert.strictEqual(extractMetadataVersion(null), '0.0.0');
+    assert.strictEqual(extractMetadataVersion(''), '0.0.0');
+
+    // 2. Unclosed metadata block
+    assert.strictEqual(extractMetadataVersion('// ==UserScript==\n// @version 2.0.0'), '0.0.0');
+
+    // 3. Metadata block lacking @version
+    assert.strictEqual(extractMetadataVersion('// ==UserScript==\n// @name Test\n// ==/UserScript=='), '0.0.0');
+
+    // 4. Multiple spaces, tabs, and trailing cleanups
+    const messyHeader = `
+      // ==UserScript==
+      // @name        Messy Script
+      // @version\t  \t  3.14.159   \r
+      // ==/UserScript==
+    `;
+    assert.strictEqual(extractMetadataVersion(messyHeader), '3.14.159');
+
+    // 5. Version declaration outside metadata block must be strictly ignored
+    const deceptiveBody = `
+      // ==UserScript==
+      // @name Valid
+      // @version 1.0.0
+      // ==/UserScript==
+      // @version 999.999.999 (Injected downstream comment)
+    `;
+    assert.strictEqual(extractMetadataVersion(deceptiveBody), '1.0.0', "Parser must not scan past // ==/UserScript== boundary");
+  });
+
   // 12. DYNAMIC CLASS-SCRAPING HARVESTER HELL PATH (NAV BADGE & FLEX INTEGRITY)
   await t.test("Class-Scraping Harvester: Injects Nav Badge into .image-gen-nav-row without flex distortion", () => {
     const { context, triggerObserverSync } = createBrowserSandbox({
@@ -1022,7 +1091,7 @@ test("Phase 6: UserScript Target Environment Verification (Tampermonkey Browser 
       vps_host: 'https://vps.example.duckdns.org',
       device_secret: 's_test_secret_123',
       browser_id: 'b_test_browser_123'
-    });
+    }, guestCode);
 
     context.document.body.innerHTML = `
       <div class="sc-1279ed83-12 vWKbz image-gen-nav-row" data-layout-bar="true">
@@ -1063,7 +1132,7 @@ test("Phase 6: UserScript Target Environment Verification (Tampermonkey Browser 
       vps_host: 'https://vps.example.duckdns.org',
       device_secret: 's_test_secret_123',
       browser_id: 'b_test_browser_123'
-    });
+    }, guestCode);
 
     // Seed DOM WITHOUT any native Opus bar present
     context.document.body.innerHTML = `
@@ -1097,7 +1166,7 @@ test("Phase 6: UserScript Target Environment Verification (Tampermonkey Browser 
       vps_host: 'https://vps.example.duckdns.org',
       device_secret: 's_test_secret_123',
       browser_id: 'b_test_browser_123'
-    });
+    }, guestCode);
 
     context.document.body.innerHTML = `
       <div class="image-gen-footer">
@@ -1178,7 +1247,7 @@ test("Phase 6: UserScript Target Environment Verification (Tampermonkey Browser 
       vps_host: 'https://vps.example.duckdns.org',
       device_secret: 's_test_secret_123',
       browser_id: 'b_test_browser_123'
-    });
+    }, guestCode);
 
     // Native NovelAI user settings modal opens
     context.document.body.innerHTML = `
