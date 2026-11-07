@@ -4,7 +4,7 @@
  *
  * This module is the authoritative persistence engine for the NovelAI gateway.
  * It manages persistent device registrations, approval states, blacklists,
- * and system configuration variables.
+ * financial ledgers, and system configuration variables.
  *
  * DESIGN PRINCIPLES:
  * 1. Zero top-level connection side-effects or ambient environment coupling.
@@ -14,7 +14,10 @@
  * 5. Strict encapsulation: suppresses raw handle leakage completely. Higher layers interact via run/get/all.
  * 6. Relational Normalization (Option 1): Maintains canonical users table for authoritative principal state
  *    while preserving legacy column contracts and synchronizing via SQLite triggers for complete zero-regression safety.
+ * 7. Negative Ledger Invariant: Preserves integer precision on negative balance states (overdrafts) without float casting.
  */
+
+'use strict';
 
 const sqlite3 = require('sqlite3').verbose();
 const path = require('path');
@@ -120,7 +123,7 @@ const initDatabase = async (targetPath) => {
           await execRun(newDb, "PRAGMA busy_timeout = 5000;");
           await execRun(newDb, "PRAGMA foreign_keys = ON;");
 
-          // Canonical Users Table: The authoritative entity for quotas, allowances, tiers, and bans
+          // Canonical Users Table: The authoritative entity for quotas, allowances, tiers, bans, and compute ledgers
           await execRun(newDb, `CREATE TABLE IF NOT EXISTS users (
             user_id TEXT PRIMARY KEY,
             priority_tier TEXT NOT NULL DEFAULT 'Normal',
@@ -130,7 +133,15 @@ const initDatabase = async (targetPath) => {
             anlas_consumed INTEGER NOT NULL DEFAULT 0,
             metered_allowance INTEGER DEFAULT 100,
             last_allowance_update_at INTEGER,
-            discord_username TEXT
+            discord_username TEXT,
+            virtual_anlas_balance INTEGER NOT NULL DEFAULT 0,
+            last_anlas_reset_epoch INTEGER,
+            v5_banked_balance INTEGER NOT NULL DEFAULT 0,
+            v5_last_accrual_epoch INTEGER,
+            v5_daily_consumed INTEGER NOT NULL DEFAULT 0,
+            subscription_period_anlas INTEGER NOT NULL DEFAULT 0,
+            subscription_period_v5 INTEGER NOT NULL DEFAULT 0,
+            subscription_period_start_epoch INTEGER
           )`);
 
           // Canonical Devices Table: Created with complete column set to guarantee backwards compatibility
@@ -148,7 +159,9 @@ const initDatabase = async (targetPath) => {
             discord_username TEXT,
             anlas_consumed INTEGER NOT NULL DEFAULT 0,
             metered_allowance INTEGER DEFAULT 100,
-            last_allowance_update_at INTEGER
+            last_allowance_update_at INTEGER,
+            virtual_anlas_balance INTEGER NOT NULL DEFAULT 0,
+            v5_banked_balance INTEGER NOT NULL DEFAULT 0
           )`);
           
           // Canonical Banned Discords Table: Preserved for legacy contract assertions
@@ -159,7 +172,7 @@ const initDatabase = async (targetPath) => {
             is_notified INTEGER NOT NULL DEFAULT 0
           )`);
           
-          // Config Table: System key-value configurations (e.g., master token)
+          // Config Table: System key-value configurations (e.g., master token, surplus pool)
           await execRun(newDb, `CREATE TABLE IF NOT EXISTS config (
             key TEXT PRIMARY KEY,
             value TEXT NOT NULL
@@ -177,11 +190,36 @@ const initDatabase = async (targetPath) => {
           // Backward-Compatibility Migrations & Trigger Setup inside BEGIN IMMEDIATE
           await execRun(newDb, "BEGIN IMMEDIATE;");
           try {
+            // 1. Transactional Migration for users table
+            const userCols = await execAll(newDb, "PRAGMA table_info(users)");
+            const hasUserCol = (name) => userCols.some(row => row.name === name);
+
+            const userColumnsToAdd = [
+              { name: 'virtual_anlas_balance', ddl: "ALTER TABLE users ADD COLUMN virtual_anlas_balance INTEGER NOT NULL DEFAULT 0" },
+              { name: 'last_anlas_reset_epoch', ddl: "ALTER TABLE users ADD COLUMN last_anlas_reset_epoch INTEGER" },
+              { name: 'v5_banked_balance', ddl: "ALTER TABLE users ADD COLUMN v5_banked_balance INTEGER NOT NULL DEFAULT 0" },
+              { name: 'v5_last_accrual_epoch', ddl: "ALTER TABLE users ADD COLUMN v5_last_accrual_epoch INTEGER" },
+              { name: 'v5_daily_consumed', ddl: "ALTER TABLE users ADD COLUMN v5_daily_consumed INTEGER NOT NULL DEFAULT 0" },
+              { name: 'subscription_period_anlas', ddl: "ALTER TABLE users ADD COLUMN subscription_period_anlas INTEGER NOT NULL DEFAULT 0" },
+              { name: 'subscription_period_v5', ddl: "ALTER TABLE users ADD COLUMN subscription_period_v5 INTEGER NOT NULL DEFAULT 0" },
+              { name: 'subscription_period_start_epoch', ddl: "ALTER TABLE users ADD COLUMN subscription_period_start_epoch INTEGER" }
+            ];
+
+            for (const migration of userColumnsToAdd) {
+              if (!hasUserCol(migration.name)) {
+                await execRun(newDb, migration.ddl);
+              }
+            }
+
+            // 2. Transactional Migration for devices table (includes label, priority_tier, approved defensively)
             const deviceCols = await execAll(newDb, "PRAGMA table_info(devices)");
             const hasCol = (name) => deviceCols.some(row => row.name === name);
 
             const legacyDeviceColumns = [
               { name: 'user_id', ddl: "ALTER TABLE devices ADD COLUMN user_id TEXT" },
+              { name: 'label', ddl: "ALTER TABLE devices ADD COLUMN label TEXT" },
+              { name: 'priority_tier', ddl: "ALTER TABLE devices ADD COLUMN priority_tier TEXT NOT NULL DEFAULT 'Normal'" },
+              { name: 'approved', ddl: "ALTER TABLE devices ADD COLUMN approved INTEGER NOT NULL DEFAULT 0" },
               { name: 'discord_id', ddl: "ALTER TABLE devices ADD COLUMN discord_id TEXT" },
               { name: 'anlas_consumed', ddl: "ALTER TABLE devices ADD COLUMN anlas_consumed INTEGER NOT NULL DEFAULT 0" },
               { name: 'banned', ddl: "ALTER TABLE devices ADD COLUMN banned INTEGER NOT NULL DEFAULT 0" },
@@ -189,7 +227,9 @@ const initDatabase = async (targetPath) => {
               { name: 'last_active_at', ddl: "ALTER TABLE devices ADD COLUMN last_active_at INTEGER" },
               { name: 'discord_username', ddl: "ALTER TABLE devices ADD COLUMN discord_username TEXT" },
               { name: 'metered_allowance', ddl: "ALTER TABLE devices ADD COLUMN metered_allowance INTEGER DEFAULT 100" },
-              { name: 'last_allowance_update_at', ddl: "ALTER TABLE devices ADD COLUMN last_allowance_update_at INTEGER" }
+              { name: 'last_allowance_update_at', ddl: "ALTER TABLE devices ADD COLUMN last_allowance_update_at INTEGER" },
+              { name: 'virtual_anlas_balance', ddl: "ALTER TABLE devices ADD COLUMN virtual_anlas_balance INTEGER NOT NULL DEFAULT 0" },
+              { name: 'v5_banked_balance', ddl: "ALTER TABLE devices ADD COLUMN v5_banked_balance INTEGER NOT NULL DEFAULT 0" }
             ];
 
             for (const migration of legacyDeviceColumns) {
@@ -198,30 +238,51 @@ const initDatabase = async (targetPath) => {
               }
             }
 
+            // 3. Transactional Migration for banned_discords
             const banCols = await execAll(newDb, "PRAGMA table_info(banned_discords)");
             const hasBanCol = (name) => banCols.some(row => row.name === name);
             if (!hasBanCol('is_notified')) {
               await execRun(newDb, "ALTER TABLE banned_discords ADD COLUMN is_notified INTEGER NOT NULL DEFAULT 0");
             }
 
-            // Populate users table from any pre-existing devices records
+            // 4. Seed ACS-1 Dynamic Cluster Surplus Keys into config table
+            await execRun(newDb, `INSERT OR IGNORE INTO config (key, value) VALUES ('v5_surplus_pool', '0')`);
+            await execRun(newDb, `INSERT OR IGNORE INTO config (key, value) VALUES ('v5_surplus_last_accrual', '0')`);
+
+            // 5. Populate users table from pre-existing devices records, prioritizing canonical user_id
             await execRun(newDb, `
-              INSERT OR IGNORE INTO users (user_id, priority_tier, banned, anlas_consumed, metered_allowance, last_allowance_update_at, discord_username)
-              SELECT COALESCE(discord_id, browser_id), priority_tier, banned, anlas_consumed, COALESCE(metered_allowance, 100), last_allowance_update_at, discord_username
+              INSERT OR IGNORE INTO users (
+                user_id, priority_tier, banned, anlas_consumed, metered_allowance, last_allowance_update_at, discord_username,
+                virtual_anlas_balance, v5_banked_balance
+              )
+              SELECT 
+                COALESCE(user_id, discord_id, browser_id), priority_tier, banned, anlas_consumed, COALESCE(metered_allowance, 100), last_allowance_update_at, discord_username,
+                COALESCE(virtual_anlas_balance, 0), COALESCE(v5_banked_balance, 0)
               FROM devices
             `);
 
             await execRun(newDb, `
-              UPDATE devices SET user_id = COALESCE(discord_id, browser_id) WHERE user_id IS NULL
+              UPDATE devices SET user_id = COALESCE(user_id, discord_id, browser_id) WHERE user_id IS NULL
             `);
 
-            // Bidirectional Synchronization Triggers
+            // 6. Reset triggers to modern schema definitions
+            await execRun(newDb, "DROP TRIGGER IF EXISTS trg_sync_devices_insert;");
+            await execRun(newDb, "DROP TRIGGER IF EXISTS trg_sync_devices_update_allowance;");
+            await execRun(newDb, "DROP TRIGGER IF EXISTS trg_sync_users_update_allowance;");
+            await execRun(newDb, "DROP TRIGGER IF EXISTS trg_sync_devices_update_balances;");
+            await execRun(newDb, "DROP TRIGGER IF EXISTS trg_sync_users_update_balances;");
+            await execRun(newDb, "DROP TRIGGER IF EXISTS trg_sync_devices_update_user_id;");
+            await execRun(newDb, "DROP TRIGGER IF EXISTS trg_sync_banned_discords_insert;");
+            await execRun(newDb, "DROP TRIGGER IF EXISTS trg_sync_banned_discords_delete;");
+
+            // 7. Bidirectional Synchronization Triggers
             await execRun(newDb, `
               CREATE TRIGGER IF NOT EXISTS trg_sync_devices_insert
               AFTER INSERT ON devices
               BEGIN
                 INSERT INTO users (
-                  user_id, priority_tier, banned, anlas_consumed, metered_allowance, last_allowance_update_at, discord_username
+                  user_id, priority_tier, banned, anlas_consumed, metered_allowance, last_allowance_update_at, discord_username,
+                  virtual_anlas_balance, v5_banked_balance
                 ) VALUES (
                   COALESCE(NEW.user_id, NEW.discord_id, NEW.browser_id),
                   COALESCE(NEW.priority_tier, 'Normal'),
@@ -229,20 +290,28 @@ const initDatabase = async (targetPath) => {
                   COALESCE(NEW.anlas_consumed, 0),
                   COALESCE(NEW.metered_allowance, 100),
                   COALESCE(NEW.last_allowance_update_at, CAST((julianday('now') - 2440587.5) * 86400000 AS INTEGER)),
-                  NEW.discord_username
+                  NEW.discord_username,
+                  COALESCE(NEW.virtual_anlas_balance, 0),
+                  COALESCE(NEW.v5_banked_balance, 0)
                 )
                 ON CONFLICT(user_id) DO UPDATE SET
                   banned = MAX(users.banned, excluded.banned),
                   priority_tier = CASE WHEN excluded.priority_tier != 'Normal' THEN excluded.priority_tier ELSE users.priority_tier END;
 
-                UPDATE devices SET user_id = COALESCE(NEW.user_id, NEW.discord_id, NEW.browser_id)
-                WHERE browser_id = NEW.browser_id AND user_id IS NULL;
+                UPDATE devices SET 
+                  user_id = COALESCE(NEW.user_id, NEW.discord_id, NEW.browser_id),
+                  metered_allowance = (SELECT metered_allowance FROM users WHERE user_id = COALESCE(NEW.user_id, NEW.discord_id, NEW.browser_id)),
+                  last_allowance_update_at = (SELECT last_allowance_update_at FROM users WHERE user_id = COALESCE(NEW.user_id, NEW.discord_id, NEW.browser_id)),
+                  virtual_anlas_balance = COALESCE((SELECT virtual_anlas_balance FROM users WHERE user_id = COALESCE(NEW.user_id, NEW.discord_id, NEW.browser_id)), 0),
+                  v5_banked_balance = COALESCE((SELECT v5_banked_balance FROM users WHERE user_id = COALESCE(NEW.user_id, NEW.discord_id, NEW.browser_id)), 0)
+                WHERE browser_id = NEW.browser_id;
               END;
             `);
 
             await execRun(newDb, `
               CREATE TRIGGER IF NOT EXISTS trg_sync_devices_update_allowance
               AFTER UPDATE OF metered_allowance, last_allowance_update_at ON devices
+              WHEN (OLD.metered_allowance IS NOT NEW.metered_allowance OR OLD.last_allowance_update_at IS NOT NEW.last_allowance_update_at)
               BEGIN
                 UPDATE users SET
                   metered_allowance = NEW.metered_allowance,
@@ -254,11 +323,50 @@ const initDatabase = async (targetPath) => {
             await execRun(newDb, `
               CREATE TRIGGER IF NOT EXISTS trg_sync_users_update_allowance
               AFTER UPDATE OF metered_allowance, last_allowance_update_at ON users
+              WHEN (OLD.metered_allowance IS NOT NEW.metered_allowance OR OLD.last_allowance_update_at IS NOT NEW.last_allowance_update_at)
               BEGIN
                 UPDATE devices SET
                   metered_allowance = NEW.metered_allowance,
                   last_allowance_update_at = NEW.last_allowance_update_at
                 WHERE user_id = NEW.user_id OR discord_id = NEW.user_id;
+              END;
+            `);
+
+            await execRun(newDb, `
+              CREATE TRIGGER IF NOT EXISTS trg_sync_devices_update_balances
+              AFTER UPDATE OF virtual_anlas_balance, v5_banked_balance ON devices
+              WHEN (OLD.virtual_anlas_balance IS NOT NEW.virtual_anlas_balance OR OLD.v5_banked_balance IS NOT NEW.v5_banked_balance)
+              BEGIN
+                UPDATE users SET
+                  virtual_anlas_balance = NEW.virtual_anlas_balance,
+                  v5_banked_balance = NEW.v5_banked_balance
+                WHERE user_id = COALESCE(NEW.user_id, NEW.discord_id, NEW.browser_id);
+              END;
+            `);
+
+            await execRun(newDb, `
+              CREATE TRIGGER IF NOT EXISTS trg_sync_users_update_balances
+              AFTER UPDATE OF virtual_anlas_balance, v5_banked_balance ON users
+              WHEN (OLD.virtual_anlas_balance IS NOT NEW.virtual_anlas_balance OR OLD.v5_banked_balance IS NOT NEW.v5_banked_balance)
+              BEGIN
+                UPDATE devices SET
+                  virtual_anlas_balance = NEW.virtual_anlas_balance,
+                  v5_banked_balance = NEW.v5_banked_balance
+                WHERE user_id = NEW.user_id OR discord_id = NEW.user_id;
+              END;
+            `);
+
+            await execRun(newDb, `
+              CREATE TRIGGER IF NOT EXISTS trg_sync_devices_update_user_id
+              AFTER UPDATE OF user_id ON devices
+              WHEN (OLD.user_id IS NOT NEW.user_id AND NEW.user_id IS NOT NULL)
+              BEGIN
+                UPDATE devices SET
+                  metered_allowance = (SELECT metered_allowance FROM users WHERE user_id = NEW.user_id),
+                  last_allowance_update_at = (SELECT last_allowance_update_at FROM users WHERE user_id = NEW.user_id),
+                  virtual_anlas_balance = COALESCE((SELECT virtual_anlas_balance FROM users WHERE user_id = NEW.user_id), 0),
+                  v5_banked_balance = COALESCE((SELECT v5_banked_balance FROM users WHERE user_id = NEW.user_id), 0)
+                WHERE browser_id = NEW.browser_id;
               END;
             `);
 

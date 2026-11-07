@@ -12,16 +12,17 @@
  * 7. Explicit key sanitization protects against prototype pollution while preserving standard Object prototype methods.
  * 8. Deep immutability: all tier objects and manifests are deeply frozen across both default and custom paths.
  * 9. Upstream URL Template Injection: Allows end-to-end transport isolation without runtime monkey-patching.
+ * 10. ACS-1 Architecture Invariant: Strict integer enforcement on discrete quotas and weights (zero float drift).
  */
 
 'use strict';
 
 const DEFAULT_TIER_CONFIGS = Object.freeze({
-  'Admin':   Object.freeze({ basePriority: 30, preciseLimit: Infinity, maxBurst: Infinity, refillRate: 0,      maxAllowance: Infinity, refillRateMs: 0 }),
-  'High':    Object.freeze({ basePriority: 20, preciseLimit: 3,        maxBurst: Infinity, refillRate: 0,      maxAllowance: Infinity, refillRateMs: 0 }),
-  'Normal':  Object.freeze({ basePriority: 10, preciseLimit: 2,        maxBurst: 15,       refillRate: 120000, maxAllowance: Infinity, refillRateMs: 0 }),
-  'Low':     Object.freeze({ basePriority: 0,  preciseLimit: 1,        maxBurst: 10,       refillRate: 120000, maxAllowance: Infinity, refillRateMs: 0 }),
-  'Metered': Object.freeze({ basePriority: 0,  preciseLimit: 0,        maxBurst: 5,        refillRate: 120000, maxAllowance: 100,      refillRateMs: 1800000 })
+  'Admin':   Object.freeze({ basePriority: 30, preciseLimit: Infinity, maxBurst: Infinity, refillRate: 0,      maxAllowance: Infinity, refillRateMs: 0,       monthlyAnlas: Infinity, v5Weight: 4, v5MaxBankDays: Infinity, v5SurplusEligible: true }),
+  'High':    Object.freeze({ basePriority: 20, preciseLimit: 3,        maxBurst: Infinity, refillRate: 0,      maxAllowance: Infinity, refillRateMs: 0,       monthlyAnlas: 1000,     v5Weight: 3, v5MaxBankDays: 3,        v5SurplusEligible: true }),
+  'Normal':  Object.freeze({ basePriority: 10, preciseLimit: 2,        maxBurst: 15,       refillRate: 120000, maxAllowance: Infinity, refillRateMs: 0,       monthlyAnlas: 500,      v5Weight: 2, v5MaxBankDays: 3,        v5SurplusEligible: true }),
+  'Low':     Object.freeze({ basePriority: 0,  preciseLimit: 1,        maxBurst: 10,       refillRate: 120000, maxAllowance: Infinity, refillRateMs: 0,       monthlyAnlas: 200,      v5Weight: 1, v5MaxBankDays: 3,        v5SurplusEligible: true }),
+  'Metered': Object.freeze({ basePriority: 0,  preciseLimit: 0,        maxBurst: 5,        refillRate: 120000, maxAllowance: 100,      refillRateMs: 1800000, monthlyAnlas: 0,        v5Weight: 0, v5MaxBankDays: 0,        v5SurplusEligible: false })
 });
 
 const MANDATORY_BASE_TIERS = Object.freeze(['Admin', 'High', 'Normal', 'Low', 'Metered']);
@@ -71,9 +72,15 @@ const OPERATIONAL_DEFAULTS = Object.freeze({
   
   // Identity & Account Policies
   ACTIVE_SESSION_TTL_MS: 30000, // Active presence RAM threshold
-  MAX_LINKED_DEVICES_PER_USER: 3
+  MAX_LINKED_DEVICES_PER_USER: 3,
 
-  //TODO: Add a MINIMUM_USERSCRIPT_VERSION parameter to enforce legacy client versioning and prevent unsupported API calls.
+  // ACS-1 Operational Constants
+  NOMINAL_DAILY_V5_COMPUTE: 190.0,
+  V5_CIRCUIT_BREAKER_PERCENT: 5.5,
+  V5_SURPLUS_THRESHOLD_PERCENT: 50.0,
+  INGRESS_SEMAPHORE_MAX: 2,
+  UPLOAD_INACTIVITY_TIMEOUT_MS: 5000,
+  UPLOAD_DURATION_CEILING_MS: 60000
 });
 
 /**
@@ -122,6 +129,8 @@ function parseTierConfigs(rawTierJson) {
       throw new Error(`Fatal schema violation in TIER_CONFIGS: Tier "${tier}" configuration must be an object.`);
     }
 
+    const defaultCfg = DEFAULT_TIER_CONFIGS[tier];
+
     // Strict numerical property checks and non-negative bounds
     if (typeof cfg.basePriority !== 'number' || !Number.isFinite(cfg.basePriority) || cfg.basePriority < 0) {
       throw new Error(`Fatal schema violation in TIER_CONFIGS: Tier "${tier}": basePriority must be a non-negative finite number.`);
@@ -148,13 +157,60 @@ function parseTierConfigs(rawTierJson) {
       throw new Error(`Fatal schema violation in TIER_CONFIGS: Tier "${tier}": maxAllowance must be a non-negative number or null.`);
     }
 
+    // ACS-1 Tier Attributes: monthlyAnlas, v5Weight, v5MaxBankDays, v5SurplusEligible
+    let monthlyAnlas;
+    if (cfg.monthlyAnlas !== undefined) {
+      const val = cfg.monthlyAnlas === null ? Infinity : cfg.monthlyAnlas;
+      if (val !== Infinity && (!Number.isInteger(val) || val < 0)) {
+        throw new Error(`Fatal schema violation in TIER_CONFIGS: Tier "${tier}": monthlyAnlas must be a non-negative integer or null.`);
+      }
+      monthlyAnlas = val;
+    } else {
+      monthlyAnlas = defaultCfg ? defaultCfg.monthlyAnlas : 0;
+    }
+
+    let v5Weight;
+    if (cfg.v5Weight !== undefined) {
+      if (!Number.isInteger(cfg.v5Weight) || cfg.v5Weight < 0) {
+        throw new Error(`Fatal schema violation in TIER_CONFIGS: Tier "${tier}": v5Weight must be a non-negative integer.`);
+      }
+      v5Weight = cfg.v5Weight;
+    } else {
+      v5Weight = defaultCfg ? defaultCfg.v5Weight : 0;
+    }
+
+    let v5MaxBankDays;
+    if (cfg.v5MaxBankDays !== undefined) {
+      const val = cfg.v5MaxBankDays === null ? Infinity : cfg.v5MaxBankDays;
+      if (val !== Infinity && (!Number.isInteger(val) || val < 0)) {
+        throw new Error(`Fatal schema violation in TIER_CONFIGS: Tier "${tier}": v5MaxBankDays must be a non-negative integer or null.`);
+      }
+      v5MaxBankDays = val;
+    } else {
+      v5MaxBankDays = defaultCfg ? defaultCfg.v5MaxBankDays : 0;
+    }
+
+    let v5SurplusEligible;
+    if (cfg.v5SurplusEligible !== undefined) {
+      if (typeof cfg.v5SurplusEligible !== 'boolean') {
+        throw new Error(`Fatal schema violation in TIER_CONFIGS: Tier "${tier}": v5SurplusEligible must be a boolean.`);
+      }
+      v5SurplusEligible = cfg.v5SurplusEligible;
+    } else {
+      v5SurplusEligible = defaultCfg ? defaultCfg.v5SurplusEligible : false;
+    }
+
     mergedConfigs[tier] = Object.freeze({
       basePriority: cfg.basePriority,
       preciseLimit,
       maxBurst,
       refillRate: cfg.refillRate,
       maxAllowance,
-      refillRateMs: cfg.refillRateMs
+      refillRateMs: cfg.refillRateMs,
+      monthlyAnlas,
+      v5Weight,
+      v5MaxBankDays,
+      v5SurplusEligible
     });
   }
 
@@ -226,6 +282,65 @@ function loadConfig(env = process.env) {
     maxPayloadSizeBytes = parsedLimit;
   }
 
+  // Operational Parameter Overrides with Strict Regex Validation
+  let nominalDailyV5Compute = OPERATIONAL_DEFAULTS.NOMINAL_DAILY_V5_COMPUTE;
+  if (env.NOMINAL_DAILY_V5_COMPUTE !== undefined) {
+    const rawVal = String(env.NOMINAL_DAILY_V5_COMPUTE).trim();
+    if (!/^\d+(\.\d+)?$/.test(rawVal)) {
+      throw new Error(`Fatal schema violation in NOMINAL_DAILY_V5_COMPUTE: "${env.NOMINAL_DAILY_V5_COMPUTE}" must be a positive number.`);
+    }
+    const parsedVal = parseFloat(rawVal);
+    if (!Number.isFinite(parsedVal) || parsedVal <= 0) {
+      throw new Error(`Fatal schema violation in NOMINAL_DAILY_V5_COMPUTE: "${env.NOMINAL_DAILY_V5_COMPUTE}" must be a positive number.`);
+    }
+    nominalDailyV5Compute = parsedVal;
+  }
+
+  let v5CircuitBreakerPercent = OPERATIONAL_DEFAULTS.V5_CIRCUIT_BREAKER_PERCENT;
+  if (env.V5_CIRCUIT_BREAKER_PERCENT !== undefined) {
+    const rawVal = String(env.V5_CIRCUIT_BREAKER_PERCENT).trim();
+    if (!/^\d+(\.\d+)?$/.test(rawVal)) {
+      throw new Error(`Fatal schema violation in V5_CIRCUIT_BREAKER_PERCENT: "${env.V5_CIRCUIT_BREAKER_PERCENT}" must be a non-negative number.`);
+    }
+    v5CircuitBreakerPercent = parseFloat(rawVal);
+  }
+
+  let v5SurplusThresholdPercent = OPERATIONAL_DEFAULTS.V5_SURPLUS_THRESHOLD_PERCENT;
+  if (env.V5_SURPLUS_THRESHOLD_PERCENT !== undefined) {
+    const rawVal = String(env.V5_SURPLUS_THRESHOLD_PERCENT).trim();
+    if (!/^\d+(\.\d+)?$/.test(rawVal)) {
+      throw new Error(`Fatal schema violation in V5_SURPLUS_THRESHOLD_PERCENT: "${env.V5_SURPLUS_THRESHOLD_PERCENT}" must be a non-negative number.`);
+    }
+    v5SurplusThresholdPercent = parseFloat(rawVal);
+  }
+
+  let ingressSemaphoreMax = OPERATIONAL_DEFAULTS.INGRESS_SEMAPHORE_MAX;
+  if (env.INGRESS_SEMAPHORE_MAX !== undefined) {
+    const rawVal = String(env.INGRESS_SEMAPHORE_MAX).trim();
+    if (!/^\d+$/.test(rawVal) || parseInt(rawVal, 10) < 1) {
+      throw new Error(`Fatal schema violation in INGRESS_SEMAPHORE_MAX: "${env.INGRESS_SEMAPHORE_MAX}" must be a positive integer.`);
+    }
+    ingressSemaphoreMax = parseInt(rawVal, 10);
+  }
+
+  let uploadInactivityTimeoutMs = OPERATIONAL_DEFAULTS.UPLOAD_INACTIVITY_TIMEOUT_MS;
+  if (env.UPLOAD_INACTIVITY_TIMEOUT_MS !== undefined) {
+    const rawVal = String(env.UPLOAD_INACTIVITY_TIMEOUT_MS).trim();
+    if (!/^\d+$/.test(rawVal) || parseInt(rawVal, 10) < 100) {
+      throw new Error(`Fatal schema violation in UPLOAD_INACTIVITY_TIMEOUT_MS: "${env.UPLOAD_INACTIVITY_TIMEOUT_MS}" must be at least 100ms.`);
+    }
+    uploadInactivityTimeoutMs = parseInt(rawVal, 10);
+  }
+
+  let uploadDurationCeilingMs = OPERATIONAL_DEFAULTS.UPLOAD_DURATION_CEILING_MS;
+  if (env.UPLOAD_DURATION_CEILING_MS !== undefined) {
+    const rawVal = String(env.UPLOAD_DURATION_CEILING_MS).trim();
+    if (!/^\d+$/.test(rawVal) || parseInt(rawVal, 10) < 1000) {
+      throw new Error(`Fatal schema violation in UPLOAD_DURATION_CEILING_MS: "${env.UPLOAD_DURATION_CEILING_MS}" must be at least 1000ms.`);
+    }
+    uploadDurationCeilingMs = parseInt(rawVal, 10);
+  }
+
   const nodeEnv = env.NODE_ENV ? String(env.NODE_ENV).trim() : OPERATIONAL_DEFAULTS.NODE_ENV;
   const tierConfigs = parseTierConfigs(env.TIER_CONFIGS);
 
@@ -253,7 +368,15 @@ function loadConfig(env = process.env) {
     TELEMETRY_STALE_MS: OPERATIONAL_DEFAULTS.TELEMETRY_STALE_MS,
     TELEMETRY_COOLDOWN_MS: OPERATIONAL_DEFAULTS.TELEMETRY_COOLDOWN_MS,
     ACTIVE_SESSION_TTL_MS: OPERATIONAL_DEFAULTS.ACTIVE_SESSION_TTL_MS,
-    MAX_LINKED_DEVICES_PER_USER: OPERATIONAL_DEFAULTS.MAX_LINKED_DEVICES_PER_USER
+    MAX_LINKED_DEVICES_PER_USER: OPERATIONAL_DEFAULTS.MAX_LINKED_DEVICES_PER_USER,
+
+    // ACS-1 Operational Constants
+    NOMINAL_DAILY_V5_COMPUTE: nominalDailyV5Compute,
+    V5_CIRCUIT_BREAKER_PERCENT: v5CircuitBreakerPercent,
+    V5_SURPLUS_THRESHOLD_PERCENT: v5SurplusThresholdPercent,
+    INGRESS_SEMAPHORE_MAX: ingressSemaphoreMax,
+    UPLOAD_INACTIVITY_TIMEOUT_MS: uploadInactivityTimeoutMs,
+    UPLOAD_DURATION_CEILING_MS: uploadDurationCeilingMs
   });
 }
 
