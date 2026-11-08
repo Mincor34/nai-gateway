@@ -28,7 +28,8 @@
  *    - Client intent signaling: verifies POST /auth/debug-intent records intent in RAM and emits state.
  *    - Data Sovereignty Check: Admin armed + Client NOT consenting -> SUPPRESSED (No clandestine admin wiretapping).
  *    - Host Protection Check: Client consenting + Admin NOT armed -> SUPPRESSED (No client-directed log flood DoS).
- *    - Bilateral Execution Check: Client consenting + Admin armed -> LOGGED (Bilateral mutual-consent satisfied).
+ *    - Bilateral Execution Check (Direct JSON): Client consenting + Admin armed -> LOGGED (Bilateral mutual-consent satisfied).
+ *    - Bilateral Execution Check (Multipart/FormData): Client consenting + Admin armed -> LOGGED with prompt preserved and image binary truncated.
  *    - Client Revocation Check: Client toggles intent off -> Immediately suppresses subsequent generation logs.
  *    - Admin Disarm Check: Admin revokes window -> Immediately suppresses subsequent generation logs.
  *    - Scavenger GC Sweeper Expiration: TTL expiration cleans authorization and halts logging automatically.
@@ -552,6 +553,67 @@ test("Phase 5: Stream Safety Invariants & Complete Gateway Integration", async (
       assert.strictEqual(resBilateral.status, 200);
       assert.strictEqual(capturedLogs.includes('AUTHORIZED_MUTUAL_CONSENT_PAYLOAD'), true, 
         "Mutual-Consent Invariant: Payload MUST be logged when both client consent and admin authorization are asserted");
+
+      // -------------------------------------------------------------------------
+      // Test D2: Bilateral Mutual-Consent Satisfied on MULTIPART/FORM-DATA -> MUST LOG
+      // (Additive Invariant: Guarantees multipart diagnostic logging preserves user prompt)
+      // -------------------------------------------------------------------------
+      capturedLogs = '';
+      queueManager.join({ browser_id: 'bilateral_guest', tab_id: 'tab_b3m', req_id: 'req_bilateral_pass_multipart', priority_tier: 'Normal' });
+      
+      const boundary = "diagnostic_multipart_boundary_777";
+      const jsonMultipartBlob = JSON.stringify({
+        prompt: "AUTHORIZED_MULTIPART_MUTUAL_CONSENT_PAYLOAD",
+        model: "nai-diffusion-4-5-full",
+        parameters: { width: 512, height: 512, steps: 28, n_samples: 1 }
+      });
+
+      const rawMultipartBuffer = Buffer.concat([
+        Buffer.from(`--${boundary}\r\nContent-Disposition: form-data; name="request"\r\nContent-Type: application/json\r\n\r\n`),
+        Buffer.from(jsonMultipartBlob),
+        Buffer.from(`\r\n--${boundary}\r\nContent-Disposition: form-data; name="image"; filename="ref.png"\r\nContent-Type: image/png\r\n\r\n`),
+        Buffer.from("FAKE_BINARY_IMAGE_DATA_CHUNK"),
+        Buffer.from(`\r\n--${boundary}--\r\n`)
+      ]);
+
+      const reqMultipart = http.request({
+        hostname: '127.0.0.1',
+        port: TEST_PORT,
+        path: '/proxy/image/ai/generate-image',
+        method: 'POST',
+        headers: {
+          'Authorization': 'Bearer sec_bilateral',
+          'X-Browser-Id': 'bilateral_guest',
+          'X-Request-Id': 'req_bilateral_pass_multipart',
+          'X-Gen-Model': 'legacy',
+          'X-Debug-Mode': 'true',
+          'Content-Type': `multipart/form-data; boundary=${boundary}`
+        }
+      });
+
+      const multipartResPromise = new Promise(resolve => {
+        reqMultipart.on('response', res => {
+          let body = '';
+          res.on('data', chunk => body += chunk);
+          res.on('end', () => resolve({ status: res.statusCode, body }));
+        });
+      });
+
+      reqMultipart.write(rawMultipartBuffer);
+      reqMultipart.end();
+
+      const multipartRes = await multipartResPromise;
+      assert.strictEqual(multipartRes.status, 200);
+      assert.strictEqual(
+        capturedLogs.includes('AUTHORIZED_MULTIPART_MUTUAL_CONSENT_PAYLOAD'), 
+        true, 
+        "CRITICAL TELEMETRY INVARIANT: Multipart diagnostic logging MUST preserve user prompt in logs"
+      );
+      assert.strictEqual(
+        capturedLogs.includes('FAKE_BINARY_IMAGE_DATA_CHUNK'),
+        false,
+        "Zero-Leak Invariant: Raw binary image chunks must NEVER be printed to telemetry logs"
+      );
 
       // -------------------------------------------------------------------------
       // Test E: Client Revocation -> Immediate Log Suppression

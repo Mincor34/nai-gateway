@@ -5,6 +5,9 @@
  * 1. Stateless Buffer Parsing:
  *    - Validates extraction from raw application/json buffers.
  *    - Validates extraction from complex multipart/form-data boundaries.
+ *    - Hell Path: Binary part preceding name="request" (verifies zero UTF-16 string bloat).
+ *    - Hell Path: Delimiter confusion where prompt contains boundary names and CRLF markdown dividers.
+ *    - Hell Path: Mixed CRLF and LF multipart header delimiters.
  *    - Hell Path: Corrupt, truncated, empty, and non-JSON payloads safely return null without uncaught exceptions.
  *    - ReDoS prevention: verifies extraction against 5MB+ base64 image strings.
  * 2. Device Identity & Hierarchical Gatekeeping:
@@ -14,10 +17,13 @@
  *    - Banned Discord accounts rejected unconditionally (403) and synchronized to SQLite devices table.
  * 3. Hard Security Enforcements (Payload Mismatch Detection):
  *    - Asserts that body payload parameter violations flag as bypass violations and trigger bans.
- *    - Asserts that stealth V5 model requests trigger bans and return full eviction targets.
+ *    - Asserts that stealth V5 model requests trigger bans and return full eviction targets across ALL V5 identifier variants.
+ *    - Asserts persistent ban ledger commits across users, devices, and banned_discords tables.
  * 4. Anlas Accounting Ledger:
  *    - Verifies Anlas costs (5 per precise reference) are deducted asynchronously.
- * 5. Token Allowance Ledger:
+ * 5. Extended Parameter Extraction:
+ *    - Verifies clean extraction of SMEA, SMEA-DYN, strength, inpaint strength, and vibe reference metrics.
+ * 6. Token Allowance Ledger:
  *    - Verifies lazy refills, millisecond timing drift preservation, and deduction boundaries.
  */
 
@@ -64,7 +70,16 @@ test("Phase 4: Decoupled Audit Engine & Parameter Extraction Verification", asyn
   await t.test("Extractor: Accurately parses clean application/json buffers", () => {
     const payload = {
       model: "nai-diffusion-3",
-      parameters: { width: 832, height: 1216, steps: 28, n_samples: 1 }
+      parameters: {
+        width: 832,
+        height: 1216,
+        steps: 28,
+        n_samples: 1,
+        sm: true,
+        sm_dyn: true,
+        strength: 0.7,
+        inpaintImg2ImgStrength: 0.3
+      }
     };
     const buffer = Buffer.from(JSON.stringify(payload));
     
@@ -76,6 +91,10 @@ test("Phase 4: Decoupled Audit Engine & Parameter Extraction Verification", asyn
     assert.strictEqual(extracted.n_samples, 1);
     assert.strictEqual(extracted.model, "nai-diffusion-3");
     assert.strictEqual(extracted.precise_ref_count, 0);
+    assert.strictEqual(extracted.sm, true);
+    assert.strictEqual(extracted.sm_dyn, true);
+    assert.strictEqual(extracted.strength, 0.7);
+    assert.strictEqual(extracted.inpaintImg2ImgStrength, 0.3);
   });
 
   await t.test("Extractor: Accurately parses complex multipart/form-data boundaries", () => {
@@ -108,6 +127,41 @@ Content-Type: image/png
     assert.strictEqual(extracted.steps, 20);
     assert.strictEqual(extracted.model, "nai-diffusion-4-5-full");
     assert.strictEqual(extracted.precise_ref_count, 2, "Must aggregate precise character references accurately");
+  });
+
+  await t.test("Hell Path: Multipart Delimiter Collision & Binary Precedence", () => {
+    const binaryChunk = Buffer.alloc(1024 * 1024, 0xFE);
+    binaryChunk.write('name="other_part"', 500);
+
+    const boundary = "extreme_boundary_token_99";
+    const promptWithTraps = `masterpiece\r\n---\r\nfake boundary: --${boundary}\r\ntrailing dashes: --`;
+
+    const jsonPart = JSON.stringify({
+      prompt: promptWithTraps,
+      model: "nai-diffusion-4-full",
+      parameters: {
+        width: 1024,
+        height: 1024,
+        steps: 28,
+        n_samples: 1,
+        director_reference_images_cached: ["refA"]
+      }
+    });
+
+    const multipart = Buffer.concat([
+      Buffer.from(`--${boundary}\r\nContent-Disposition: form-data; name="image"; filename="raw.png"\r\nContent-Type: image/png\r\n\r\n`),
+      binaryChunk,
+      Buffer.from(`\r\n--${boundary}\r\nContent-Disposition: form-data; name="request"\r\nContent-Type: application/json\r\n\r\n`),
+      Buffer.from(jsonPart),
+      Buffer.from(`\r\n--${boundary}--\r\n`)
+    ]);
+
+    const extracted = extractParametersFromRawBody(multipart, `multipart/form-data; boundary=${boundary}`);
+    assert.ok(extracted, "Must parse request part preceded by 1MB binary data and containing delimiter traps");
+    assert.strictEqual(extracted.width, 1024);
+    assert.strictEqual(extracted.steps, 28);
+    assert.strictEqual(extracted.model, "nai-diffusion-4-full");
+    assert.strictEqual(extracted.precise_ref_count, 1);
   });
 
   await t.test("Hell Path: Extractor gracefully returns null on malformed, empty, or non-JSON payloads", () => {
@@ -192,6 +246,11 @@ Content-Type: image/png
     assert.strictEqual(auditResult.discordId, discordId, "Must return target discordId for router-level queue eviction");
     assert.strictEqual(auditResult.browserId, browserId);
     
+    // Assert Ban Ledger across users, devices, and banned_discords
+    const user = await get('SELECT banned, ban_reason FROM users WHERE user_id = ?', [discordId]);
+    assert.strictEqual(user.banned, 1, "User record must be flagged as banned in database");
+    assert.match(user.ban_reason, /Client spoofed headers to bypass ingress limits/i);
+
     const device = await get('SELECT banned FROM devices WHERE browser_id = ?', [browserId]);
     assert.strictEqual(device.banned, 1, "Device must be flagged as banned in database");
 
@@ -200,7 +259,7 @@ Content-Type: image/png
     assert.match(discordBan.reason, /Client spoofed headers to bypass ingress limits/i);
   });
 
-  await t.test("Audit Engine: Model spoofing bypass triggers database bans and returns eviction targets", async () => {
+  await t.test("Audit Engine: Model spoofing bypass triggers database bans across all V5 identifier variants", async () => {
     const browserId = "stealth_v5_client";
     const discordId = "discord_stealth_123";
     await run('INSERT INTO devices (browser_id, device_secret, discord_id, priority_tier, approved, banned) VALUES (?, ?, ?, ?, 1, 0)', 
@@ -218,12 +277,42 @@ Content-Type: image/png
     assert.strictEqual(auditResult.discordId, discordId);
     
     // Assert Ban Ledger
+    const user = await get('SELECT banned, ban_reason FROM users WHERE user_id = ?', [discordId]);
+    assert.strictEqual(user.banned, 1, "Canonical user record must be flagged as banned in users table");
+    assert.match(user.ban_reason, /suppressed X-Gen-Model header/i);
+
     const device = await get('SELECT banned FROM devices WHERE browser_id = ?', [browserId]);
     assert.strictEqual(device.banned, 1);
 
     const discordBan = await get('SELECT reason FROM banned_discords WHERE discord_id = ?', [discordId]);
     assert.ok(discordBan);
     assert.match(discordBan.reason, /suppressed X-Gen-Model header/i);
+
+    // ADDITIVE INVARIANT ASSERTION: Bare 'nai-diffusion-5' variant must also trigger full database ban ledger
+    const browserIdBare = "stealth_v5_bare_client";
+    const discordIdBare = "discord_stealth_bare";
+    await run('INSERT INTO devices (browser_id, device_secret, discord_id, priority_tier, approved, banned) VALUES (?, ?, ?, ?, 1, 0)', 
+      [browserIdBare, "secret", discordIdBare, "Normal"]);
+
+    const payloadBare = Buffer.from(JSON.stringify({
+      model: "nai-diffusion-5",
+      parameters: { width: 1024, height: 1024, steps: 28, n_samples: 1 }
+    }));
+
+    const auditResultBare = await runBackgroundAudit(browserIdBare, payloadBare, false);
+    assert.strictEqual(auditResultBare.banned, true, "Bare 'nai-diffusion-5' without suffixes must trigger model spoof ban");
+    assert.strictEqual(auditResultBare.discordId, discordIdBare);
+
+    const userBare = await get('SELECT banned, ban_reason FROM users WHERE user_id = ?', [discordIdBare]);
+    assert.strictEqual(userBare.banned, 1, "User must be flagged banned in users table");
+    assert.match(userBare.ban_reason, /suppressed X-Gen-Model header/i);
+
+    const devBare = await get('SELECT banned FROM devices WHERE browser_id = ?', [browserIdBare]);
+    assert.strictEqual(devBare.banned, 1, "Device must be flagged banned in devices table");
+
+    const discordBanBare = await get('SELECT reason FROM banned_discords WHERE discord_id = ?', [discordIdBare]);
+    assert.ok(discordBanBare, "Must record ban in banned_discords");
+    assert.match(discordBanBare.reason, /suppressed X-Gen-Model header/i);
   });
 
   await t.test("Audit Engine: Verifies exact Anlas deduction ledger per reference image", async () => {
