@@ -2,8 +2,11 @@ module.exports = {
   apps: [{
     name: "nai-gateway-prod",
     script: "./server.js",
+    // Optional: pin explicit Node binary path when using nvm so shell PATH drift cannot swap runtimes
+    // interpreter: "/path/to/node",
     watch: false,
-    max_memory_restart: "200M",
+    // Must exceed baseline Node/SQLite RSS + (INGRESS_SEMAPHORE_MAX * MAX_PAYLOAD_SIZE_BYTES) + concat/JSON headroom
+    max_memory_restart: "512M",
     env: {
       NODE_ENV: "production",
       PORT: 3000,

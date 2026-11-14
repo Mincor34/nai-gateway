@@ -22,7 +22,7 @@ const ANLAS_MAX_PER_IMAGE_CAP = 140;
 
 // Maximum permissible byte ceiling for the extracted JSON metadata slice (~20MB).
 // Accommodates up to 12 full-resolution Base64 reference images while bounding
-// peak dual-stream heap allocations to <160MB, safely beneath PM2's 200MB ceiling.
+// metadata string and JSON parse heap allocations per request.
 const MAX_JSON_PART_BYTES = 20971520;
 
 // Static Module-Scoped Binary Needles & Part Header Inspection Patterns

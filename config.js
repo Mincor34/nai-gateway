@@ -48,7 +48,7 @@ const OPERATIONAL_DEFAULTS = Object.freeze({
   // Upstream Destination Boundary
   UPSTREAM_BASE_URL_TEMPLATE: 'https://{subdomain}.novelai.net',
 
-  // Physical Memory Boundary: 50MB maximum request buffer fits comfortably within PM2 200MB heap
+  // Physical Memory Boundary: 50MB maximum request buffer bounds per-request staging allocations
   // while supporting multiple Base64-inflated high-resolution reference images
   MAX_PAYLOAD_SIZE_BYTES: 52428800,
 

@@ -260,7 +260,8 @@ router.all('/:subdomain/{*splat}', async (req, res) => {
     req.on('end', () => {
       if (req.destroyed || payloadExceededLimit) return;
 
-      const payloadBuffer = Buffer.concat(bodyChunks);
+      const payloadBuffer = Buffer.concat(bodyChunks, accumulatedBytes);
+      bodyChunks.length = 0;
 
       // Asynchronous Audit & Session Tracking
       setImmediate(async () => {

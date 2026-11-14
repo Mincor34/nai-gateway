@@ -60,6 +60,8 @@ A single-concurrency transaction queue and split-token reverse proxy designed to
 2. **Configure Runtime Environment Manifests**
    Environment variables are managed dynamically via local PM2 configuration files. This separates runtime states without requiring manual exports or external environment dependency management.
 
+   Size `max_memory_restart` above your measured baseline Node/SQLite RSS plus peak transient request allocations (`INGRESS_SEMAPHORE_MAX * MAX_PAYLOAD_SIZE_BYTES` plus concatenation and JSON parsing headroom) so PM2 never restarts mid-upload and wipes in-memory queue locks. With the default `50MB` payload limit and `2` concurrent ingress streams, `"512M"` provides adequate headroom. If running `nvm`, optionally set `interpreter` to the absolute Node binary path so shell `PATH` differences cannot alter the runtime.
+
    * **Production Configuration (`~/nai-gateway/ecosystem.config.js`):**
      ```javascript
      module.exports = {
@@ -67,7 +69,7 @@ A single-concurrency transaction queue and split-token reverse proxy designed to
          name: "nai-gateway-prod",
          script: "./server.js",
          watch: false,
-         max_memory_restart: "200M",
+         max_memory_restart: "512M",
          env: {
            NODE_ENV: "production",
            PORT: 3000,
@@ -85,7 +87,7 @@ A single-concurrency transaction queue and split-token reverse proxy designed to
          name: "nai-gateway-staging",
          script: "./server.js",
          watch: false,
-         max_memory_restart: "200M",
+         max_memory_restart: "512M",
          env: {
            NODE_ENV: "staging",
            PORT: 3001,
@@ -97,7 +99,7 @@ A single-concurrency transaction queue and split-token reverse proxy designed to
      ```
 
 3. **Initialize Persistent Daemon Execution**
-   Deploy the instances using their respective manifest files. PM2 will read the parameters and maintain runtime memory separation:
+   Deploy the instances from a clean non-IDE SSH session (not an integrated editor terminal, which leaks editor environment variables and `PATH` overrides into PM2). PM2 will read the parameters and maintain runtime memory separation:
    ```bash
    # Start production gateway
    cd ~/nai-gateway
@@ -107,7 +109,7 @@ A single-concurrency transaction queue and split-token reverse proxy designed to
    cd ~/nai-gateway-staging
    pm2 start ecosystem.config.js
 
-   # Configure PM2 to restart on VPS reboot
+   # Configure PM2 to restart cleanly via systemd on VPS reboot
    pm2 startup
    pm2 save
    ```
