@@ -36,8 +36,8 @@ A single-concurrency transaction queue and split-token reverse proxy designed to
 ## 2. Server Installation (VPS Host)
 
 ### Prerequisites
-* **Node.js** (v18.x or v20.x recommended)
-* **SQLite3 Build Tools** (compiled natively during `npm install`)
+* **Node.js** (v26.x LTS recommended; Linux hosts require `libatomic` on RHEL/Oracle Linux or `libatomic1` on Debian/Ubuntu)
+* **SQLite3 Build Tools** (only required if prebuilt `linux-arm64`/`linux-x64` binaries are unavailable during `npm install`)
 * **Process Manager (PM2)**: For daemon execution and automated crash recovery.
 * **Reverse Proxy (Caddy or Nginx)**: For automated TLS certificate acquisition and TLS termination.
 

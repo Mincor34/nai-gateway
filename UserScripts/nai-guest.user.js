@@ -67,16 +67,13 @@
   }
   function parseResponseHeaders(headerStr) {
     const headers = new Headers();
-    if (!headerStr)
-      return headers;
+    if (!headerStr) return headers;
     const lines = headerStr.split(/[\r\n]+/);
     lines.forEach((line) => {
       const trimmedLine = line.trim();
-      if (!trimmedLine)
-        return;
+      if (!trimmedLine) return;
       const colonIndex = trimmedLine.indexOf(":");
-      if (colonIndex === -1)
-        return;
+      if (colonIndex === -1) return;
       const name = trimmedLine.slice(0, colonIndex).trim();
       const value = trimmedLine.slice(colonIndex + 1).trim();
       if (name) {
@@ -106,15 +103,13 @@
     return 0;
   }
   async function readStreamAsString(stream) {
-    if (!stream)
-      return "";
+    if (!stream) return "";
     const reader = stream.getReader();
     const decoder = new TextDecoder();
     let result = "";
     while (true) {
       const { done, value } = await reader.read();
-      if (done)
-        break;
+      if (done) break;
       result += decoder.decode(value, { stream: true });
     }
     result += decoder.decode();
@@ -137,11 +132,9 @@
     return classCache.get(cacheKey) || "";
   }
   function injectNavBadge(onClickHandler) {
-    if (document.getElementById("gw-nav-badge"))
-      return true;
+    if (document.getElementById("gw-nav-badge")) return true;
     const menuBtn = document.querySelector('button[aria-label="menu"]');
-    if (!menuBtn || !menuBtn.parentElement)
-      return false;
+    if (!menuBtn || !menuBtn.parentElement) return false;
     const btnClasses = getElementClasses(menuBtn, "nav_menu_btn");
     const badgeBtn = document.createElement("button");
     badgeBtn.id = "gw-nav-badge";
@@ -174,11 +167,9 @@
     return true;
   }
   function injectAllowanceBar() {
-    if (document.getElementById("gw-allowance-bar"))
-      return true;
+    if (document.getElementById("gw-allowance-bar")) return true;
     const genBtn = document.querySelector(".image-gen-generate-button");
-    if (!genBtn || !genBtn.parentElement)
-      return false;
+    if (!genBtn || !genBtn.parentElement) return false;
     const barRoot = document.createElement("div");
     barRoot.id = "gw-allowance-bar";
     barRoot.style.cssText = `
@@ -243,8 +234,7 @@
     injectAllowanceBar();
     const labelSpan = document.getElementById("gw-allowance-label");
     const fillDiv = document.getElementById("gw-allowance-fill");
-    if (!labelSpan || !fillDiv)
-      return;
+    if (!labelSpan || !fillDiv) return;
     if (allowance === null || maxAllowance === Infinity) {
       labelSpan.textContent = "Rolling Allowance: Exempt (Unlimited)";
       fillDiv.style.width = "100%";
@@ -273,10 +263,8 @@
   }
   function injectQueueShield() {
     const genBtn = document.querySelector(".image-gen-generate-button");
-    if (!genBtn)
-      return false;
-    if (document.getElementById("gw-button-shield"))
-      return true;
+    if (!genBtn) return false;
+    if (document.getElementById("gw-button-shield")) return true;
     genBtn.style.position = "relative";
     genBtn.style.overflow = "hidden";
     const shield = document.createElement("div");
@@ -314,8 +302,7 @@
     injectQueueShield();
     const shield = document.getElementById("gw-button-shield");
     const labelText = document.getElementById("gw-shield-text");
-    if (!shield || !labelText)
-      return;
+    if (!shield || !labelText) return;
     const genBtn = shield.parentElement;
     if (genBtn) {
       for (const child of genBtn.children) {
@@ -336,8 +323,7 @@
   var observerInstance = null;
   var rafScheduled = false;
   function initDOMObserver(options = {}) {
-    if (observerInstance)
-      observerInstance.disconnect();
+    if (observerInstance) observerInstance.disconnect();
     const runSync = () => {
       rafScheduled = false;
       injectNavBadge(options.onOpenSettings);
@@ -347,8 +333,7 @@
     observerInstance = new MutationObserver((mutations) => {
       let relevant = false;
       for (const m of mutations) {
-        if (m.target && m.target.id && m.target.id.startsWith("gw-"))
-          continue;
+        if (m.target && m.target.id && m.target.id.startsWith("gw-")) continue;
         if (m.addedNodes.length > 0 || m.removedNodes.length > 0) {
           relevant = true;
           break;
@@ -378,32 +363,27 @@
     setQueueShieldState(false, "");
   }
   function injectWarningBadge(message, bgColor) {
-    if (document.getElementById("vps-debug-badge"))
-      return;
+    if (document.getElementById("vps-debug-badge")) return;
     const badge = document.createElement("div");
     badge.id = "vps-debug-badge";
     badge.innerHTML = message;
     badge.style.cssText = `position:fixed; top:10px; left:50%; transform:translateX(-50%); background:${bgColor}; color:#fff; font-weight:bold; font-size:11px; padding:6px 12px; border-radius:4px; z-index:99999; box-shadow:0 2px 8px rgba(0,0,0,0.4); pointer-events:none; font-family:sans-serif;`;
     const root = document.body || document.documentElement;
-    if (root)
-      root.appendChild(badge);
+    if (root) root.appendChild(badge);
   }
   function removeWarningBadge() {
     const badge = document.getElementById("vps-debug-badge");
-    if (badge)
-      badge.remove();
+    if (badge) badge.remove();
   }
 
   // src/userscripts/shared/params.js
   async function extractImageParams(body) {
-    if (!body)
-      return null;
+    if (!body) return null;
     try {
       let payload = null;
       if (typeof FormData !== "undefined" && body instanceof FormData) {
         const requestBlob = body.get("request");
-        if (!requestBlob)
-          return null;
+        if (!requestBlob) return null;
         const text = typeof requestBlob.text === "function" ? await requestBlob.text() : String(requestBlob);
         payload = JSON.parse(text);
       } else if (typeof body === "string") {
@@ -503,8 +483,7 @@
       console.log(`[VPS Gateway] Telemetry: Received raw error text: "${errorText}"`);
       let parsedError = null;
       try {
-        if (errorText)
-          parsedError = JSON.parse(errorText);
+        if (errorText) parsedError = JSON.parse(errorText);
       } catch (e) {
       }
       const responseBody = parsedError && (parsedError.statusCode || parsedError.message || parsedError.error) ? JSON.stringify({
@@ -533,8 +512,7 @@
     const originalBody = config.body;
     let imgParams = { width: 1024, height: 1024, steps: 28, n_samples: 1, precise_refs: 0, model: "" };
     const extracted = await extractImageParams(originalBody);
-    if (extracted)
-      imgParams = extracted;
+    if (extracted) imgParams = extracted;
     const executeQueueJoin = async () => {
       try {
         const joinRes = await backgroundRequest({
@@ -569,8 +547,7 @@
             }), { status: 403 });
           }
         }
-        if (joinRes.status !== 200)
-          throw new Error("Join rejection");
+        if (joinRes.status !== 200) throw new Error("Join rejection");
       } catch (e) {
         return new Response(JSON.stringify({ statusCode: 502, message: "Queue allocation failure" }), { status: 502 });
       }
@@ -659,16 +636,14 @@
           responseType: "stream",
           onloadstart: async function(responseDetails) {
             console.log(`[${envConfig.logPrefix}] Telemetry: onloadstart fired. ReadyState: ${responseDetails.readyState}, Status: ${extractStatusCode(responseDetails)}`);
-            if (hasResolved)
-              return;
+            if (hasResolved) return;
             if (await tryResolveProxyResponse(responseDetails, resolve, true, false)) {
               hasResolved = true;
             }
           },
           onreadystatechange: async function(responseDetails) {
             console.log(`[${envConfig.logPrefix}] Telemetry: onreadystatechange fired. ReadyState: ${responseDetails.readyState}, ExtractedStatus: ${extractStatusCode(responseDetails)}`);
-            if (hasResolved)
-              return;
+            if (hasResolved) return;
             if (responseDetails.readyState >= 2) {
               if (await tryResolveProxyResponse(responseDetails, resolve, true, false)) {
                 hasResolved = true;
@@ -677,8 +652,7 @@
           },
           onload: async function(responseDetails) {
             console.log(`[${envConfig.logPrefix}] Telemetry: onload fired. Status: ${extractStatusCode(responseDetails)}. Socket download complete.`);
-            if (hasResolved)
-              return;
+            if (hasResolved) return;
             if (await tryResolveProxyResponse(responseDetails, resolve, true, false)) {
               hasResolved = true;
             }
@@ -748,16 +722,14 @@
         responseType: "stream",
         onloadstart: async function(responseDetails) {
           console.log(`[${envConfig.logPrefix}] Telemetry (Text): onloadstart fired. ReadyState: ${responseDetails.readyState}, Status: ${extractStatusCode(responseDetails)}`);
-          if (hasResolved)
-            return;
+          if (hasResolved) return;
           if (await tryResolveProxyResponse(responseDetails, resolve, false, true)) {
             hasResolved = true;
           }
         },
         onreadystatechange: async function(responseDetails) {
           console.log(`[${envConfig.logPrefix}] Telemetry (Text): onreadystatechange fired. ReadyState: ${responseDetails.readyState}, Status: ${extractStatusCode(responseDetails)}`);
-          if (hasResolved)
-            return;
+          if (hasResolved) return;
           if (responseDetails.readyState >= 2) {
             if (await tryResolveProxyResponse(responseDetails, resolve, false, true)) {
               hasResolved = true;
@@ -766,8 +738,7 @@
         },
         onload: async function(responseDetails) {
           console.log(`[${envConfig.logPrefix}] Telemetry (Text): onload fired. Status: ${extractStatusCode(responseDetails)}. Socket download complete.`);
-          if (hasResolved)
-            return;
+          if (hasResolved) return;
           if (await tryResolveProxyResponse(responseDetails, resolve, false, true)) {
             hasResolved = true;
           }
@@ -886,12 +857,10 @@
   }
   var enforcementInterval = null;
   function startUIEnforcement() {
-    if (enforcementInterval)
-      return;
+    if (enforcementInterval) return;
     console.log("Nai-Guest: Starting high-frequency UI enforcement loop...");
     enforcementInterval = setInterval(() => {
-      if (!document.body)
-        return;
+      if (!document.body) return;
       let overlay = document.getElementById("vps-approval-overlay");
       if (!overlay) {
         console.log("Nai-Guest: UI overlay was missing or deleted by React. Re-injecting...");
@@ -904,8 +873,7 @@
     }, 50);
   }
   function renderSetupWizard(container) {
-    if (container.querySelector(".setup-wizard-card"))
-      return;
+    if (container.querySelector(".setup-wizard-card")) return;
     container.innerHTML = `
         <div class="setup-wizard-card" style="background:var(--theme-bg1, #1c1c1c); padding:35px; border-radius:8px; border:1px solid var(--theme-error, #c0392b); box-shadow:0 8px 30px rgba(0,0,0,0.6); max-width:90vw; width:420px; box-sizing:border-box; color:var(--theme-text, #fff); font-family:inherit;">
             <h3 style="margin:0 0 15px 0; color:var(--theme-accent, #00bc8c); text-align:center; letter-spacing:1px; font-size:18px;">GATEWAY COORDINATOR SETUP</h3>
@@ -1090,8 +1058,7 @@
   } else {
     let startStatePolling = function() {
       const poll = async () => {
-        if (!document.getElementById("gw-allowance-bar"))
-          return;
+        if (!document.getElementById("gw-allowance-bar")) return;
         try {
           const res = await backgroundRequest({
             method: "GET",
@@ -1173,8 +1140,7 @@
         `;
       if (onClose) {
         const closeBtn = container.querySelector("#guest-close-modal-btn");
-        if (closeBtn)
-          closeBtn.onclick = onClose;
+        if (closeBtn) closeBtn.onclick = onClose;
       }
       if (domain && deviceSecret) {
         backgroundRequest({
@@ -1185,14 +1151,11 @@
           if (res.status === 200) {
             const data = JSON.parse(res.responseText);
             const tierEl = container.querySelector("#guest-assigned-tier");
-            if (tierEl)
-              tierEl.textContent = data.tier || "Normal";
+            if (tierEl) tierEl.textContent = data.tier || "Normal";
             const refEl = container.querySelector("#guest-precise-limit");
-            if (refEl)
-              refEl.textContent = data.precise_limit === "Unlimited" ? "Unlimited" : `${data.precise_limit} Refs`;
+            if (refEl) refEl.textContent = data.precise_limit === "Unlimited" ? "Unlimited" : `${data.precise_limit} Refs`;
             const anlasEl = container.querySelector("#guest-anlas-consumed");
-            if (anlasEl)
-              anlasEl.textContent = `${data.anlas_consumed || 0} Anlas`;
+            if (anlasEl) anlasEl.textContent = `${data.anlas_consumed || 0} Anlas`;
             const sessionEl = container.querySelector("#guest-rolling-allowance");
             if (sessionEl) {
               if (data.session) {
@@ -1263,23 +1226,18 @@
       };
       saveDomBtn.onclick = () => {
         let val = domInput.value.trim().replace(/\/+$/, "");
-        if (!val)
-          return;
-        if (!/^https?:\/\//i.test(val))
-          val = "https://" + val;
+        if (!val) return;
+        if (!/^https?:\/\//i.test(val)) val = "https://" + val;
         GM_setValue("vps_host", val);
         GM_setValue("approved", false);
-        if (typeof onClose === "function")
-          onClose();
+        if (typeof onClose === "function") onClose();
         window.location.reload();
       };
       debugCheckbox.onchange = async () => {
         const checked = debugCheckbox.checked;
         GM_setValue("debug_mode", checked);
-        if (checked)
-          injectWarningBadge("\u26A0\uFE0F VPS DEBUG INTENT ACTIVE", "var(--theme-warning, #e67e22)");
-        else
-          removeWarningBadge();
+        if (checked) injectWarningBadge("\u26A0\uFE0F VPS DEBUG INTENT ACTIVE", "var(--theme-warning, #e67e22)");
+        else removeWarningBadge();
         debugIntentStatus.style.display = "block";
         debugIntentStatus.style.color = "var(--theme-warning, #f39c12)";
         debugIntentStatus.innerHTML = checked ? "\u23F3 Synchronizing diagnostic debug intent with gateway..." : "\u23F3 Revoking diagnostic debug intent on gateway...";
@@ -1336,8 +1294,7 @@
       let backdrop = document.getElementById("vps-settings-backdrop");
       if (modal) {
         modal.remove();
-        if (backdrop)
-          backdrop.remove();
+        if (backdrop) backdrop.remove();
         return;
       }
       backdrop = document.createElement("div");

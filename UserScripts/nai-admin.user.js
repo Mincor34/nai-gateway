@@ -67,16 +67,13 @@
   }
   function parseResponseHeaders(headerStr) {
     const headers = new Headers();
-    if (!headerStr)
-      return headers;
+    if (!headerStr) return headers;
     const lines = headerStr.split(/[\r\n]+/);
     lines.forEach((line) => {
       const trimmedLine = line.trim();
-      if (!trimmedLine)
-        return;
+      if (!trimmedLine) return;
       const colonIndex = trimmedLine.indexOf(":");
-      if (colonIndex === -1)
-        return;
+      if (colonIndex === -1) return;
       const name = trimmedLine.slice(0, colonIndex).trim();
       const value = trimmedLine.slice(colonIndex + 1).trim();
       if (name) {
@@ -106,15 +103,13 @@
     return 0;
   }
   async function readStreamAsString(stream) {
-    if (!stream)
-      return "";
+    if (!stream) return "";
     const reader = stream.getReader();
     const decoder = new TextDecoder();
     let result = "";
     while (true) {
       const { done, value } = await reader.read();
-      if (done)
-        break;
+      if (done) break;
       result += decoder.decode(value, { stream: true });
     }
     result += decoder.decode();
@@ -137,11 +132,9 @@
     return classCache.get(cacheKey) || "";
   }
   function injectNavBadge(onClickHandler) {
-    if (document.getElementById("gw-nav-badge"))
-      return true;
+    if (document.getElementById("gw-nav-badge")) return true;
     const menuBtn = document.querySelector('button[aria-label="menu"]');
-    if (!menuBtn || !menuBtn.parentElement)
-      return false;
+    if (!menuBtn || !menuBtn.parentElement) return false;
     const btnClasses = getElementClasses(menuBtn, "nav_menu_btn");
     const badgeBtn = document.createElement("button");
     badgeBtn.id = "gw-nav-badge";
@@ -174,11 +167,9 @@
     return true;
   }
   function injectAllowanceBar() {
-    if (document.getElementById("gw-allowance-bar"))
-      return true;
+    if (document.getElementById("gw-allowance-bar")) return true;
     const genBtn = document.querySelector(".image-gen-generate-button");
-    if (!genBtn || !genBtn.parentElement)
-      return false;
+    if (!genBtn || !genBtn.parentElement) return false;
     const barRoot = document.createElement("div");
     barRoot.id = "gw-allowance-bar";
     barRoot.style.cssText = `
@@ -243,8 +234,7 @@
     injectAllowanceBar();
     const labelSpan = document.getElementById("gw-allowance-label");
     const fillDiv = document.getElementById("gw-allowance-fill");
-    if (!labelSpan || !fillDiv)
-      return;
+    if (!labelSpan || !fillDiv) return;
     if (allowance === null || maxAllowance === Infinity) {
       labelSpan.textContent = "Rolling Allowance: Exempt (Unlimited)";
       fillDiv.style.width = "100%";
@@ -273,10 +263,8 @@
   }
   function injectQueueShield() {
     const genBtn = document.querySelector(".image-gen-generate-button");
-    if (!genBtn)
-      return false;
-    if (document.getElementById("gw-button-shield"))
-      return true;
+    if (!genBtn) return false;
+    if (document.getElementById("gw-button-shield")) return true;
     genBtn.style.position = "relative";
     genBtn.style.overflow = "hidden";
     const shield = document.createElement("div");
@@ -314,8 +302,7 @@
     injectQueueShield();
     const shield = document.getElementById("gw-button-shield");
     const labelText = document.getElementById("gw-shield-text");
-    if (!shield || !labelText)
-      return;
+    if (!shield || !labelText) return;
     const genBtn = shield.parentElement;
     if (genBtn) {
       for (const child of genBtn.children) {
@@ -336,8 +323,7 @@
   var observerInstance = null;
   var rafScheduled = false;
   function initDOMObserver(options = {}) {
-    if (observerInstance)
-      observerInstance.disconnect();
+    if (observerInstance) observerInstance.disconnect();
     const runSync = () => {
       rafScheduled = false;
       injectNavBadge(options.onOpenSettings);
@@ -347,8 +333,7 @@
     observerInstance = new MutationObserver((mutations) => {
       let relevant = false;
       for (const m of mutations) {
-        if (m.target && m.target.id && m.target.id.startsWith("gw-"))
-          continue;
+        if (m.target && m.target.id && m.target.id.startsWith("gw-")) continue;
         if (m.addedNodes.length > 0 || m.removedNodes.length > 0) {
           relevant = true;
           break;
@@ -378,32 +363,27 @@
     setQueueShieldState(false, "");
   }
   function injectWarningBadge(message, bgColor) {
-    if (document.getElementById("vps-debug-badge"))
-      return;
+    if (document.getElementById("vps-debug-badge")) return;
     const badge = document.createElement("div");
     badge.id = "vps-debug-badge";
     badge.innerHTML = message;
     badge.style.cssText = `position:fixed; top:10px; left:50%; transform:translateX(-50%); background:${bgColor}; color:#fff; font-weight:bold; font-size:11px; padding:6px 12px; border-radius:4px; z-index:99999; box-shadow:0 2px 8px rgba(0,0,0,0.4); pointer-events:none; font-family:sans-serif;`;
     const root = document.body || document.documentElement;
-    if (root)
-      root.appendChild(badge);
+    if (root) root.appendChild(badge);
   }
   function removeWarningBadge() {
     const badge = document.getElementById("vps-debug-badge");
-    if (badge)
-      badge.remove();
+    if (badge) badge.remove();
   }
 
   // src/userscripts/shared/params.js
   async function extractImageParams(body) {
-    if (!body)
-      return null;
+    if (!body) return null;
     try {
       let payload = null;
       if (typeof FormData !== "undefined" && body instanceof FormData) {
         const requestBlob = body.get("request");
-        if (!requestBlob)
-          return null;
+        if (!requestBlob) return null;
         const text = typeof requestBlob.text === "function" ? await requestBlob.text() : String(requestBlob);
         payload = JSON.parse(text);
       } else if (typeof body === "string") {
@@ -503,8 +483,7 @@
       console.log(`[VPS Gateway] Telemetry: Received raw error text: "${errorText}"`);
       let parsedError = null;
       try {
-        if (errorText)
-          parsedError = JSON.parse(errorText);
+        if (errorText) parsedError = JSON.parse(errorText);
       } catch (e) {
       }
       const responseBody = parsedError && (parsedError.statusCode || parsedError.message || parsedError.error) ? JSON.stringify({
@@ -533,8 +512,7 @@
     const originalBody = config.body;
     let imgParams = { width: 1024, height: 1024, steps: 28, n_samples: 1, precise_refs: 0, model: "" };
     const extracted = await extractImageParams(originalBody);
-    if (extracted)
-      imgParams = extracted;
+    if (extracted) imgParams = extracted;
     const executeQueueJoin = async () => {
       try {
         const joinRes = await backgroundRequest({
@@ -569,8 +547,7 @@
             }), { status: 403 });
           }
         }
-        if (joinRes.status !== 200)
-          throw new Error("Join rejection");
+        if (joinRes.status !== 200) throw new Error("Join rejection");
       } catch (e) {
         return new Response(JSON.stringify({ statusCode: 502, message: "Queue allocation failure" }), { status: 502 });
       }
@@ -659,16 +636,14 @@
           responseType: "stream",
           onloadstart: async function(responseDetails) {
             console.log(`[${envConfig.logPrefix}] Telemetry: onloadstart fired. ReadyState: ${responseDetails.readyState}, Status: ${extractStatusCode(responseDetails)}`);
-            if (hasResolved)
-              return;
+            if (hasResolved) return;
             if (await tryResolveProxyResponse(responseDetails, resolve, true, false)) {
               hasResolved = true;
             }
           },
           onreadystatechange: async function(responseDetails) {
             console.log(`[${envConfig.logPrefix}] Telemetry: onreadystatechange fired. ReadyState: ${responseDetails.readyState}, ExtractedStatus: ${extractStatusCode(responseDetails)}`);
-            if (hasResolved)
-              return;
+            if (hasResolved) return;
             if (responseDetails.readyState >= 2) {
               if (await tryResolveProxyResponse(responseDetails, resolve, true, false)) {
                 hasResolved = true;
@@ -677,8 +652,7 @@
           },
           onload: async function(responseDetails) {
             console.log(`[${envConfig.logPrefix}] Telemetry: onload fired. Status: ${extractStatusCode(responseDetails)}. Socket download complete.`);
-            if (hasResolved)
-              return;
+            if (hasResolved) return;
             if (await tryResolveProxyResponse(responseDetails, resolve, true, false)) {
               hasResolved = true;
             }
@@ -748,16 +722,14 @@
         responseType: "stream",
         onloadstart: async function(responseDetails) {
           console.log(`[${envConfig.logPrefix}] Telemetry (Text): onloadstart fired. ReadyState: ${responseDetails.readyState}, Status: ${extractStatusCode(responseDetails)}`);
-          if (hasResolved)
-            return;
+          if (hasResolved) return;
           if (await tryResolveProxyResponse(responseDetails, resolve, false, true)) {
             hasResolved = true;
           }
         },
         onreadystatechange: async function(responseDetails) {
           console.log(`[${envConfig.logPrefix}] Telemetry (Text): onreadystatechange fired. ReadyState: ${responseDetails.readyState}, Status: ${extractStatusCode(responseDetails)}`);
-          if (hasResolved)
-            return;
+          if (hasResolved) return;
           if (responseDetails.readyState >= 2) {
             if (await tryResolveProxyResponse(responseDetails, resolve, false, true)) {
               hasResolved = true;
@@ -766,8 +738,7 @@
         },
         onload: async function(responseDetails) {
           console.log(`[${envConfig.logPrefix}] Telemetry (Text): onload fired. Status: ${extractStatusCode(responseDetails)}. Socket download complete.`);
-          if (hasResolved)
-            return;
+          if (hasResolved) return;
           if (await tryResolveProxyResponse(responseDetails, resolve, false, true)) {
             hasResolved = true;
           }
@@ -882,12 +853,10 @@
   }
   var enforcementInterval = null;
   function startUIEnforcement() {
-    if (enforcementInterval)
-      return;
+    if (enforcementInterval) return;
     console.log("Nai-Admin: Starting high-frequency UI enforcement loop...");
     enforcementInterval = setInterval(() => {
-      if (!document.body)
-        return;
+      if (!document.body) return;
       let overlay = document.getElementById("vps-approval-overlay");
       if (!overlay) {
         overlay = document.createElement("div");
@@ -899,8 +868,7 @@
     }, 50);
   }
   function renderSetupWizard(container) {
-    if (container.querySelector(".setup-wizard-card"))
-      return;
+    if (container.querySelector(".setup-wizard-card")) return;
     container.innerHTML = `
         <div class="setup-wizard-card" style="background:var(--theme-bg1, #1c1c1c); padding:35px; border-radius:8px; border:1px solid var(--theme-error, #c0392b); box-shadow:0 8px 30px rgba(0,0,0,0.6); max-width:90vw; width:420px; box-sizing:border-box; color:var(--theme-text, #fff); font-family:inherit;">
             <h3 style="margin:0 0 15px 0; color:var(--theme-accent, #00bc8c); text-align:center; letter-spacing:1px; font-size:18px;">GATEWAY COORDINATOR SETUP (ADMIN)</h3>
@@ -1088,8 +1056,7 @@
       let backdrop = document.getElementById("vps-admin-backdrop");
       if (modal) {
         modal.remove();
-        if (backdrop)
-          backdrop.remove();
+        if (backdrop) backdrop.remove();
         return;
       }
       backdrop = document.createElement("div");
@@ -1127,8 +1094,7 @@
         backdrop.remove();
       });
     }, renderAdminUnifiedView = function(container, onClose) {
-      if (!container)
-        return;
+      if (!container) return;
       const isGovernance = activeSubTab === "governance";
       container.innerHTML = `
             <div style="display:flex; justify-content:space-between; align-items:center; border-bottom:1px solid var(--theme-bg2, #333); padding-bottom:10px; margin-bottom:12px;">
@@ -1150,8 +1116,7 @@
         `;
       if (onClose) {
         const closeBtn = container.querySelector("#admin-close-modal-btn");
-        if (closeBtn)
-          closeBtn.onclick = onClose;
+        if (closeBtn) closeBtn.onclick = onClose;
       }
       const govBtn = container.querySelector("#admin-tab-governance");
       const setBtn = container.querySelector("#admin-tab-settings");
@@ -1231,11 +1196,9 @@
           if (res.status === 200) {
             const data = JSON.parse(res.responseText);
             const anlasEl = contentHost.querySelector("#operator-anlas-consumed");
-            if (anlasEl)
-              anlasEl.textContent = `${data.anlas_consumed || 0} Anlas`;
+            if (anlasEl) anlasEl.textContent = `${data.anlas_consumed || 0} Anlas`;
             const refEl = contentHost.querySelector("#operator-precise-limit");
-            if (refEl)
-              refEl.textContent = data.precise_limit === "Unlimited" ? "Unlimited" : `${data.precise_limit} Refs`;
+            if (refEl) refEl.textContent = data.precise_limit === "Unlimited" ? "Unlimited" : `${data.precise_limit} Refs`;
             const devicesEl = contentHost.querySelector("#operator-linked-devices");
             if (devicesEl && data.linked_devices && data.linked_devices.length > 0) {
               devicesEl.innerHTML = data.linked_devices.map((d) => `- \`${d.id.substring(0, 10)}...\` (${d.label})`).join("<br>");
@@ -1282,23 +1245,18 @@
       };
       saveDomBtn.onclick = () => {
         let val = domInput.value.trim().replace(/\/+$/, "");
-        if (!val)
-          return;
-        if (!/^https?:\/\//i.test(val))
-          val = "https://" + val;
+        if (!val) return;
+        if (!/^https?:\/\//i.test(val)) val = "https://" + val;
         GM_setValue("vps_host", val);
         GM_setValue("approved", false);
-        if (typeof onClose === "function")
-          onClose();
+        if (typeof onClose === "function") onClose();
         window.location.reload();
       };
       debugCheckbox.onchange = () => {
         const checked = debugCheckbox.checked;
         GM_setValue("debug_mode", checked);
-        if (checked)
-          injectWarningBadge("\u26A0\uFE0F VPS DEBUG MODE ACTIVE", "var(--theme-error, #e74c3c)");
-        else
-          removeWarningBadge();
+        if (checked) injectWarningBadge("\u26A0\uFE0F VPS DEBUG MODE ACTIVE", "var(--theme-error, #e74c3c)");
+        else removeWarningBadge();
       };
     };
     initInterceptor({
@@ -1342,8 +1300,7 @@
       if (pushBtn) {
         pushBtn.onclick = async () => {
           const tk = contentHost.querySelector("#vps-master-token-input").value.trim();
-          if (!tk)
-            return;
+          if (!tk) return;
           try {
             const res = await backgroundRequest({
               method: "POST",
@@ -1351,10 +1308,8 @@
               headers: { "Content-Type": "application/json", "Authorization": `Bearer ${deviceSecret}` },
               data: JSON.stringify({ master_token: tk })
             });
-            if (res.status === 200)
-              alert("Master Token saved securely.");
-            else
-              alert("Token registration denied.");
+            if (res.status === 200) alert("Master Token saved securely.");
+            else alert("Token registration denied.");
           } catch (e) {
             alert("Communication execution failed.");
           }
@@ -1377,21 +1332,16 @@
         if (res.status === 200) {
           let groups = JSON.parse(res.responseText);
           const container = contentHost.querySelector("#vps-client-list");
-          if (!container)
-            return;
+          if (!container) return;
           if (groups.length === 0) {
             container.innerHTML = "No clients pending registration.";
             return;
           }
           groups.sort((a, b) => {
-            if (currentSort === "anlas")
-              return b.anlas_consumed - a.anlas_consumed;
-            if (currentSort === "reqs")
-              return b.total_requests - a.total_requests;
-            if (currentSort === "active")
-              return b.last_active_at - a.last_active_at;
-            if (currentSort === "status")
-              return (b.is_online ? 1 : 0) - (a.is_online ? 1 : 0);
+            if (currentSort === "anlas") return b.anlas_consumed - a.anlas_consumed;
+            if (currentSort === "reqs") return b.total_requests - a.total_requests;
+            if (currentSort === "active") return b.last_active_at - a.last_active_at;
+            if (currentSort === "status") return (b.is_online ? 1 : 0) - (a.is_online ? 1 : 0);
             return 0;
           });
           container.innerHTML = "";
@@ -1490,10 +1440,8 @@
           contentHost.querySelectorAll(".client-card-header").forEach((h) => {
             h.onclick = (e) => {
               const key = e.currentTarget.getAttribute("data-key");
-              if (expandedKeys.has(key))
-                expandedKeys.delete(key);
-              else
-                expandedKeys.add(key);
+              if (expandedKeys.has(key)) expandedKeys.delete(key);
+              else expandedKeys.add(key);
               renderGovernanceTab(contentHost, parentContainer, onClose);
             };
           });
@@ -1508,8 +1456,7 @@
                 headers: { "Content-Type": "application/json", "Authorization": `Bearer ${deviceSecret}` },
                 data: JSON.stringify({ browser_id: bid, enable, ttl_ms: 6e5 })
               });
-              if (actionRes.status === 200)
-                renderGovernanceTab(contentHost, parentContainer, onClose);
+              if (actionRes.status === 200) renderGovernanceTab(contentHost, parentContainer, onClose);
             };
           });
           contentHost.querySelectorAll(".btn-approve-group").forEach((b) => {
@@ -1526,8 +1473,7 @@
                 headers: { "Content-Type": "application/json", "Authorization": `Bearer ${deviceSecret}` },
                 data: JSON.stringify(payload)
               });
-              if (actionRes.status === 200)
-                renderGovernanceTab(contentHost, parentContainer, onClose);
+              if (actionRes.status === 200) renderGovernanceTab(contentHost, parentContainer, onClose);
             };
           });
           contentHost.querySelectorAll(".btn-revoke-group").forEach((b) => {
@@ -1535,8 +1481,7 @@
               const target = e.currentTarget;
               const key = target.getAttribute("data-key");
               const isDiscord = target.getAttribute("data-is-discord") === "true";
-              if (!confirm(`Are you sure you want to revoke authorization for ${key}?`))
-                return;
+              if (!confirm(`Are you sure you want to revoke authorization for ${key}?`)) return;
               const payload = isDiscord ? { discord_id: key } : { browser_id: key };
               const actionRes = await backgroundRequest({
                 method: "POST",
@@ -1544,8 +1489,7 @@
                 headers: { "Content-Type": "application/json", "Authorization": `Bearer ${deviceSecret}` },
                 data: JSON.stringify(payload)
               });
-              if (actionRes.status === 200)
-                renderGovernanceTab(contentHost, parentContainer, onClose);
+              if (actionRes.status === 200) renderGovernanceTab(contentHost, parentContainer, onClose);
             };
           });
           contentHost.querySelectorAll(".btn-ban-group").forEach((b) => {
@@ -1554,8 +1498,7 @@
               const key = target.getAttribute("data-key");
               const isDiscord = target.getAttribute("data-is-discord") === "true";
               const reason = prompt("Enter a reason for banning this client:");
-              if (reason === null)
-                return;
+              if (reason === null) return;
               const payload = isDiscord ? { discord_id: key, reason } : { browser_id: key, reason };
               const actionRes = await backgroundRequest({
                 method: "POST",
@@ -1563,8 +1506,7 @@
                 headers: { "Content-Type": "application/json", "Authorization": `Bearer ${deviceSecret}` },
                 data: JSON.stringify(payload)
               });
-              if (actionRes.status === 200)
-                renderGovernanceTab(contentHost, parentContainer, onClose);
+              if (actionRes.status === 200) renderGovernanceTab(contentHost, parentContainer, onClose);
             };
           });
           contentHost.querySelectorAll(".btn-unban-group").forEach((b) => {
@@ -1579,30 +1521,26 @@
                 headers: { "Content-Type": "application/json", "Authorization": `Bearer ${deviceSecret}` },
                 data: JSON.stringify(payload)
               });
-              if (actionRes.status === 200)
-                renderGovernanceTab(contentHost, parentContainer, onClose);
+              if (actionRes.status === 200) renderGovernanceTab(contentHost, parentContainer, onClose);
             };
           });
           contentHost.querySelectorAll(".btn-prune-dev").forEach((b) => {
             b.onclick = async (e) => {
               const bid = e.currentTarget.getAttribute("data-id");
-              if (!confirm(`Are you sure you want to permanently delete device registration: ${bid}?`))
-                return;
+              if (!confirm(`Are you sure you want to permanently delete device registration: ${bid}?`)) return;
               const actionRes = await backgroundRequest({
                 method: "POST",
                 url: `${VPS_HOST}/admin/prune-device`,
                 headers: { "Content-Type": "application/json", "Authorization": `Bearer ${deviceSecret}` },
                 data: JSON.stringify({ browser_id: bid })
               });
-              if (actionRes.status === 200)
-                renderGovernanceTab(contentHost, parentContainer, onClose);
+              if (actionRes.status === 200) renderGovernanceTab(contentHost, parentContainer, onClose);
             };
           });
         }
       } catch (e) {
         const container = contentHost.querySelector("#vps-client-list");
-        if (container)
-          container.innerHTML = "Error retrieving system data records.";
+        if (container) container.innerHTML = "Error retrieving system data records.";
       }
     }
     initDOMObserver({
