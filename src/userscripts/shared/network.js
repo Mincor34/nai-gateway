@@ -2,7 +2,7 @@
  * PRIVILEGED NETWORK TRANSPORT & STREAM PARSING ENGINE (src/userscripts/shared/network.js)
  * 
  * DESIGN PRINCIPLES:
- * 1. CSP Sandbox Breakout: Outbound requests targeting the external VPS gateway must execute
+ * 1. CSP Sandbox Breakout: Outbound requests targeting the external GuildWeave gateway must execute
  *    via Tampermonkey's privileged `GM_xmlhttpRequest` context. Native page `window.fetch()` 
  *    is blocked by NovelAI's production `Content-Security-Policy` (`connect-src`) headers.
  * 2. Transparent Version Reporting: Dynamically injects `x-script-version` from extension
@@ -23,21 +23,21 @@
  */
 export function backgroundRequest(details) {
     const headers = details.headers || {};
-    // Dynamically inject script version metadata from Tampermonkey manifest to enforce version validation on VPS
+    // Dynamically inject script version metadata from Tampermonkey manifest to enforce version validation on GuildWeave
     headers["x-script-version"] = GM_info.script.version;
 
-    console.log(`[Nai-Gateway Network] Dispatching request to ${details.url}...`);
+    console.log(`[GuildWeave Network] Dispatching request to ${details.url}...`);
 
     return new Promise((resolve, reject) => {
         GM_xmlhttpRequest({
             ...details,
             headers,
             onload: (r) => {
-                console.log(`[Nai-Gateway Network] Received response status ${r.status} from ${details.url}`);
+                console.log(`[GuildWeave Network] Received response status ${r.status} from ${details.url}`);
                 resolve(r);
             },
             onerror: (e) => {
-                console.error(`[Nai-Gateway Network] Request error to ${details.url}`, e);
+                console.error(`[GuildWeave Network] Request error to ${details.url}`, e);
                 reject(e);
             }
         });
@@ -72,10 +72,10 @@ export function parseResponseHeaders(headerStr) {
                 try {
                     headers.append(name, value);
                 } catch (e) {
-                    console.error(`[Nai-Gateway Network] Failed to append header "${name}":`, e);
+                    console.error(`[GuildWeave Network] Failed to append header "${name}":`, e);
                 }
             } else {
-                console.warn(`[Nai-Gateway Network] Dropping invalid header token: "${name}"`);
+                console.warn(`[GuildWeave Network] Dropping invalid header token: "${name}"`);
             }
         }
     });

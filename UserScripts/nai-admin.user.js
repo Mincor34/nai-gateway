@@ -1,5 +1,5 @@
 // ==UserScript==
-// @name         GuildWeave Gateway (Admin)
+// @name         GuildWeave (Admin)
 // @namespace    http://tampermonkey.net/
 // @version      5.0.0
 // @description  Secure administration panel, telemetry dashboard, bilateral debug coordinator, and session token injector
@@ -49,17 +49,17 @@
   function backgroundRequest(details) {
     const headers = details.headers || {};
     headers["x-script-version"] = GM_info.script.version;
-    console.log(`[Nai-Gateway Network] Dispatching request to ${details.url}...`);
+    console.log(`[GuildWeave Network] Dispatching request to ${details.url}...`);
     return new Promise((resolve, reject) => {
       GM_xmlhttpRequest({
         ...details,
         headers,
         onload: (r) => {
-          console.log(`[Nai-Gateway Network] Received response status ${r.status} from ${details.url}`);
+          console.log(`[GuildWeave Network] Received response status ${r.status} from ${details.url}`);
           resolve(r);
         },
         onerror: (e) => {
-          console.error(`[Nai-Gateway Network] Request error to ${details.url}`, e);
+          console.error(`[GuildWeave Network] Request error to ${details.url}`, e);
           reject(e);
         }
       });
@@ -81,10 +81,10 @@
           try {
             headers.append(name, value);
           } catch (e) {
-            console.error(`[Nai-Gateway Network] Failed to append header "${name}":`, e);
+            console.error(`[GuildWeave Network] Failed to append header "${name}":`, e);
           }
         } else {
-          console.warn(`[Nai-Gateway Network] Dropping invalid header token: "${name}"`);
+          console.warn(`[GuildWeave Network] Dropping invalid header token: "${name}"`);
         }
       }
     });
@@ -139,8 +139,8 @@
     const badgeBtn = document.createElement("button");
     badgeBtn.id = "gw-nav-badge";
     badgeBtn.className = btnClasses;
-    badgeBtn.setAttribute("aria-label", "GuildWeave Gateway Settings");
-    badgeBtn.setAttribute("title", "GuildWeave Gateway Settings");
+    badgeBtn.setAttribute("aria-label", "GuildWeave Settings");
+    badgeBtn.setAttribute("title", "GuildWeave Settings");
     badgeBtn.style.marginRight = "8px";
     badgeBtn.style.cursor = "pointer";
     const innerDiv = document.createElement("div");
@@ -413,7 +413,7 @@
         };
       }
     } catch (e) {
-      console.error("[Nai-Gateway Security] Payload extraction constraint failure:", e);
+      console.error("[GuildWeave Security] Payload extraction constraint failure:", e);
     }
     return null;
   }
@@ -423,7 +423,7 @@
     browserId: "",
     deviceSecret: "",
     VPS_HOST: "",
-    logPrefix: "Nai-Gateway",
+    logPrefix: "GuildWeave",
     onRevoked: () => {
     }
   };
@@ -438,10 +438,10 @@
     }
     if (status === 200) {
       if (!responseDetails.response) {
-        console.error("[VPS Gateway] Telemetry: Success code detected, but readable response stream was empty.");
+        console.error("[GuildWeave] Telemetry: Success code detected, but readable response stream was empty.");
         return false;
       }
-      console.log("[VPS Gateway] Telemetry: Stream successfully acquired. Piping stream response directly to fetch promise.");
+      console.log("[GuildWeave] Telemetry: Stream successfully acquired. Piping stream response directly to fetch promise.");
       if (isImageGen) {
         GM_setValue("count_image_gens", GM_getValue("count_image_gens", 0) + 1);
       } else if (isTextGen) {
@@ -456,9 +456,9 @@
       if (responseDetails.readyState !== 4 && responseDetails.readyState !== void 0) {
         return false;
       }
-      console.error("[VPS Gateway] Telemetry: Proxy returned exception status code:", status);
+      console.error("[GuildWeave] Telemetry: Proxy returned exception status code:", status);
       if (status === 401) {
-        console.warn("[VPS Gateway] Revocation signature caught. Restoring setup lock.");
+        console.warn("[GuildWeave] Revocation signature caught. Restoring setup lock.");
         GM_setValue("approved", false);
         if (typeof envConfig.onRevoked === "function") {
           envConfig.onRevoked();
@@ -478,9 +478,9 @@
           errorText = responseDetails.responseText;
         }
       } catch (e) {
-        console.error("[VPS Gateway] Error: Failed to extract string from raw exception stream:", e);
+        console.error("[GuildWeave] Error: Failed to extract string from raw exception stream:", e);
       }
-      console.log(`[VPS Gateway] Telemetry: Received raw error text: "${errorText}"`);
+      console.log(`[GuildWeave] Telemetry: Received raw error text: "${errorText}"`);
       let parsedError = null;
       try {
         if (errorText) parsedError = JSON.parse(errorText);
@@ -488,10 +488,10 @@
       }
       const responseBody = parsedError && (parsedError.statusCode || parsedError.message || parsedError.error) ? JSON.stringify({
         statusCode: parsedError.statusCode || status,
-        message: parsedError.message || parsedError.error || errorText || "Gateway processing error"
+        message: parsedError.message || parsedError.error || errorText || "GuildWeave processing error"
       }) : JSON.stringify({
         statusCode: status,
-        message: errorText || "Gateway processing error"
+        message: errorText || "GuildWeave processing error"
       });
       resolveObj(new Response(responseBody, {
         status,
@@ -618,7 +618,7 @@
       updatedHeaders.set("x-script-version", GM_info.script.version);
       if (GM_getValue("debug_mode", false)) {
         updatedHeaders.set("x-debug-mode", "true");
-        console.log(`[VPS Debug Mode] Outbound image generation details:`, originalBody);
+        console.log(`[GuildWeave Debug Mode] Outbound image generation details:`, originalBody);
       }
       updatedHeaders.delete("host");
       updatedHeaders.delete("content-length");
@@ -626,7 +626,7 @@
         updatedHeaders.delete("content-type");
       }
       let hasResolved = false;
-      console.log(`[${envConfig.logPrefix}] Intercepting fetch targeting VPS rewrite URL: ${proxyUrl}`);
+      console.log(`[${envConfig.logPrefix}] Intercepting fetch targeting GuildWeave rewrite URL: ${proxyUrl}`);
       return new Promise((resolve, reject) => {
         GM_xmlhttpRequest({
           method: config.method || "POST",
@@ -705,7 +705,7 @@
     updatedHeaders.set("x-script-version", GM_info.script.version);
     if (GM_getValue("debug_mode", false)) {
       updatedHeaders.set("x-debug-mode", "true");
-      console.log(`[VPS Debug Mode] Outbound text prompt payload:`, config.body);
+      console.log(`[GuildWeave Debug Mode] Outbound text prompt payload:`, config.body);
     }
     updatedHeaders.delete("host");
     updatedHeaders.delete("content-length");
@@ -756,7 +756,7 @@
   function hijackFetch() {
     const targetWindow = typeof unsafeWindow !== "undefined" && unsafeWindow ? unsafeWindow : typeof window !== "undefined" ? window : typeof globalThis !== "undefined" ? globalThis : null;
     if (!targetWindow || typeof targetWindow.fetch !== "function") {
-      console.error("[Nai-Gateway] Fatal: Target window fetch interface is unavailable.");
+      console.error("[GuildWeave] Fatal: Target window fetch interface is unavailable.");
       return;
     }
     const originalFetch = targetWindow.fetch;
@@ -849,12 +849,12 @@
       GM_setValue("browser_id", browserId);
     }
   } catch (err) {
-    console.error("Nai-Admin: Storage initialization crash:", err);
+    console.error("GuildWeave (Admin): Storage initialization crash:", err);
   }
   var enforcementInterval = null;
   function startUIEnforcement() {
     if (enforcementInterval) return;
-    console.log("Nai-Admin: Starting high-frequency UI enforcement loop...");
+    console.log("GuildWeave (Admin): Starting high-frequency UI enforcement loop...");
     enforcementInterval = setInterval(() => {
       if (!document.body) return;
       let overlay = document.getElementById("vps-approval-overlay");
@@ -871,11 +871,11 @@
     if (container.querySelector(".setup-wizard-card")) return;
     container.innerHTML = `
         <div class="setup-wizard-card" style="background:var(--theme-bg1, #1c1c1c); padding:35px; border-radius:8px; border:1px solid var(--theme-error, #c0392b); box-shadow:0 8px 30px rgba(0,0,0,0.6); max-width:90vw; width:420px; box-sizing:border-box; color:var(--theme-text, #fff); font-family:inherit;">
-            <h3 style="margin:0 0 15px 0; color:var(--theme-accent, #00bc8c); text-align:center; letter-spacing:1px; font-size:18px;">GATEWAY COORDINATOR SETUP (ADMIN)</h3>
+            <h3 style="margin:0 0 15px 0; color:var(--theme-accent, #00bc8c); text-align:center; letter-spacing:1px; font-size:18px;">GUILDWEAVE SETUP (ADMIN)</h3>
             
             <!-- Gateway Domain Configuration -->
             <div id="step-1-container" style="margin-bottom:20px;">
-                <label style="display:block; font-size:12px; color:var(--theme-textSecondary, #aaa); margin-bottom:5px; font-weight:bold;">STEP 1: ENTER GATEWAY DOMAIN</label>
+                <label style="display:block; font-size:12px; color:var(--theme-textSecondary, #aaa); margin-bottom:5px; font-weight:bold;">STEP 1: ENTER GUILDWEAVE DOMAIN</label>
                 <div style="display:flex; gap:10px;">
                     <input type="text" id="setup-domain" value="${GM_getValue("vps_host", "")}" placeholder="https://your-domain.duckdns.org" style="flex:1; background:var(--theme-bg0, #111); border:1px solid var(--theme-bg2, #444); color:var(--theme-text, #fff); padding:8px; font-size:12px; border-radius:4px; font-family:inherit;">
                     <button id="btn-verify-domain" style="background:var(--theme-accent, #2980b9); border:none; color:var(--theme-bg0, #fff); padding:8px 15px; font-size:11px; font-weight:bold; cursor:pointer; border-radius:4px; font-family:inherit;">Verify</button>
@@ -932,7 +932,7 @@
         });
         if (res.status > 0) {
           step1Status.style.color = "var(--theme-success, #2ecc71)";
-          step1Status.innerHTML = "\u2713 Connected to Gateway!";
+          step1Status.innerHTML = "\u2713 Connected to GuildWeave!";
           GM_setValue("vps_host", val);
           validatedHost = val;
           step2Container.style.display = "block";
@@ -1098,7 +1098,7 @@
       const isGovernance = activeSubTab === "governance";
       container.innerHTML = `
             <div style="display:flex; justify-content:space-between; align-items:center; border-bottom:1px solid var(--theme-bg2, #333); padding-bottom:10px; margin-bottom:12px;">
-                <h4 style="margin:0; color:var(--theme-accent, #00bc8c); font-size:15px; font-weight:bold; letter-spacing:0.5px;">GATEWAY COORDINATOR (ADMIN)</h4>
+                <h4 style="margin:0; color:var(--theme-accent, #00bc8c); font-size:15px; font-weight:bold; letter-spacing:0.5px;">GUILDWEAVE (ADMIN)</h4>
                 ${onClose ? `<button id="admin-close-modal-btn" style="background:none; border:none; color:var(--theme-textSecondary, #888); font-size:18px; cursor:pointer; line-height:1;">\u2715</button>` : ""}
             </div>
 
@@ -1163,10 +1163,10 @@
             </div>
 
             <div style="margin-bottom:12px;">
-                <label style="display:block; font-size:10px; color:var(--theme-textSecondary, #aaa); margin-bottom:5px; font-weight:bold;">GATEWAY DOMAIN</label>
+                <label style="display:block; font-size:10px; color:var(--theme-textSecondary, #aaa); margin-bottom:5px; font-weight:bold;">GUILDWEAVE DOMAIN</label>
                 <div style="display:flex; gap:8px;">
                     <input type="text" id="settings-domain" value="${domain}" style="flex:1; background:var(--theme-bg0, #111); border:1px solid var(--theme-bg2, #444); color:var(--theme-text, #fff); padding:6px; font-size:11px; border-radius:4px; font-family:inherit;">
-                    <button id="btn-save-domain" style="background:#2980b9; border:none; color:#fff; padding:6px 12px; font-size:10px; font-weight:bold; cursor:border; border-radius:4px; white-space:nowrap; font-family:inherit;">Save & Reset</button>
+                    <button id="btn-save-domain" style="background:#2980b9; border:none; color:#fff; padding:6px 12px; font-size:10px; font-weight:bold; cursor:pointer; border-radius:4px; white-space:nowrap; font-family:inherit;">Save & Reset</button>
                 </div>
             </div>
 
@@ -1183,7 +1183,7 @@
                     ENABLE OPERATOR PROMPT DEBUGGING
                 </label>
                 <div id="debug-consent" style="font-size:10px; color:var(--theme-textSecondary, #999); margin-top:6px; line-height:1.4; background:var(--theme-bg1, #222); padding:8px; border-radius:4px; border-left:2px solid var(--theme-warning, #f39c12);">
-                    <strong>Consent Form:</strong> Enabling Debug Mode logs full outbound API request payloads (including prompts and image parameters) to VPS telemetry. Personal session tokens remain strictly isolated.
+                    <strong>Consent Form:</strong> Enabling Debug Mode logs full outbound API request payloads (including prompts and image parameters) to GuildWeave telemetry. Personal session tokens remain strictly isolated.
                 </div>
             </div>
         `;
@@ -1240,7 +1240,7 @@
           }
         } catch (err) {
           nickStatus.style.color = "var(--theme-error, #e74c3c)";
-          nickStatus.innerHTML = "\u2717 Failed to update nickname on VPS.";
+          nickStatus.innerHTML = "\u2717 Failed to update nickname on GuildWeave.";
         }
       };
       saveDomBtn.onclick = () => {
@@ -1255,7 +1255,7 @@
       debugCheckbox.onchange = () => {
         const checked = debugCheckbox.checked;
         GM_setValue("debug_mode", checked);
-        if (checked) injectWarningBadge("\u26A0\uFE0F VPS DEBUG MODE ACTIVE", "var(--theme-error, #e74c3c)");
+        if (checked) injectWarningBadge("\u26A0\uFE0F GUILDWEAVE DEBUG MODE ACTIVE", "var(--theme-error, #e74c3c)");
         else removeWarningBadge();
       };
     };
@@ -1263,7 +1263,7 @@
       browserId,
       deviceSecret,
       VPS_HOST,
-      logPrefix: "Nai-Admin",
+      logPrefix: "GuildWeave (Admin)",
       onRevoked: () => {
         setTimeout(() => {
           if (typeof window !== "undefined" && window.location) {
@@ -1277,7 +1277,7 @@
             <div style="margin-bottom:15px;">
                 <label style="display:block; font-size:10px; color:var(--theme-textSecondary, #888); font-weight:bold; margin-bottom:5px; text-transform:uppercase;">MASTER NOVELAI SESSION TOKEN</label>
                 <input type="password" id="vps-master-token-input" placeholder="Bearer jti_..." style="width:100%; background:var(--theme-bg1, #111); border:1px solid var(--theme-bg2, #444); color:var(--theme-text, #fff); padding:8px; font-size:11px; border-radius:4px; box-sizing:border-box; font-family:inherit;">
-                <button id="vps-btn-push-token" style="background:var(--theme-success, #27ae60); border:none; color:var(--theme-bg0, #fff); padding:8px 12px; margin-top:8px; font-size:11px; font-weight:bold; cursor:pointer; border-radius:4px; width:100%; font-family:inherit;">PUSH TO VPS STORAGE</button>
+                <button id="vps-btn-push-token" style="background:var(--theme-success, #27ae60); border:none; color:var(--theme-bg0, #fff); padding:8px 12px; margin-top:8px; font-size:11px; font-weight:bold; cursor:pointer; border-radius:4px; width:100%; font-family:inherit;">PUSH TO GUILDWEAVE STORAGE</button>
             </div>
 
             <div style="border-top:1px solid var(--theme-bg2, #333); padding-top:12px;">

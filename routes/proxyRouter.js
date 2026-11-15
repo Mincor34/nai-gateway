@@ -51,13 +51,13 @@ router.all('/:subdomain/{*splat}', async (req, res) => {
 
   // SSRF Protection Rule: Reject arbitrary target routing
   if (!config.SUBDOMAIN_WHITELIST.includes(subdomain)) {
-    console.warn(`[VPS SSRF Warning] Target subdomain rejected: "${subdomain}"`);
+    console.warn(`[GuildWeave SSRF Warning] Target subdomain rejected: "${subdomain}"`);
     return sendEarlyError(403, { error: 'SSRF Shield: Unauthorized subdomain destination.' });
   }
 
   // Privilege Escalation Prevention Rule: Ensure requested endpoint is strictly whitelisted
   if (!config.PROXY_PATH_WHITELIST.has(pathPart)) {
-    console.warn(`[VPS Security Warning] Target path non-whitelisted: "${pathPart}"`);
+    console.warn(`[GuildWeave Security Warning] Target path non-whitelisted: "${pathPart}"`);
     return sendEarlyError(403, { error: 'Access Denied: Path not whitelisted for proxying.' });
   }
 
@@ -94,7 +94,7 @@ router.all('/:subdomain/{*splat}', async (req, res) => {
 
     if (activeTask) {
       queueManager.complete(activeTask.req_id, browserId);
-      console.log(`[VPS Telemetry] Stream cleaned up. Slot released for request: "${activeTask.req_id}"`);
+      console.log(`[GuildWeave Telemetry] Stream cleaned up. Slot released for request: "${activeTask.req_id}"`);
     }
 
     if (isImageGen && genModelHeader === 'V5' && req.telemetry) {
@@ -117,17 +117,17 @@ router.all('/:subdomain/{*splat}', async (req, res) => {
     if (isImageGen) {
       // Reject missing model headers to prevent accidental bans on outdated clients
       if (!genModelHeader) {
-        console.warn(`[VPS Gatekeeper] Rejected image gen request from browser "${browserId}" due to missing model validation header (outdated script).`);
+        console.warn(`[GuildWeave Gatekeeper] Rejected image gen request from browser "${browserId}" due to missing model validation header (outdated script).`);
         return sendEarlyError(426, {
           statusCode: 426,
           error: 'SCRIPT_UPDATE_REQUIRED',
-          message: 'Your NovelAI Gateway Tampermonkey userscript is outdated. Please update to the latest version to proceed.'
+          message: 'Your GuildWeave Tampermonkey userscript is outdated. Please update to the latest version to proceed.'
         });
       }
 
       // Reject unverified X-Base-Paid=true bypass claims prior to Commit 8 Anlas ledger integration
       if (req.headers['x-base-paid'] === 'true') {
-        console.warn(`[VPS Gatekeeper] Rejected premature X-Base-Paid=true claim from browser "${browserId}".`);
+        console.warn(`[GuildWeave Gatekeeper] Rejected premature X-Base-Paid=true claim from browser "${browserId}".`);
         return sendEarlyError(400, {
           statusCode: 400,
           error: 'BASE_PAID_UNSUPPORTED',
@@ -138,7 +138,7 @@ router.all('/:subdomain/{*splat}', async (req, res) => {
       // V5 Capacity Safeguard & Operational Circuit Breaker
       if (genModelHeader === 'V5') {
         if (!req.telemetry) {
-          console.error(`[VPS Gatekeeper] Critical: Telemetry context missing on V5 execution. Failing closed.`);
+          console.error(`[GuildWeave Gatekeeper] Critical: Telemetry context missing on V5 execution. Failing closed.`);
           return sendEarlyError(503, {
             statusCode: 503,
             error: 'TELEMETRY_UNAVAILABLE',
@@ -149,7 +149,7 @@ router.all('/:subdomain/{*splat}', async (req, res) => {
         try {
           await req.telemetry.ensureFresh();
         } catch (telemetryErr) {
-          console.error(`[VPS Gatekeeper] On-demand telemetry sync failed:`, telemetryErr.message);
+          console.error(`[GuildWeave Gatekeeper] On-demand telemetry sync failed:`, telemetryErr.message);
           // If telemetry has never been fetched and fails, fail closed
           if (req.telemetry.lastFetched === 0) {
             return sendEarlyError(503, {
@@ -161,7 +161,7 @@ router.all('/:subdomain/{*splat}', async (req, res) => {
         }
 
         if (req.telemetry.isHardLocked) {
-          console.warn(`[VPS Gatekeeper] V5 generation blocked by circuit breaker for browser "${browserId}". Projected V5 Capacity: ${req.telemetry.percent.toFixed(2)}%`);
+          console.warn(`[GuildWeave Gatekeeper] V5 generation blocked by circuit breaker for browser "${browserId}". Projected V5 Capacity: ${req.telemetry.percent.toFixed(2)}%`);
           return sendEarlyError(503, {
             statusCode: 503,
             error: 'V5_BATTERY_CRITICAL',
@@ -240,7 +240,7 @@ router.all('/:subdomain/{*splat}', async (req, res) => {
       if (accumulatedBytes > config.MAX_PAYLOAD_SIZE_BYTES) {
         payloadExceededLimit = true;
         req.pause();
-        console.warn(`[VPS Security] Payload constraint violation. Terminating stream from browser "${browserId}".`);
+        console.warn(`[GuildWeave Security] Payload constraint violation. Terminating stream from browser "${browserId}".`);
         executeCleanup();
         if (!res.headersSent) {
           res.status(413).json({
@@ -258,7 +258,7 @@ router.all('/:subdomain/{*splat}', async (req, res) => {
     safeResume();
 
     req.on('error', (reqErr) => {
-      console.error('[VPS Proxy] Client request socket stream error:', reqErr);
+      console.error('[GuildWeave Proxy] Client request socket stream error:', reqErr);
       executeCleanup();
       if (!res.headersSent) {
         res.status(400).json({ error: 'Client request stream terminated abnormally.' });
@@ -289,7 +289,7 @@ router.all('/:subdomain/{*splat}', async (req, res) => {
             }
           }
         } catch (err) {
-          console.error('[VPS Audit] Background async process exception:', err);
+          console.error('[GuildWeave Audit] Background async process exception:', err);
         }
       });
 
@@ -299,7 +299,7 @@ router.all('/:subdomain/{*splat}', async (req, res) => {
       const isAdminAuthorized = (device.priority_tier === 'Admin') || queueManager.isDebugEnabled(browserId);
 
       if (isClientConsenting && isAdminAuthorized) {
-        console.log(`\n--- [VPS Debug Telemetry] Untruncated Structured Payload (Client: "${browserId}") ---`);
+        console.log(`\n--- [GuildWeave Debug Telemetry] Untruncated Structured Payload (Client: "${browserId}") ---`);
         console.log(auditEngine.formatPayloadForLogging(payloadBuffer, req.headers['content-type']));
         console.log("------------------------------------------------------------------------------------\n");
       }
@@ -323,12 +323,12 @@ router.all('/:subdomain/{*splat}', async (req, res) => {
 
       headers['content-length'] = payloadBuffer.length;
 
-      console.log(`[VPS Telemetry] Forwarding piped request upstream to NovelAI: ${upstreamUrl} (Body: ${payloadBuffer.length} bytes)`);
+      console.log(`[GuildWeave Telemetry] Forwarding piped request upstream to NovelAI: ${upstreamUrl} (Body: ${payloadBuffer.length} bytes)`);
 
       const transport = upstreamUrl.startsWith('https:') ? https : http;
 
       upstreamReq = transport.request(upstreamUrl, { method: req.method, headers }, (upstreamRes) => {
-        console.log(`[VPS Telemetry] Received upstream headers. Status: ${upstreamRes.statusCode}`);
+        console.log(`[GuildWeave Telemetry] Received upstream headers. Status: ${upstreamRes.statusCode}`);
 
         const tierConfig = config.TIER_CONFIGS[device.priority_tier];
         if (upstreamRes.statusCode === 200 && isImageGen) {
@@ -341,9 +341,9 @@ router.all('/:subdomain/{*splat}', async (req, res) => {
               try {
                 // Deduct allowance from canonical user_id (affects all user devices synchronously)
                 const remaining = await auditEngine.getOrUpdateAllowance(device.user_id, device.priority_tier, true);
-                console.log(`[VPS Audit Ledger] Deducted 1 token for User "${device.user_id}" (${device.priority_tier}). Remaining balance: ${remaining}`);
+                console.log(`[GuildWeave Audit Ledger] Deducted 1 token for User "${device.user_id}" (${device.priority_tier}). Remaining balance: ${remaining}`);
               } catch (err) {
-                console.error('[VPS Audit] Failed to deduct metered token:', err);
+                console.error('[GuildWeave Audit] Failed to deduct metered token:', err);
               }
             });
           }
@@ -358,7 +358,7 @@ router.all('/:subdomain/{*splat}', async (req, res) => {
 
         // Active Cleanup Invariant: Synchronously release queue locks immediately upon failure
         upstreamRes.on('error', (err) => {
-          console.error('[VPS Telemetry] Upstream response stream error occurred:', err);
+          console.error('[GuildWeave Telemetry] Upstream response stream error occurred:', err);
           executeCleanup();
           if (!res.headersSent) {
             res.status(502).json({
@@ -372,14 +372,14 @@ router.all('/:subdomain/{*splat}', async (req, res) => {
         });
 
         upstreamRes.on('aborted', () => {
-          console.warn('[VPS Telemetry] Upstream response stream aborted by server');
+          console.warn('[GuildWeave Telemetry] Upstream response stream aborted by server');
           executeCleanup();
           res.destroy();
         });
 
         upstreamRes.on('close', () => {
           if (!upstreamRes.complete) {
-            console.warn('[VPS Telemetry] Upstream response socket closed prematurely before completion');
+            console.warn('[GuildWeave Telemetry] Upstream response socket closed prematurely before completion');
             executeCleanup();
             res.destroy();
           }
@@ -390,7 +390,7 @@ router.all('/:subdomain/{*splat}', async (req, res) => {
       });
 
       upstreamReq.on('error', (err) => {
-        console.error('[VPS Telemetry] Upstream connection socket exception occurred:', err);
+        console.error('[GuildWeave Telemetry] Upstream connection socket exception occurred:', err);
         executeCleanup();
         if (!res.headersSent) {
           res.status(502).json({ 
@@ -414,7 +414,7 @@ router.all('/:subdomain/{*splat}', async (req, res) => {
     });
 
   } catch (err) {
-    console.error('[VPS Telemetry] Fatal exception thrown inside proxy router context:', err);
+    console.error('[GuildWeave Telemetry] Fatal exception thrown inside proxy router context:', err);
     executeCleanup();
     if (!res.headersSent) {
       sendEarlyError(500, { error: 'Proxy execution failure.' });

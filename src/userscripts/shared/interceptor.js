@@ -8,7 +8,7 @@
  *    native keystore (E2EE keys) and account preferences while injecting an artificial Opus tier (tier 3)
  *    and 19,998 Anlas. This unlocks generation controls and eliminates client-side trial lockouts.
  * 3. WAF Request Smuggling Shield: Outbound proxy calls delete `Content-Length`, `Content-Type`
- *    (for FormData), and `Host` headers. This allows the browser background transport to append correct
+ *    (for FormData), and `Host` headers. This allows the browser background transport to append valid
  *    boundary metrics natively during transmission, preventing Cloudflare HTTP Request Smuggling drops.
  * 4. Dual-Timing Stream Coordination: Bypasses Tampermonkey stream exhaustion bugs by resolving
  *    piped `Response` instances inside `onloadstart` as soon as HTTP 200 headers arrive, streaming
@@ -30,7 +30,7 @@ let envConfig = {
     browserId: '',
     deviceSecret: '',
     VPS_HOST: '',
-    logPrefix: 'Nai-Gateway',
+    logPrefix: 'GuildWeave',
     onRevoked: () => {}
 };
 
@@ -41,7 +41,7 @@ let envConfig = {
  * @param {string} config.browserId - Hardware footprint UUID.
  * @param {string} config.deviceSecret - Secret authentication passkey.
  * @param {string} config.VPS_HOST - Target gateway base URL.
- * @param {string} [config.logPrefix='Nai-Gateway'] - Diagnostic logging prefix string.
+ * @param {string} [config.logPrefix='GuildWeave'] - Diagnostic logging prefix string.
  * @param {Function} [config.onRevoked] - Callback to execute upon HTTP 401 unauthorization signatures.
  */
 export function initInterceptor(config) {
@@ -68,10 +68,10 @@ async function tryResolveProxyResponse(responseDetails, resolveObj, isImageGen, 
 
     if (status === 200) {
         if (!responseDetails.response) {
-            console.error("[VPS Gateway] Telemetry: Success code detected, but readable response stream was empty.");
+            console.error("[GuildWeave] Telemetry: Success code detected, but readable response stream was empty.");
             return false; // Wait for response body context to bind
         }
-        console.log("[VPS Gateway] Telemetry: Stream successfully acquired. Piping stream response directly to fetch promise.");
+        console.log("[GuildWeave] Telemetry: Stream successfully acquired. Piping stream response directly to fetch promise.");
         
         // Increment telemetry variables on validation success
         if (isImageGen) {
@@ -88,16 +88,16 @@ async function tryResolveProxyResponse(responseDetails, resolveObj, isImageGen, 
         return true;
     } else {
         // For error responses, defer resolution until the request has fully completed (readyState 4)
-        // so we can read the fully buffered error body.
+        // so the fully buffered error body can be read.
         if (responseDetails.readyState !== 4 && responseDetails.readyState !== undefined) {
             return false;
         }
 
-        console.error("[VPS Gateway] Telemetry: Proxy returned exception status code:", status);
+        console.error("[GuildWeave] Telemetry: Proxy returned exception status code:", status);
 
         // Self-Healing Hook for Admin/Guest
         if (status === 401) {
-            console.warn("[VPS Gateway] Revocation signature caught. Restoring setup lock.");
+            console.warn("[GuildWeave] Revocation signature caught. Restoring setup lock.");
             GM_setValue("approved", false);
             if (typeof envConfig.onRevoked === 'function') {
                 envConfig.onRevoked();
@@ -119,12 +119,12 @@ async function tryResolveProxyResponse(responseDetails, resolveObj, isImageGen, 
                 errorText = responseDetails.responseText;
             }
         } catch (e) {
-            console.error("[VPS Gateway] Error: Failed to extract string from raw exception stream:", e);
+            console.error("[GuildWeave] Error: Failed to extract string from raw exception stream:", e);
         }
 
-        console.log(`[VPS Gateway] Telemetry: Received raw error text: "${errorText}"`);
+        console.log(`[GuildWeave] Telemetry: Received raw error text: "${errorText}"`);
 
-        // Standardize raw anomalies into correct structured exception parameters for SPA parsing
+        // Standardize raw anomalies into structured exception parameters for SPA parsing
         let parsedError = null;
         try {
             if (errorText) parsedError = JSON.parse(errorText);
@@ -133,11 +133,11 @@ async function tryResolveProxyResponse(responseDetails, resolveObj, isImageGen, 
         const responseBody = parsedError && (parsedError.statusCode || parsedError.message || parsedError.error)
             ? JSON.stringify({
                 statusCode: parsedError.statusCode || status,
-                message: parsedError.message || parsedError.error || errorText || "Gateway processing error"
+                message: parsedError.message || parsedError.error || errorText || "GuildWeave processing error"
               })
             : JSON.stringify({
                 statusCode: status,
-                message: errorText || "Gateway processing error"
+                message: errorText || "GuildWeave processing error"
               });
 
         resolveObj(new Response(responseBody, {
@@ -240,7 +240,7 @@ async function handleGenerationIntercept(url, config) {
                 }
             } catch (e) {
                 hideQueueStatusBanner();
-                // Send fully-formed authorization and hardware context to prevent ghost locks on the VPS
+                // Send fully-formed authorization and hardware context to prevent ghost locks on the server
                 backgroundRequest({
                     method: "POST",
                     url: `${envConfig.VPS_HOST}/queue/complete`,
@@ -272,7 +272,7 @@ async function handleGenerationIntercept(url, config) {
             }
         }
 
-        // v5 Safeguard: Explicitly mark v5 generations to prevent legacy false-positive bans on VPS
+        // v5 Safeguard: Explicitly mark v5 generations to prevent legacy false-positive bans on GuildWeave
         const isV5 = typeof imgParams.model === 'string' && /[-_]5[-_]/i.test(imgParams.model) && !imgParams.model.includes('4-5');
 
         updatedHeaders.set("x-browser-id", envConfig.browserId);
@@ -294,7 +294,7 @@ async function handleGenerationIntercept(url, config) {
         updatedHeaders.set("x-script-version", GM_info.script.version); // Dyn Version Injection
         if (GM_getValue("debug_mode", false)) {
             updatedHeaders.set("x-debug-mode", "true");
-            console.log(`[VPS Debug Mode] Outbound image generation details:`, originalBody);
+            console.log(`[GuildWeave Debug Mode] Outbound image generation details:`, originalBody);
         }
 
         updatedHeaders.delete("host");
@@ -305,7 +305,7 @@ async function handleGenerationIntercept(url, config) {
         }
 
         let hasResolved = false;
-        console.log(`[${envConfig.logPrefix}] Intercepting fetch targeting VPS rewrite URL: ${proxyUrl}`);
+        console.log(`[${envConfig.logPrefix}] Intercepting fetch targeting GuildWeave rewrite URL: ${proxyUrl}`);
 
         return new Promise((resolve, reject) => {
             GM_xmlhttpRequest({
@@ -404,7 +404,7 @@ async function handleTextGenerationIntercept(url, config) {
     updatedHeaders.set("x-script-version", GM_info.script.version); // Dyn Version Injection
     if (GM_getValue("debug_mode", false)) {
         updatedHeaders.set("x-debug-mode", "true");
-        console.log(`[VPS Debug Mode] Outbound text prompt payload:`, config.body);
+        console.log(`[GuildWeave Debug Mode] Outbound text prompt payload:`, config.body);
     }
 
     updatedHeaders.delete("host");
@@ -466,7 +466,7 @@ function hijackFetch() {
         : (typeof window !== 'undefined' ? window : (typeof globalThis !== 'undefined' ? globalThis : null));
 
     if (!targetWindow || typeof targetWindow.fetch !== 'function') {
-        console.error("[Nai-Gateway] Fatal: Target window fetch interface is unavailable.");
+        console.error("[GuildWeave] Fatal: Target window fetch interface is unavailable.");
         return;
     }
 

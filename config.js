@@ -235,7 +235,7 @@ function parseTierConfigs(rawTierJson) {
 function loadConfig(env = process.env) {
   const adminSecretKey = env.ADMIN_SECRET_KEY;
   if (!adminSecretKey || typeof adminSecretKey !== 'string' || adminSecretKey.trim() === '') {
-    throw new Error("[VPS Critical] ADMIN_SECRET_KEY variable is unconfigured! Crashing boot sequence.");
+    throw new Error("[GuildWeave Critical] ADMIN_SECRET_KEY variable is unconfigured! Crashing boot sequence.");
   }
 
   let port = OPERATIONAL_DEFAULTS.PORT;

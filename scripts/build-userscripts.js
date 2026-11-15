@@ -9,8 +9,9 @@ const OUT_DIR = path.join(__dirname, '..', 'UserScripts');
 
 // UserScript metadata banners for Tampermonkey
 // Adhere to SemVer versioning for the @version field
+// Note: @updateURL/@downloadURL and output filenames retain the legacy repository slug for upgrade continuity
 const adminBanner = `// ==UserScript==
-// @name         GuildWeave Gateway (Admin)
+// @name         GuildWeave (Admin)
 // @namespace    http://tampermonkey.net/
 // @version      5.0.0
 // @description  Secure administration panel, telemetry dashboard, bilateral debug coordinator, and session token injector
@@ -27,7 +28,7 @@ const adminBanner = `// ==UserScript==
 // ==/UserScript==\n`;
 
 const guestBanner = `// ==UserScript==
-// @name         GuildWeave Gateway
+// @name         GuildWeave
 // @namespace    http://tampermonkey.net/
 // @version      5.0.0
 // @description  FIFO queue coordination, rolling allowance telemetry visualization, and background stream proxy pipeline

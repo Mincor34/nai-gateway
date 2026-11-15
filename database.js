@@ -2,7 +2,7 @@
  * DATABASE CONTROLLER (database.js)
  * Architecture Level 0: Stateless persistence engine on module load.
  *
- * This module is the authoritative persistence engine for the NovelAI gateway.
+ * This module is the authoritative persistence engine for GuildWeave.
  * It manages persistent device registrations, approval states, blacklists,
  * financial ledgers, and system configuration variables.
  *

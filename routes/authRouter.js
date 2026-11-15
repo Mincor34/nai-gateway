@@ -42,7 +42,7 @@ router.post('/register', async (req, res) => {
 
     res.json({ success: true });
   } catch (err) { 
-    console.error('[VPS Telemetry] Registration exception:', err);
+    console.error('[GuildWeave Telemetry] Registration exception:', err);
     res.status(500).json({ error: err.message }); 
   }
 });
@@ -62,10 +62,10 @@ router.post('/update-label', async (req, res) => {
     }
 
     await run('UPDATE devices SET label = ? WHERE browser_id = ?', [label, browser_id]);
-    console.log(`[VPS Telemetry] Device "${browser_id}" updated nickname: "${label}"`);
+    console.log(`[GuildWeave Telemetry] Device "${browser_id}" updated nickname: "${label}"`);
     res.json({ success: true });
   } catch (err) { 
-    console.error('[VPS Telemetry] Update label exception:', err);
+    console.error('[GuildWeave Telemetry] Update label exception:', err);
     res.status(500).json({ error: err.message }); 
   }
 });
@@ -91,7 +91,7 @@ router.post('/debug-intent', async (req, res) => {
 
     const intentState = Boolean(enabled);
     queueManager.setDebugIntent(browser_id, intentState);
-    console.log(`[VPS Telemetry] Device "${browser_id}" registered diagnostic debug intent: ${intentState}`);
+    console.log(`[GuildWeave Telemetry] Device "${browser_id}" registered diagnostic debug intent: ${intentState}`);
 
     const debugInfo = queueManager.getDebugTargetInfo(browser_id);
 
@@ -103,7 +103,7 @@ router.post('/debug-intent', async (req, res) => {
       expires_in_ms: debugInfo.expires_in_ms
     });
   } catch (err) {
-    console.error('[VPS Telemetry] Debug intent registration exception:', err);
+    console.error('[GuildWeave Telemetry] Debug intent registration exception:', err);
     res.status(500).json({ error: err.message });
   }
 });
@@ -163,7 +163,7 @@ router.get('/status', async (req, res) => {
       debug_expires_in_ms: debugInfo.expires_in_ms
     });
   } catch (err) { 
-    console.error('[VPS Telemetry] Authentication verification query failure:', err);
+    console.error('[GuildWeave Telemetry] Authentication verification query failure:', err);
     res.status(500).json({ error: err.message }); 
   }
 });

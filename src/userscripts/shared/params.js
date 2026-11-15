@@ -68,7 +68,7 @@ export async function extractImageParams(body) {
             };
         }
     } catch (e) {
-        console.error("[Nai-Gateway Security] Payload extraction constraint failure:", e);
+        console.error("[GuildWeave Security] Payload extraction constraint failure:", e);
     }
     return null;
 }

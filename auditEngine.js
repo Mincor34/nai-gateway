@@ -1418,7 +1418,7 @@ function extractParametersFromRawBody(buffer, contentType = null) {
       vibe_reference_count: vibeRefs
     };
   } catch (err) {
-    console.error('[VPS Audit] Error extracting parameters from raw body:', err.message);
+    console.error('[GuildWeave Audit] Error extracting parameters from raw body:', err.message);
   }
   return null;
 }
@@ -1559,13 +1559,13 @@ async function runBackgroundAudit(browserId, payloadBuffer, clientReportedV5, co
   if (anlasSpent > 0) {
     await run('UPDATE users SET anlas_consumed = anlas_consumed + ? WHERE user_id = ?', [anlasSpent, targetUserId]);
     await run('UPDATE devices SET anlas_consumed = anlas_consumed + ? WHERE browser_id = ?', [anlasSpent, browserId]);
-    console.log(`[VPS Audit Ledger] Deducted ${anlasSpent} Anlas on user profile ${targetUserId} (refs used: ${actualRefs})`);
+    console.log(`[GuildWeave Audit Ledger] Deducted ${anlasSpent} Anlas on user profile ${targetUserId} (refs used: ${actualRefs})`);
   }
 
   // Punitive execution on hostile mismatch
   if (isViolation || bypassViolation) {
-    console.warn(`\x1b[31m[VPS SECURITY AUDIT] !!! HOSTILE PAYLOAD SPOOFING DETECTED !!!\x1b[0m`);
-    console.warn(`[VPS Security Audit] Device: "${browserId}", User: "${targetUserId}", Tier: "${effectiveTier}"`);
+    console.warn(`\x1b[31m[GuildWeave SECURITY AUDIT] !!! HOSTILE PAYLOAD SPOOFING DETECTED !!!\x1b[0m`);
+    console.warn(`[GuildWeave Security Audit] Device: "${browserId}", User: "${targetUserId}", Tier: "${effectiveTier}"`);
     
     try {
       const banReason = bypassViolation 
@@ -1582,7 +1582,7 @@ async function runBackgroundAudit(browserId, payloadBuffer, clientReportedV5, co
         ]);
       }
       
-      console.log(`[VPS Security Audit] Success. Database ban committed for "${targetUserId}".`);
+      console.log(`[GuildWeave Security Audit] Success. Database ban committed for "${targetUserId}".`);
       return {
         banned: true,
         reason: banReason,
@@ -1591,7 +1591,7 @@ async function runBackgroundAudit(browserId, payloadBuffer, clientReportedV5, co
         browserId
       };
     } catch (dbErr) {
-      console.error('[VPS Security Audit] Failed to execute database ban:', dbErr.message);
+      console.error('[GuildWeave Security Audit] Failed to execute database ban:', dbErr.message);
     }
   }
 

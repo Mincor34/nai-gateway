@@ -69,8 +69,8 @@ export function injectNavBadge(onClickHandler) {
   const badgeBtn = document.createElement('button');
   badgeBtn.id = 'gw-nav-badge';
   badgeBtn.className = btnClasses;
-  badgeBtn.setAttribute('aria-label', 'GuildWeave Gateway Settings');
-  badgeBtn.setAttribute('title', 'GuildWeave Gateway Settings');
+  badgeBtn.setAttribute('aria-label', 'GuildWeave Settings');
+  badgeBtn.setAttribute('title', 'GuildWeave Settings');
   badgeBtn.style.marginRight = '8px';
   badgeBtn.style.cursor = 'pointer';
 

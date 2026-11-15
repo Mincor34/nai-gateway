@@ -6,9 +6,9 @@
 
 #### 1. What Changes
 * **Decommissioning the Binary Parametric Firewall:** The rigid barrier in `proxyRouter.js` and `auditEngine.js` that dropped all generations exceeding baseline boundaries ($1024 \times 1024$, 1 sample, and 28 steps) is converted into a conditional gate. Any generation that breaches baseline parameters (dimensions $> 1\text{MP}$, samples $> 1$, or steps $> 28$) is classified as an Anlas-paid generation across all models. 
-* **Model Polymorphy & Selective Parameter Firewalls:** The gateway recognizes two distinct V5 models: `nai-diffusion-5-full` (High Effort) and `nai-diffusion-5-full-medium` (Medium Effort).
+* **Model Polymorphy & Selective Parameter Firewalls:** GuildWeave recognizes two distinct V5 models: `nai-diffusion-5-full` (High Effort) and `nai-diffusion-5-full-medium` (Medium Effort).
   * For `nai-diffusion-5-full`, free-tier generations ($\le 1\text{MP}$, 1 sample) are constrained to $\le 23$ steps; free V5 High requests with 24–28 steps are strictly rejected (`HTTP 400 PARAMETRIC_LIMIT_EXCEEDED`) to prevent upstream battery drainage.
-  * For `nai-diffusion-5-full-medium`, NovelAI's upstream backend hardcodes generation effort and silently ignores all auxiliary parameters. Consequently, the gateway firewall and audit engine for `nai-diffusion-5-full-medium` **validate strictly dimensions ($\le 1\text{MP}$ for free) and sample count ($n_{\text{samples}} = 1$)**, bypassing step-count validation and the 24–28 deadband check entirely.
+  * For `nai-diffusion-5-full-medium`, NovelAI's upstream backend hardcodes generation effort and silently ignores all auxiliary parameters. Consequently, the GuildWeave firewall and audit engine for `nai-diffusion-5-full-medium` **validate strictly dimensions ($\le 1\text{MP}$ for free) and sample count ($n_{\text{samples}} = 1$)**, bypassing step-count validation and the 24–28 deadband check entirely.
 * **Pre-Upstream Synchronous Gate & Point of No Return (PoNR) Accounting:** Rather than relying on fragile post-hoc asynchronous audits, parameter extraction and cost evaluation execute synchronously at `req.on('end')` on the in-memory buffer before the upstream socket is opened. Balance deductions follow a strict two-phase commit: an in-memory reservation hold is placed pre-dispatch, and the SQLite ledger debit is committed **if and only if** NovelAI responds with `HTTP 200 OK` (the Point of No Return).
 * **Dual-Mode Zero-Copy Buffer Extractor:** Slicing logic operates directly on binary `Buffer` primitives without converting multi-megabyte payloads to UTF-16 strings or running regular expressions over image data. The extractor dynamically branches between RFC 7578 multipart streams (extracting `boundary` from `Content-Type`, locating `name="request"`, headers delimiter `\r\n\r\n` within 4KB, and trailing boundary `\r\n--${boundary}`) and raw RFC 8259 JSON bodies (with a bounded 4KB prefix scan skipping leading whitespace `0x20`, `0x0A`, `0x0D`, `0x09`).
 * **Two-Phase Concurrency Handshake & Slowloris Protection:** Payload staging is decoupled from Channel A exclusive execution locks. Inbound buffering is gated by an ingress upload semaphore (`activeBufferingStreams <= 2`) to bound concurrent ingress buffer allocations. Inbound body streams on `/proxy/` enforce an upload streaming inactivity timeout (5 seconds without incoming data) and an absolute upload ceiling (60 seconds) to prevent slow mobile connections from holding connections indefinitely. The exclusive Channel A GPU execution lock is claimed strictly after the payload is fully buffered and validated in local VPS RAM, eliminating wide-area network transit delays from the GPU lock window.
@@ -16,7 +16,7 @@
 * **Cross-Channel Defense-in-Depth Reservation Accounting:** `activeTextLocks` in `QueueCoordinator` is upgraded from a primitive timestamp map to a structured record map: `{ timestamp, user_id, held_cost }`. Available balance is computed dynamically across all active execution channels:
   $$\text{Available Balance} = \text{users.virtual\_anlas\_balance} - \sum_{\{t \in \text{queue} \mid t.\text{user\_id} = \text{user\_id}\}} t.\text{held\_cost} - \sum_{\{l \in \text{activeTextLocks} \mid l.\text{user\_id} = \text{user\_id}\}} l.\text{held\_cost}$$
   Attaching `held_cost` directly to the `task` record in `QueueCoordinator` and to `activeTextLocks` ensures holds automatically terminate if a task is completed, evicted, or purged by the TTL scavenger.
-* **TTL Clock Re-Anchoring:** At the exact millisecond `req.on('end')` fires, parameter validation succeeds, and the Channel A lock is claimed, the gateway invokes `queueManager.reanchorProcessingTimestamp(req_id)`. This resets `task.started_processing_at = Date.now()`, granting upstream NovelAI the full, unpenalized 75-second GPU processing window regardless of client upload transit duration.
+* **TTL Clock Re-Anchoring:** At the exact millisecond `req.on('end')` fires, parameter validation succeeds, and the Channel A lock is claimed, GuildWeave invokes `queueManager.reanchorProcessingTimestamp(req_id)`. This resets `task.started_processing_at = Date.now()`, granting upstream NovelAI the full, unpenalized 75-second GPU processing window regardless of client upload transit duration.
 * **Optimistic Header Ingress Assertion with Step-3 Anti-Spoofing Reconciliation:** Step 1 host defense evaluates model identity and parametric limits optimistically from routing headers to reject unauthenticated or non-whitelisted traffic before allocation. At `req.on('end')`, extracted body parameters are reconciled against declared headers; any intentional discrepancy (e.g., header declared 1024px, body requested 2048px, or header declared Medium while body requested High) triggers an immediate `HTTP 403` and permanent database ban for active firewall evasion.
 * **Native JavaScript Pricing Engine & Upstream Specification Tracking:** Anlas costs are calculated authoritatively on the server and client using a native JavaScript port of the reverse-engineered NovelAI pricing formula (mirroring `anlas-calculation.md`), covering base resolution curves, step multipliers, SMEA flags (`sm`, `sm_dyn`), Img2Img strength, precise character reference surcharges, and vibe transfer encoding fees:
   * For `nai-diffusion-5-full`, costs follow standard V5 formulas.
@@ -37,7 +37,7 @@
   * The client appends `X-Base-Paid: true | false`, `X-Scraped-Anlas: <integer>`, and `X-Declared-Anlas: <integer>` (the authorized spending limit) to the request headers. Bypass headers transmitted on Channel B text generation are ignored.
   * When `X-Base-Paid` is false and total declared Anlas is 0, baseline parametric boundaries remain strictly enforced at zero Anlas cost.
   * When `X-Base-Paid` is true or `X-Declared-Anlas > 0`, the ingress gate asserts that the user's assigned tier permits bypass. It verifies that the user is not currently in an active Anlas debt state (`virtual_anlas_balance < 0`).
-  * **Violation of Debt Lockout:** If a user with an active Anlas debt ($\text{balance} < 0$) attempts to transmit a generation request requiring Anlas (`X-Declared-Anlas > 0`), the gateway flags this as an intentional circumvention attempt. The request is rejected with `HTTP 403 DEBT_LOCKED`. Baseline free Opus generations ($0\text{ Anlas}$) remain fully operational.
+  * **Violation of Debt Lockout:** If a user with an active Anlas debt ($\text{balance} < 0$) attempts to transmit a generation request requiring Anlas (`X-Declared-Anlas > 0`), GuildWeave flags this as an intentional circumvention attempt. The request is rejected with `HTTP 403 DEBT_LOCKED`. Baseline free Opus generations ($0\text{ Anlas}$) remain fully operational.
   * If the user is in good standing, the gate checks if the declared cost is $\le$ the user's available virtual Anlas balance.
   * If the balance is sufficient, an in-memory reservation hold is placed, and the request proceeds to buffer or queue.
   * If the balance is insufficient, the request is rejected with `HTTP 403 INSUFFICIENT_ANLAS` without opening an upstream socket.
@@ -63,7 +63,7 @@
   * Extracts: width, height, steps, samples, model, `sm`, `sm_dyn`, `strength`, `inpaintImg2ImgStrength`, reference counts, and uncached vibe counts.
 * **Parameter Forgery Verification (Active Evasion Ban):**
   * Reconciles physical parameters against routing headers: `X-Gen-Width === body.width`, `X-Gen-Height === body.height`, `X-Gen-Steps === body.steps`, `X-Gen-Samples === body.n_samples`, and asserted model family.
-  * If an adversarial client set `X-Gen-Model: legacy` or `X-Gen-Width: 1024` to pass Step 1 ingress, but embedded a V5 model or 2048px in the payload body, the gateway flags active evasion:
+  * If an adversarial client set `X-Gen-Model: legacy` or `X-Gen-Width: 1024` to pass Step 1 ingress, but embedded a V5 model or 2048px in the payload body, GuildWeave flags active evasion:
     * Rejects with `HTTP 403 FORBIDDEN`.
     * Commits permanent ban: `users.banned = 1`, `devices.banned = 1`.
     * Dispatches unnotified ban record for Discord bot alert.
@@ -99,7 +99,7 @@
 * **Operational Canary Telemetry:**
   * Compares $C_{\text{auth}}$ against `X-Scraped-Anlas`.
   * If $|C_{\text{auth}} - \text{X-Scraped-Anlas}| > 0$, logs an operational canary event:
-    `[VPS Telemetry Canary] Formula drift detected: Upstream UI reported ${X-Scraped-Anlas}, server calculated ${C_auth}. Check upstream specification.`
+    `[GuildWeave Telemetry Canary] Formula drift detected: Upstream UI reported ${X-Scraped-Anlas}, server calculated ${C_auth}. Check upstream specification.`
   * Zero bans or rejections are executed against the user for calculation drift.
 
 #### 3. Why It Is Done This Way
@@ -204,7 +204,7 @@
       * Delete the in-memory reservation hold.
 
 #### 3. Why It Is Done This Way
-* **Elimination of Phantom Anlas Fallback & Lockout Prevention:** Virtual Anlas inside the gateway does not purchase upstream V5 battery charge. Permitting users to spend virtual Anlas to push the master tank down to 1% results in zero Anlas spent upstream while forcing the entire cluster into an unrecoverable 6.7+ hour operational freeze.
+* **Elimination of Phantom Anlas Fallback & Lockout Prevention:** Virtual Anlas inside GuildWeave does not purchase upstream V5 battery charge. Permitting users to spend virtual Anlas to push the master tank down to 1% results in zero Anlas spent upstream while forcing the entire cluster into an unrecoverable 6.7+ hour operational freeze.
 * **Discrete Compute Units Eliminate Truncation Drift:** Denominating V5 allocations in Normalized Compute Points (18 NCP for High, 10 NCP for Medium) cleanly models NovelAI's 42% Medium efficiency gain while keeping SQLite ledgers strictly in integer space.
 * **Weighted Battery Modeling Prevents Premature Shutdown:** Distinguishing High vs Medium dispatches prevents local projections from draining $1.8\times$ faster than reality during Medium generation sessions.
 * **Prevention of Queue Starvation:** Evaluating V5 quotas inside `queueRouter.js` guarantees that depleted clients are rejected at the door. They cannot wait in line, acquire Channel A execution locks, and block solvent users before failing at the proxy.

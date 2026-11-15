@@ -130,7 +130,7 @@ function isNonEmptyString(value) {
 }
 
 /**
- * Authoritative in-memory state coordinator for the NovelAI gateway.
+ * Authoritative in-memory state coordinator for GuildWeave.
  */
 class QueueCoordinator {
   /**
@@ -393,7 +393,7 @@ class QueueCoordinator {
 
     // protection against map key-collision concurrency bypasses
     if (this.activeTextLocks.has(req_id)) {
-      console.warn(`[VPS Security] Channel B Concurrency Bypass Attempt: Overlapping lock ID detected ("${req_id}"). Rejecting.`);
+      console.warn(`[GuildWeave Security] Channel B Concurrency Bypass Attempt: Overlapping lock ID detected ("${req_id}"). Rejecting.`);
       return false;
     }
     const maxConcurrent = Number.isFinite(this.config.MAX_CONCURRENT_TEXT_GENS)
@@ -467,7 +467,7 @@ class QueueCoordinator {
           bucket.tokens -= 1.0;
           task.has_burst_boost = true;
           stateChanged = true;
-          console.log(`[VPS Queue AUTO] Task "${task.req_id}" hit ${this.config.QUEUE_AUTO_BOOST_SECONDS}s threshold. Promoting User "${targetPrincipal}" to Fast Slope.`);
+          console.log(`[GuildWeave Queue AUTO] Task "${task.req_id}" hit ${this.config.QUEUE_AUTO_BOOST_SECONDS}s threshold. Promoting User "${targetPrincipal}" to Fast Slope.`);
         }
       }
 
@@ -607,7 +607,7 @@ class QueueCoordinator {
       priorTask.held_ncp_source = null;
       const evictedTarget = priorTask.user_id || priorTask.discord_id || priorTask.browser_id;
       this.queue.splice(existingIdx, 1);
-      console.log(`[VPS Telemetry] Concurrency eviction: Terminated active lock for user/device: ${evictedTarget}`);
+      console.log(`[GuildWeave Telemetry] Concurrency eviction: Terminated active lock for user/device: ${evictedTarget}`);
     }
 
     const tierConfig = this.tierConfigs[priority_tier] || this.tierConfigs['Normal'];
@@ -620,10 +620,10 @@ class QueueCoordinator {
       if (bucket && bucket.tokens >= 1.0) {
         bucket.tokens -= 1.0;
         hasBurstBoost = true;
-        console.log(`[VPS Token Bucket] Allocated 1.0 token to Principal "${principalId}". Tokens remaining: ${bucket.tokens}`);
+        console.log(`[GuildWeave Token Bucket] Allocated 1.0 token to Principal "${principalId}". Tokens remaining: ${bucket.tokens}`);
       } else {
         hasBurstBoost = false;
-        console.log(`[VPS Token Bucket] Saturated bucket for Principal "${principalId}". Defaulting to Base Slope.`);
+        console.log(`[GuildWeave Token Bucket] Saturated bucket for Principal "${principalId}". Defaulting to Base Slope.`);
       }
     }
 
@@ -647,7 +647,7 @@ class QueueCoordinator {
     };
 
     this.queue.push(task);
-    console.log(`[VPS Telemetry] Device "${browser_id}" (User: "${principalId}") joined queue. ReqId: "${req_id}". Tier: "${priority_tier}"`);
+    console.log(`[GuildWeave Telemetry] Device "${browser_id}" (User: "${principalId}") joined queue. ReqId: "${req_id}". Tier: "${priority_tier}"`);
     this.processQueue(safeNow);
     return task;
   }
@@ -853,7 +853,7 @@ class QueueCoordinator {
       task.held_ncp = 0;
       task.held_ncp_source = null;
       this.queue.splice(idx, 1);
-      console.log(`[VPS Telemetry] Task released from queue: "${req_id}"`);
+      console.log(`[GuildWeave Telemetry] Task released from queue: "${req_id}"`);
       this.processQueue();
       return true;
     }
@@ -919,7 +919,7 @@ class QueueCoordinator {
 
     const totalEvicted = evictedQueueCount + evictedTextCount;
     if (totalEvicted > 0) {
-      console.warn(`[VPS Queue Evict] Purged ${evictedQueueCount} Channel A tasks and ${evictedTextCount} Channel B locks for Browser: "${browser_id}", Discord/User: "${targetUserId}"`);
+      console.warn(`[GuildWeave Queue Evict] Purged ${evictedQueueCount} Channel A tasks and ${evictedTextCount} Channel B locks for Browser: "${browser_id}", Discord/User: "${targetUserId}"`);
     }
     if (evictedQueueCount > 0) {
       this.processQueue();
@@ -978,7 +978,7 @@ class QueueCoordinator {
     try {
       return validateBatteryPercent(this.telemetryProvider());
     } catch (err) {
-      console.warn('[VPS Surplus] Telemetry provider exception:', err && err.message ? err.message : err);
+      console.warn('[GuildWeave Surplus] Telemetry provider exception:', err && err.message ? err.message : err);
       return null;
     }
   }
@@ -1096,11 +1096,11 @@ class QueueCoordinator {
         const maybePromise = this.onSurplusAccrual(newPool, now);
         if (maybePromise && typeof maybePromise.catch === 'function') {
           maybePromise.catch((err) => {
-            console.error('[VPS Surplus] Async persistence hook failed:', err && err.message ? err.message : err);
+            console.error('[GuildWeave Surplus] Async persistence hook failed:', err && err.message ? err.message : err);
           });
         }
       } catch (err) {
-        console.error('[VPS Surplus] Sync persistence hook failed:', err && err.message ? err.message : err);
+        console.error('[GuildWeave Surplus] Sync persistence hook failed:', err && err.message ? err.message : err);
       }
     }
 
@@ -1154,7 +1154,7 @@ class QueueCoordinator {
         }
         this.activeTextLocks.delete(reqId);
         textLocksChanged = true;
-        console.warn(`[Nai-Gateway GC] Purged zombie text generation lock. Freed Channel B slot for req: ${reqId}`);
+        console.warn(`[GuildWeave GC] Purged zombie text generation lock. Freed Channel B slot for req: ${reqId}`);
       }
     }
 
@@ -1162,7 +1162,7 @@ class QueueCoordinator {
     for (const [browserId, expiresAt] of this.debugTargets.entries()) {
       if (now > expiresAt) {
         this.debugTargets.delete(browserId);
-        console.log(`[Nai-Gateway GC] Diagnostic debug authorization TTL expired for browser: "${browserId}". Revoked.`);
+        console.log(`[GuildWeave GC] Diagnostic debug authorization TTL expired for browser: "${browserId}". Revoked.`);
       }
     }
 
@@ -1180,7 +1180,7 @@ class QueueCoordinator {
         t.held_ncp = 0;
         t.held_ncp_source = null;
         queueChanged = true;
-        console.warn(`[Nai-Gateway GC] Discarding inactive pending client: BrowserId: ${t.browser_id}`);
+        console.warn(`[GuildWeave GC] Discarding inactive pending client: BrowserId: ${t.browser_id}`);
         return false;
       }
       // Forcefully drop processing connections stuck/hung for over spec-configured TTL
@@ -1192,7 +1192,7 @@ class QueueCoordinator {
         t.held_ncp = 0;
         t.held_ncp_source = null;
         queueChanged = true;
-        console.warn(`[Nai-Gateway GC] Terminating hung generation lock. Extinguished active socket for: ${t.browser_id}`);
+        console.warn(`[GuildWeave GC] Terminating hung generation lock. Extinguished active socket for: ${t.browser_id}`);
         return false;
       }
       return true;

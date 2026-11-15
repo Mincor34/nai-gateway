@@ -1,5 +1,5 @@
 /**
- * NOVELAI SPLIT-TOKEN GATEWAY COORDINATOR (ADMIN PANEL)
+ * GUILDWEAVE GATEWAY COORDINATOR (ADMIN PANEL)
  * Architecture Level 4: Administrative UI, Device Management, and Token Injector
  *
  * Implements a high-security control and telemetry layout on top of the NovelAI Single Page App (SPA).
@@ -7,7 +7,7 @@
  * and coordinates the bilateral mutual-consent diagnostic debug authorization gate.
  *
  * SECURITY DESIGN PRINCIPLES:
- * 1. Privileged Background Transport: Outbound requests targeting the VPS `/proxy/`, `/queue/`, and `/admin/`
+ * 1. Privileged Background Transport: Outbound requests targeting the GuildWeave `/proxy/`, `/queue/`, and `/admin/`
  *    endpoints are routed using Tampermonkey's privileged background context (`GM_xmlhttpRequest`). This breaks
  *    through local Content Security Policy (CSP) headers served by novelai.net that would otherwise block
  *    connection sockets to your external gateway domain.
@@ -18,7 +18,7 @@
  *    and permanent account banishment tools directly within the SPA viewport.
  * 4. Master Credential Injection: Directly pushes the paid account's Bearer session token to SQLite storage.
  * 5. Dedicated Single Presentation Portal: Eliminates redundant user settings sidebar tabs, housing both
- *    Device Governance and Operator Personal Settings (Debug Mode, VPS host, and Nickname) in a unified modal
+ *    Device Governance and Operator Personal Settings (Debug Mode, Domain, and Nickname) in a unified modal
  *    invoked strictly by #gw-nav-badge and styled using NovelAI CSS custom properties.
  */
 
@@ -48,7 +48,7 @@ try {
         GM_setValue("browser_id", browserId);
     }
 } catch (err) {
-    console.error("Nai-Admin: Storage initialization crash:", err);
+    console.error("GuildWeave (Admin): Storage initialization crash:", err);
 }
 
 // High-frequency UI enforcement loop (forces UI overlay to stay mounted and visible during initial config)
@@ -58,7 +58,7 @@ let enforcementInterval = null;
 
 function startUIEnforcement() {
     if (enforcementInterval) return;
-    console.log("Nai-Admin: Starting high-frequency UI enforcement loop...");
+    console.log("GuildWeave (Admin): Starting high-frequency UI enforcement loop...");
     enforcementInterval = setInterval(() => {
         if (!document.body) return; // Wait for document body to construct
 
@@ -83,11 +83,11 @@ function renderSetupWizard(container) {
     
     container.innerHTML = `
         <div class="setup-wizard-card" style="background:var(--theme-bg1, #1c1c1c); padding:35px; border-radius:8px; border:1px solid var(--theme-error, #c0392b); box-shadow:0 8px 30px rgba(0,0,0,0.6); max-width:90vw; width:420px; box-sizing:border-box; color:var(--theme-text, #fff); font-family:inherit;">
-            <h3 style="margin:0 0 15px 0; color:var(--theme-accent, #00bc8c); text-align:center; letter-spacing:1px; font-size:18px;">GATEWAY COORDINATOR SETUP (ADMIN)</h3>
+            <h3 style="margin:0 0 15px 0; color:var(--theme-accent, #00bc8c); text-align:center; letter-spacing:1px; font-size:18px;">GUILDWEAVE SETUP (ADMIN)</h3>
             
             <!-- Gateway Domain Configuration -->
             <div id="step-1-container" style="margin-bottom:20px;">
-                <label style="display:block; font-size:12px; color:var(--theme-textSecondary, #aaa); margin-bottom:5px; font-weight:bold;">STEP 1: ENTER GATEWAY DOMAIN</label>
+                <label style="display:block; font-size:12px; color:var(--theme-textSecondary, #aaa); margin-bottom:5px; font-weight:bold;">STEP 1: ENTER GUILDWEAVE DOMAIN</label>
                 <div style="display:flex; gap:10px;">
                     <input type="text" id="setup-domain" value="${GM_getValue("vps_host", "")}" placeholder="https://your-domain.duckdns.org" style="flex:1; background:var(--theme-bg0, #111); border:1px solid var(--theme-bg2, #444); color:var(--theme-text, #fff); padding:8px; font-size:12px; border-radius:4px; font-family:inherit;">
                     <button id="btn-verify-domain" style="background:var(--theme-accent, #2980b9); border:none; color:var(--theme-bg0, #fff); padding:8px 15px; font-size:11px; font-weight:bold; cursor:pointer; border-radius:4px; font-family:inherit;">Verify</button>
@@ -152,7 +152,7 @@ function renderSetupWizard(container) {
             });
             if (res.status > 0) {
                 step1Status.style.color = "var(--theme-success, #2ecc71)";
-                step1Status.innerHTML = "✓ Connected to Gateway!";
+                step1Status.innerHTML = "✓ Connected to GuildWeave!";
                 GM_setValue("vps_host", val);
                 validatedHost = val;
                 step2Container.style.display = "block";
@@ -287,7 +287,7 @@ if (!approved || !VPS_HOST || !deviceSecret) {
         browserId, 
         deviceSecret, 
         VPS_HOST, 
-        logPrefix: 'Nai-Admin',
+        logPrefix: 'GuildWeave (Admin)',
         onRevoked: () => {
             setTimeout(() => {
                 if (typeof window !== 'undefined' && window.location) {
@@ -359,7 +359,7 @@ if (!approved || !VPS_HOST || !deviceSecret) {
 
         container.innerHTML = `
             <div style="display:flex; justify-content:space-between; align-items:center; border-bottom:1px solid var(--theme-bg2, #333); padding-bottom:10px; margin-bottom:12px;">
-                <h4 style="margin:0; color:var(--theme-accent, #00bc8c); font-size:15px; font-weight:bold; letter-spacing:0.5px;">GATEWAY COORDINATOR (ADMIN)</h4>
+                <h4 style="margin:0; color:var(--theme-accent, #00bc8c); font-size:15px; font-weight:bold; letter-spacing:0.5px;">GUILDWEAVE (ADMIN)</h4>
                 ${onClose ? `<button id="admin-close-modal-btn" style="background:none; border:none; color:var(--theme-textSecondary, #888); font-size:18px; cursor:pointer; line-height:1;">✕</button>` : ''}
             </div>
 
@@ -414,7 +414,7 @@ if (!approved || !VPS_HOST || !deviceSecret) {
             <div style="margin-bottom:15px;">
                 <label style="display:block; font-size:10px; color:var(--theme-textSecondary, #888); font-weight:bold; margin-bottom:5px; text-transform:uppercase;">MASTER NOVELAI SESSION TOKEN</label>
                 <input type="password" id="vps-master-token-input" placeholder="Bearer jti_..." style="width:100%; background:var(--theme-bg1, #111); border:1px solid var(--theme-bg2, #444); color:var(--theme-text, #fff); padding:8px; font-size:11px; border-radius:4px; box-sizing:border-box; font-family:inherit;">
-                <button id="vps-btn-push-token" style="background:var(--theme-success, #27ae60); border:none; color:var(--theme-bg0, #fff); padding:8px 12px; margin-top:8px; font-size:11px; font-weight:bold; cursor:pointer; border-radius:4px; width:100%; font-family:inherit;">PUSH TO VPS STORAGE</button>
+                <button id="vps-btn-push-token" style="background:var(--theme-success, #27ae60); border:none; color:var(--theme-bg0, #fff); padding:8px 12px; margin-top:8px; font-size:11px; font-weight:bold; cursor:pointer; border-radius:4px; width:100%; font-family:inherit;">PUSH TO GUILDWEAVE STORAGE</button>
             </div>
 
             <div style="border-top:1px solid var(--theme-bg2, #333); padding-top:12px;">
@@ -763,10 +763,10 @@ if (!approved || !VPS_HOST || !deviceSecret) {
             </div>
 
             <div style="margin-bottom:12px;">
-                <label style="display:block; font-size:10px; color:var(--theme-textSecondary, #aaa); margin-bottom:5px; font-weight:bold;">GATEWAY DOMAIN</label>
+                <label style="display:block; font-size:10px; color:var(--theme-textSecondary, #aaa); margin-bottom:5px; font-weight:bold;">GUILDWEAVE DOMAIN</label>
                 <div style="display:flex; gap:8px;">
                     <input type="text" id="settings-domain" value="${domain}" style="flex:1; background:var(--theme-bg0, #111); border:1px solid var(--theme-bg2, #444); color:var(--theme-text, #fff); padding:6px; font-size:11px; border-radius:4px; font-family:inherit;">
-                    <button id="btn-save-domain" style="background:#2980b9; border:none; color:#fff; padding:6px 12px; font-size:10px; font-weight:bold; cursor:border; border-radius:4px; white-space:nowrap; font-family:inherit;">Save & Reset</button>
+                    <button id="btn-save-domain" style="background:#2980b9; border:none; color:#fff; padding:6px 12px; font-size:10px; font-weight:bold; cursor:pointer; border-radius:4px; white-space:nowrap; font-family:inherit;">Save & Reset</button>
                 </div>
             </div>
 
@@ -783,7 +783,7 @@ if (!approved || !VPS_HOST || !deviceSecret) {
                     ENABLE OPERATOR PROMPT DEBUGGING
                 </label>
                 <div id="debug-consent" style="font-size:10px; color:var(--theme-textSecondary, #999); margin-top:6px; line-height:1.4; background:var(--theme-bg1, #222); padding:8px; border-radius:4px; border-left:2px solid var(--theme-warning, #f39c12);">
-                    <strong>Consent Form:</strong> Enabling Debug Mode logs full outbound API request payloads (including prompts and image parameters) to VPS telemetry. Personal session tokens remain strictly isolated.
+                    <strong>Consent Form:</strong> Enabling Debug Mode logs full outbound API request payloads (including prompts and image parameters) to GuildWeave telemetry. Personal session tokens remain strictly isolated.
                 </div>
             </div>
         `;
@@ -844,7 +844,7 @@ if (!approved || !VPS_HOST || !deviceSecret) {
                 }
             } catch (err) {
                 nickStatus.style.color = "var(--theme-error, #e74c3c)";
-                nickStatus.innerHTML = "✗ Failed to update nickname on VPS.";
+                nickStatus.innerHTML = "✗ Failed to update nickname on GuildWeave.";
             }
         };
 
@@ -861,7 +861,7 @@ if (!approved || !VPS_HOST || !deviceSecret) {
         debugCheckbox.onchange = () => {
             const checked = debugCheckbox.checked;
             GM_setValue("debug_mode", checked);
-            if (checked) injectWarningBadge("⚠️ VPS DEBUG MODE ACTIVE", "var(--theme-error, #e74c3c)");
+            if (checked) injectWarningBadge("⚠️ GUILDWEAVE DEBUG MODE ACTIVE", "var(--theme-error, #e74c3c)");
             else removeWarningBadge();
         };
     }

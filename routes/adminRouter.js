@@ -147,14 +147,14 @@ router.post('/approve', async (req, res) => {
     if (discord_id) {
       await run('UPDATE users SET priority_tier = ? WHERE user_id = ?', [targetTier, discord_id]);
       await run('UPDATE devices SET approved = 1 WHERE user_id = ?', [discord_id]);
-      console.log(`[VPS Telemetry Admin] Approved Discord Account: "${discord_id}". Priority: "${targetTier}"`);
+      console.log(`[GuildWeave Admin] Approved Discord Account: "${discord_id}". Priority: "${targetTier}"`);
     } else if (browser_id) {
       const dev = await get('SELECT user_id FROM devices WHERE browser_id = ?', [browser_id]);
       if (dev) {
         await run('UPDATE users SET priority_tier = ? WHERE user_id = ?', [targetTier, dev.user_id]);
       }
       await run('UPDATE devices SET approved = 1 WHERE browser_id = ?', [browser_id]);
-      console.log(`[VPS Telemetry Admin] Approved Unlinked Browser: "${browser_id}". Priority: "${targetTier}"`);
+      console.log(`[GuildWeave Admin] Approved Unlinked Browser: "${browser_id}". Priority: "${targetTier}"`);
     }
     res.json({ success: true });
   } catch (err) { res.status(500).json({ error: err.message }); }
@@ -165,10 +165,10 @@ router.post('/revoke', async (req, res) => {
   try {
     if (discord_id) {
       await run('UPDATE devices SET approved = 0 WHERE user_id = ?', [discord_id]);
-      console.log(`[VPS Telemetry Admin] Revoked access for Discord Account: "${discord_id}"`);
+      console.log(`[GuildWeave Admin] Revoked access for Discord Account: "${discord_id}"`);
     } else if (browser_id) {
       await run('UPDATE devices SET approved = 0 WHERE browser_id = ?', [browser_id]);
-      console.log(`[VPS Telemetry Admin] Revoked access for Unlinked Browser: "${browser_id}"`);
+      console.log(`[GuildWeave Admin] Revoked access for Unlinked Browser: "${browser_id}"`);
     }
     res.json({ success: true });
   } catch (err) { res.status(500).json({ error: err.message }); }
@@ -187,7 +187,7 @@ router.post('/ban', async (req, res) => {
 
     if (targetUserId) {
       await run('UPDATE users SET banned = 1, ban_reason = ?, ban_notified = 0 WHERE user_id = ?', [banReason, targetUserId]);
-      console.log(`[VPS Telemetry Admin] Banned Canonical User: "${targetUserId}"`);
+      console.log(`[GuildWeave Admin] Banned Canonical User: "${targetUserId}"`);
       queueManager.evict({ user_id: targetUserId });
     }
     res.json({ success: true });
@@ -207,7 +207,7 @@ router.post('/unban', async (req, res) => {
 
     if (targetUserId) {
       await run('UPDATE users SET banned = 0, ban_reason = NULL, ban_notified = 0 WHERE user_id = ?', [targetUserId]);
-      console.log(`[VPS Telemetry Admin] Unbanned Canonical User: "${targetUserId}"`);
+      console.log(`[GuildWeave Admin] Unbanned Canonical User: "${targetUserId}"`);
     }
     res.json({ success: true });
   } catch (err) {
@@ -219,7 +219,7 @@ router.post('/prune-device', async (req, res) => {
   const { browser_id } = req.body;
   try {
     await run('DELETE FROM devices WHERE browser_id = ?', [browser_id]);
-    console.log(`[VPS Telemetry Admin] Pruned individual browser registration: "${browser_id}"`);
+    console.log(`[GuildWeave Admin] Pruned individual browser registration: "${browser_id}"`);
     res.json({ success: true });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
@@ -227,7 +227,7 @@ router.post('/prune-device', async (req, res) => {
 router.post('/update-token', async (req, res) => {
   try {
     await run('INSERT OR REPLACE INTO config (key, value) VALUES (?, ?)', ['master_token', req.body.master_token]);
-    console.log('[VPS Admin] Pushed fresh master Opus session token to configuration schema.');
+    console.log('[GuildWeave Admin] Pushed fresh master Opus session token to configuration schema.');
     res.json({ success: true });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
@@ -263,7 +263,7 @@ router.post('/link', async (req, res) => {
     if (existingLinks.length >= config.MAX_LINKED_DEVICES_PER_USER) {
       const oldestDevice = existingLinks[0].browser_id;
       await run('UPDATE devices SET approved = 0 WHERE browser_id = ?', [oldestDevice]);
-      console.log(`[VPS Admin API] Automatically de-authorized oldest linked browser ID: ${oldestDevice} for user ${discord_id}`);
+      console.log(`[GuildWeave Admin API] Automatically de-authorized oldest linked browser ID: ${oldestDevice} for user ${discord_id}`);
     }
 
     // 5. Transfer hardware device pointer to canonical Discord user_id
@@ -274,7 +274,7 @@ router.post('/link', async (req, res) => {
       await run('DELETE FROM users WHERE user_id = ?', [device.user_id]);
     }
 
-    console.log(`[VPS Admin API] Linked Discord ID ${discord_id} to browser ${browser_id} (${priority_tier})`);
+    console.log(`[GuildWeave Admin API] Linked Discord ID ${discord_id} to browser ${browser_id} (${priority_tier})`);
     res.json({ success: true });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
@@ -289,11 +289,11 @@ router.post('/sync-usernames', async (req, res) => {
     for (const m of mappings) {
       await run('UPDATE users SET discord_username = ? WHERE user_id = ?', [m.discord_username, m.discord_id]);
     }
-    console.log(`[VPS Admin] Successfully batch synced usernames for ${mappings.length} Discord accounts.`);
+    console.log(`[GuildWeave Admin] Successfully batch synced usernames for ${mappings.length} Discord accounts.`);
     res.json({ success: true });
   } catch (err) {
-    console.error('❌ [VPS Admin] CRITICAL USERNAME SYNC FAILURE:\n', err);
-    res.status(500).json({ error: `VPS_SQLITE_EXEC_ERROR: ${err.message}\nStack: ${err.stack}` });
+    console.error('❌ [GuildWeave Admin] CRITICAL USERNAME SYNC FAILURE:\n', err);
+    res.status(500).json({ error: `GUILDWEAVE_SQLITE_EXEC_ERROR: ${err.message}` });
   }
 });
 
@@ -306,7 +306,7 @@ router.post('/sync-tier', async (req, res) => {
     if (user && user.banned === 1) return res.status(403).json({ error: "This Discord account is blacklisted." });
 
     await run('UPDATE users SET priority_tier = ? WHERE user_id = ?', [priority_tier, discord_id]);
-    console.log(`[VPS Admin API] Updated tier for canonical user ${discord_id} to ${priority_tier}`);
+    console.log(`[GuildWeave Admin API] Updated tier for canonical user ${discord_id} to ${priority_tier}`);
     res.json({ success: true });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
@@ -317,7 +317,7 @@ router.post('/revoke-discord', async (req, res) => {
 
   try {
     await run('UPDATE devices SET approved = 0 WHERE user_id = ?', [discord_id]);
-    console.log(`[VPS Admin API] Deauthorized all devices registered to Discord ID ${discord_id}`);
+    console.log(`[GuildWeave Admin API] Deauthorized all devices registered to Discord ID ${discord_id}`);
     res.json({ success: true });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
@@ -363,10 +363,10 @@ router.post('/debug-target', (req, res) => {
   if (enable) {
     const duration = (typeof ttl_ms === 'number' && Number.isFinite(ttl_ms) && ttl_ms > 0) ? ttl_ms : 600000;
     queueManager.setDebugTarget(browser_id, duration);
-    console.log(`[VPS Admin Telemetry] Armed temporary diagnostic debug logging for browser: "${browser_id}" (TTL: ${duration}ms)`);
+    console.log(`[GuildWeave Admin Telemetry] Armed temporary diagnostic debug logging for browser: "${browser_id}" (TTL: ${duration}ms)`);
   } else {
     queueManager.removeDebugTarget(browser_id);
-    console.log(`[VPS Admin Telemetry] Disarmed diagnostic debug logging for browser: "${browser_id}"`);
+    console.log(`[GuildWeave Admin Telemetry] Disarmed diagnostic debug logging for browser: "${browser_id}"`);
   }
 
   const info = queueManager.getDebugTargetInfo(browser_id);

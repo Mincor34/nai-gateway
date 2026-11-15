@@ -37,10 +37,10 @@ router.post('/join', async (req, res) => {
       // Evaluate allowance against canonical user_id (shared pool across all user devices)
       const allowance = await auditEngine.getOrUpdateAllowance(device.user_id, device.priority_tier, false);
       if (allowance < 1) {
-        console.warn(`[VPS Session Guard] User "${device.user_id}" (Device: ${browser_id}) allowance depleted.`);
+        console.warn(`[GuildWeave Session Guard] User "${device.user_id}" (Device: ${browser_id}) allowance depleted.`);
         return res.status(403).json({ statusCode: 403, error: 'ALLOWANCE_EXHAUSTED' });
       }
-      console.log(`[VPS Session Check] User "${device.user_id}" verified with ${allowance} remaining tokens.`);
+      console.log(`[GuildWeave Session Check] User "${device.user_id}" verified with ${allowance} remaining tokens.`);
     }
 
     queueManager.join({
@@ -53,7 +53,7 @@ router.post('/join', async (req, res) => {
 
     res.json({ success: true });
   } catch (err) { 
-    console.error('[VPS Telemetry] Queue join process exception:', err);
+    console.error('[GuildWeave Telemetry] Queue join process exception:', err);
     res.status(500).json({ error: err.message }); 
   }
 });
@@ -97,7 +97,7 @@ router.post('/complete', async (req, res) => {
     }
 
     queueManager.complete(req_id, browser_id);
-    console.log(`[VPS Telemetry] Received verified completion bounds. Dropping request: "${req_id}"`);
+    console.log(`[GuildWeave Telemetry] Received verified completion bounds. Dropping request: "${req_id}"`);
     res.json({ success: true });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });

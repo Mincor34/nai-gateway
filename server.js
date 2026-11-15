@@ -391,7 +391,7 @@ function persistSurplusState(poolNcp, accrualEpoch) {
           if (surplusPersistSeq > mySeq) {
             return true;
           }
-          console.error(`[VPS Surplus] Failed to persist Bucket 2 surplus state after ${attempt} attempts:`, err.message);
+          console.error(`[GuildWeave Surplus] Failed to persist Bucket 2 surplus state after ${attempt} attempts:`, err.message);
           return false;
         }
         await new Promise(resolve => {
@@ -439,7 +439,7 @@ function scheduleNextHeartbeat() {
       await flushPendingSurplusPersist();
       await syncTelemetry({ rescheduleHeartbeat: false });
     } catch (err) {
-      console.warn("[VPS Harvester] Heartbeat refresh failed:", err.message);
+      console.warn("[GuildWeave Harvester] Heartbeat refresh failed:", err.message);
     } finally {
       scheduleNextHeartbeat();
     }
@@ -468,13 +468,13 @@ function syncTelemetry({ rescheduleHeartbeat = true } = {}) {
       const config = getRuntimeConfig();
       const configRecord = await database.get('SELECT value FROM config WHERE key = ?', ['master_token']);
       if (!configRecord || !configRecord.value) {
-        console.warn("[VPS Harvester] Telemetry sync skipped: No master_token configured in database yet.");
+        console.warn("[GuildWeave Harvester] Telemetry sync skipped: No master_token configured in database yet.");
         return;
       }
       const masterToken = configRecord.value;
       last_network_attempt_at = Date.now();
 
-      console.log("[VPS Harvester] Fetching master subscription telemetry...");
+      console.log("[GuildWeave Harvester] Fetching master subscription telemetry...");
 
       await new Promise((resolve, reject) => {
         const baseUrl = config.UPSTREAM_BASE_URL_TEMPLATE.replace('{subdomain}', 'image');
@@ -488,7 +488,7 @@ function syncTelemetry({ rescheduleHeartbeat = true } = {}) {
           method: 'GET',
           headers: {
             'Authorization': `Bearer ${masterToken}`,
-            'User-Agent': 'nai-gateway-v5-harvester/1.0'
+            'User-Agent': 'guildweave-v5-harvester/1.0'
           },
           timeout: config.TELEMETRY_FETCH_TIMEOUT_MS
         };
@@ -504,7 +504,7 @@ function syncTelemetry({ rescheduleHeartbeat = true } = {}) {
                 const payload = JSON.parse(rawData);
                 const snapshot = applyUsageTelemetry(payload, config, Date.now());
                 console.log(
-                  `[VPS Harvester] Telemetry sync successful. Capacity: ${snapshot.rawProjected.toFixed(2)}% (clamped: ${snapshot.percent.toFixed(2)}%), C_base: ${snapshot.nominalDailyCompute.toFixed(2)}, NextPoll: ${Math.round(snapshot.pollingIntervalMs / 1000)}s, Locked: ${snapshot.isHardLocked}`
+                  `[GuildWeave Harvester] Telemetry sync successful. Capacity: ${snapshot.rawProjected.toFixed(2)}% (clamped: ${snapshot.percent.toFixed(2)}%), C_base: ${snapshot.nominalDailyCompute.toFixed(2)}, NextPoll: ${Math.round(snapshot.pollingIntervalMs / 1000)}s, Locked: ${snapshot.isHardLocked}`
                 );
                 if (rescheduleHeartbeat && serverInstance && !isShuttingDown) {
                   scheduleNextHeartbeat();
@@ -528,7 +528,7 @@ function syncTelemetry({ rescheduleHeartbeat = true } = {}) {
         req.end();
       });
     } catch (err) {
-      console.error("[VPS Harvester] Exception in telemetry harvester sync:", err.message);
+      console.error("[GuildWeave Harvester] Exception in telemetry harvester sync:", err.message);
       throw err; // Propagate exception to boot sequence for explicit error logging
     } finally {
       activeFetchPromise = null;
@@ -571,7 +571,7 @@ app.use((req, res, next) => {
       const lastAttemptOrSync = Math.max(last_fetched_at, last_network_attempt_at);
       if (!activeFetchPromise && (now - lastAttemptOrSync >= cooldownMs)) {
         setImmediate(() => {
-          syncTelemetry().catch(err => console.error("[VPS Telemetry] Out-of-band sync failed:", err.message));
+          syncTelemetry().catch(err => console.error("[GuildWeave Telemetry] Out-of-band sync failed:", err.message));
         });
       }
     },
@@ -601,7 +601,7 @@ app.use((req, res, next) => {
   const maskedIp = (rawIp === 'unknown' || rawIp === '127.0.0.1' || rawIp === '::1')
     ? 'local/unknown'
     : crypto.createHash('sha256').update(rawIp + IP_SALT).digest('hex').substring(0, 12);
-  console.log(`[VPS Telemetry] ${timestamp} | ${req.method} ${req.url} | Client: ${maskedIp}`);
+  console.log(`[GuildWeave Telemetry] ${timestamp} | ${req.method} ${req.url} | Client: ${maskedIp}`);
   next();
 });
 
@@ -627,7 +627,7 @@ database.initDatabase(bootConfig.DATABASE_PATH)
       const accrualRow = await database.get("SELECT value FROM config WHERE key = 'v5_surplus_last_accrual'");
       queueManager.hydrateSurplusPool(poolRow ? poolRow.value : '0', accrualRow ? accrualRow.value : '0');
     } catch (hydrateErr) {
-      console.warn("[VPS Boot] Bucket 2 surplus pool hydration failed. Falling back to 0:", hydrateErr.message);
+      console.warn("[GuildWeave Boot] Bucket 2 surplus pool hydration failed. Falling back to 0:", hydrateErr.message);
       queueManager.hydrateSurplusPool('0', '0');
     }
 
@@ -636,10 +636,10 @@ database.initDatabase(bootConfig.DATABASE_PATH)
     });
 
     try {
-      console.log("[VPS Boot] Executing warm boot subscription sync...");
+      console.log("[GuildWeave Boot] Executing warm boot subscription sync...");
       await syncTelemetry({ rescheduleHeartbeat: false });
     } catch (warmBootErr) {
-      console.warn("[VPS Boot] Warm boot telemetry pull failed. Initializing with default metrics:", warmBootErr.message);
+      console.warn("[GuildWeave Boot] Warm boot telemetry pull failed. Initializing with default metrics:", warmBootErr.message);
     }
 
     // Start Queue Scavenger GC cycle strictly after DB hydration
@@ -649,7 +649,7 @@ database.initDatabase(bootConfig.DATABASE_PATH)
     scheduleNextHeartbeat();
     
     serverInstance = app.listen(bootConfig.PORT, '127.0.0.1', () => {
-      console.log(`Gateway coordinator running on port ${bootConfig.PORT}`);
+      console.log(`GuildWeave coordinator running on port ${bootConfig.PORT}`);
     });
 
     serverInstance.on('close', () => {
@@ -662,7 +662,7 @@ database.initDatabase(bootConfig.DATABASE_PATH)
     });
   })
   .catch((err) => {
-    console.error("[VPS Critical] Database initialization failed. Terminating engine process.", err);
+    console.error("[GuildWeave Critical] Database initialization failed. Terminating engine process.", err);
     process.exit(1);
   });
 

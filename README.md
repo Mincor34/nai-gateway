@@ -1,6 +1,8 @@
-# GuildWeave (nai-gateway)
+# GuildWeave
 
 A single-concurrency transaction queue and split-token reverse proxy designed to coordinate a shared, paid NovelAI Opus-tier session across a verified user group without exposing master account credentials.
+
+*(Note: The repository slug `nai-gateway`, PM2 daemon names `nai-gateway-prod`/`nai-gateway-staging`, and compiled bundle filenames `UserScripts/nai-*.user.js` are retained for deployment and auto-update continuity.)*
 
 ## 1. System Architecture
 
@@ -13,7 +15,7 @@ A single-concurrency transaction queue and split-token reverse proxy designed to
                                              (Local Port 3000)             (Local Port 3001)
                                                     ||                             ||
                                                     \/                             \/
-                                        [ Express Gateway (PROD) ]    [ Express Gateway (STAGING) ]
+                                        [ GuildWeave (PROD) ]         [ GuildWeave (STAGING) ]
                                         ├── SQLite Store (data.db)    ├── SQLite Store (staging_data.db)
                                         ├── In-Memory Queues          ├── In-Memory Queues
                                         └── Request Accumulator       └── Request Accumulator
@@ -202,22 +204,22 @@ This compiles the ES module tree into the production artifacts:
 2. **Install Compiled Scripts:**
    * **Guest Users:** Install `UserScripts/nai-guest.user.js`.
    * **Admin Users:** Install `UserScripts/nai-admin.user.js`.
-3. **Configure VPS Target:**
-   On initial page boot, the embedded setup wizard will appear. Enter your gateway domain (`https://your-domain.duckdns.org`) and your passkey/nickname.
+3. **Configure GuildWeave Target:**
+   On initial page boot, the embedded setup wizard will appear. Enter your GuildWeave domain (`https://your-domain.duckdns.org`) and your passkey/nickname.
 
 ---
 
 ## 5. Split-Token Authentication & Spoofing Flow
 
-Guests log in natively with their own personal, free NovelAI accounts. All profile loading, story database reads, settings updates, and cryptographic E2EE decryption occur natively on their own local accounts. The UserScript interceptor tricks the local Single Page Application (SPA) into unlocking premium generation interfaces, while the VPS proxy transparently swaps personal tokens for the master paid token exclusively on outgoing generation requests.
+Guests log in natively with their own personal, free NovelAI accounts. All profile loading, story database reads, settings updates, and cryptographic E2EE decryption occur natively on their own local accounts. The UserScript interceptor tricks the local Single Page Application (SPA) into unlocking premium generation interfaces, while the GuildWeave proxy transparently swaps personal tokens for the master paid token exclusively on outgoing generation requests.
 
 ### The Administrator Flow
-1. **Admin Key Entry:** Press `Ctrl + Shift + A` on the NovelAI interface (or use the Setup Wizard) to set and save your administrator API secret.
-2. **Admin UI Access:** Click the red "VPS CONTROL PANEL" floating action button.
+1. **Admin Key Entry:** Complete the embedded Setup Wizard (`GUILDWEAVE SETUP (ADMIN)`) on initial boot to verify the domain, register a nickname, and authenticate your administrator API secret.
+2. **Admin UI Access:** Click the **GuildWeave** badge button (`#gw-nav-badge`) next to the menu icon in the image generation navigation bar.
 3. **Approve/Revoke with Priority Assignment:**
-   * *Approve:* Click "Approve" next to a pending device and assign a **Priority Tier** (`Metered`, `Low`, `Normal`, `High`, `Admin`).
+   * *Approve:* Click "APPROVE & SET" next to a pending device and assign a **Priority Tier** (`Metered`, `Low`, `Normal`, `High`, `Admin`).
    * *Revoke:* Revoking de-authorizes the device in SQLite. The guest's next proxied request will fail with an HTTP 401, restoring their setup lock.
-4. **Manual Token Push:** Input the paid master account's Bearer token and click "PUSH TO VPS STORAGE". This updates the master session key in SQLite securely.
+4. **Manual Token Push:** Input the paid master account's Bearer token and click "PUSH TO GUILDWEAVE STORAGE". This updates the master session key in SQLite securely.
 
 ---
 
@@ -235,11 +237,11 @@ pm2 logs nai-gateway-staging
 ```
 
 ### Troubleshooting Upstream Exceptions
-If PM2 outputs `[VPS Telemetry] Upstream connection socket exception occurred: Error: socket hang up` with code `ECONNRESET`:
+If PM2 outputs `[GuildWeave Telemetry] Upstream connection socket exception occurred: Error: socket hang up` with code `ECONNRESET`:
 
 1. **Verify Outbound Connectivity:** Ensure your VPS outbound port `443` is not restricted by cloud security lists.
-2. **Verify Session Token Integrity:** Cloudflare will forcefully drop connection sockets with a TCP reset (`ECONNRESET`) if your master token is expired, invalid, or malformed. Extract a fresh Bearer token from a paid Opus-tier account and push it to VPS storage via the control panel.
-3. **Trace Sandbox Violations:** If the client receives a status code error, the userscript normalizer intercepts raw exceptions and outputs the text directly to the browser console (`[VPS Gateway] Telemetry: Received raw error text:`).
+2. **Verify Session Token Integrity:** Cloudflare will forcefully drop connection sockets with a TCP reset (`ECONNRESET`) if your master token is expired, invalid, or malformed. Extract a fresh Bearer token from a paid Opus-tier account and push it to GuildWeave storage via the control panel.
+3. **Trace Sandbox Violations:** If the client receives a status code error, the userscript normalizer intercepts raw exceptions and outputs the text directly to the browser console (`[GuildWeave] Telemetry: Received raw error text:`).
 
 ### Recovering Hung Slots
 The server executes an automated TTL sweep every 5 seconds. In the event of a client crash or tab closure, active image generation locks self-terminate after 75 seconds, promoting the next queued task automatically.
