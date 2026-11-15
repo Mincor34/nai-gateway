@@ -172,7 +172,7 @@ const initDatabase = async (targetPath) => {
             is_notified INTEGER NOT NULL DEFAULT 0
           )`);
           
-          // Config Table: System key-value configurations (e.g., master token, surplus pool)
+          // Config Table: System key-value configurations (e.g., master token, surplus pool, billing cycle epoch)
           await execRun(newDb, `CREATE TABLE IF NOT EXISTS config (
             key TEXT PRIMARY KEY,
             value TEXT NOT NULL
@@ -245,9 +245,11 @@ const initDatabase = async (targetPath) => {
               await execRun(newDb, "ALTER TABLE banned_discords ADD COLUMN is_notified INTEGER NOT NULL DEFAULT 0");
             }
 
-            // 4. Seed ACS-1 Dynamic Cluster Surplus Keys into config table
+            // 4. Seed ACS-1 Dynamic Cluster Surplus & Authoritative Billing Cycle Keys into config table
             await execRun(newDb, `INSERT OR IGNORE INTO config (key, value) VALUES ('v5_surplus_pool', '0')`);
             await execRun(newDb, `INSERT OR IGNORE INTO config (key, value) VALUES ('v5_surplus_last_accrual', '0')`);
+            await execRun(newDb, `INSERT OR IGNORE INTO config (key, value) VALUES ('master_last_paid_expires_at', '0')`);
+            await execRun(newDb, `INSERT OR IGNORE INTO config (key, value) VALUES ('master_anlas_cycle_epoch', '0')`);
 
             // 5. Populate users table from pre-existing devices records, prioritizing canonical user_id
             await execRun(newDb, `

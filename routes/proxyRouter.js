@@ -135,10 +135,15 @@ router.all('/:subdomain/{*splat}', async (req, res) => {
         });
       }
 
+      // Resolve any Channel A task owned by this authenticated client prior to 503 gates so early exits never strand locks
+      const requestId = req.headers['x-request-id'];
+      activeTask = requestId ? queueManager.getProcessingTask(requestId, browserId) : null;
+
       // V5 Capacity Safeguard & Operational Circuit Breaker
       if (genModelHeader === 'V5') {
         if (!req.telemetry) {
           console.error(`[GuildWeave Gatekeeper] Critical: Telemetry context missing on V5 execution. Failing closed.`);
+          executeCleanup();
           return sendEarlyError(503, {
             statusCode: 503,
             error: 'TELEMETRY_UNAVAILABLE',
@@ -152,6 +157,8 @@ router.all('/:subdomain/{*splat}', async (req, res) => {
           console.error(`[GuildWeave Gatekeeper] On-demand telemetry sync failed:`, telemetryErr.message);
           // If telemetry has never been fetched and fails, fail closed
           if (req.telemetry.lastFetched === 0) {
+            activeTask = requestId ? queueManager.getProcessingTask(requestId, browserId) : null;
+            executeCleanup();
             return sendEarlyError(503, {
               statusCode: 503,
               error: 'TELEMETRY_FETCH_FAILED',
@@ -160,21 +167,41 @@ router.all('/:subdomain/{*splat}', async (req, res) => {
           }
         }
 
+        // Re-verify Channel A lock ownership after async telemetry I/O so an evicted task cannot race upstream
+        activeTask = requestId ? queueManager.getProcessingTask(requestId, browserId) : null;
+
+        if (req.telemetry.lastFetched > 0 && req.telemetry.subscriptionActive === false) {
+          console.warn(`[GuildWeave Gatekeeper] V5 generation blocked for browser "${browserId}": Master Opus subscription is inactive.`);
+          executeCleanup();
+          return sendEarlyError(503, {
+            statusCode: 503,
+            error: 'MASTER_SUBSCRIPTION_INACTIVE',
+            message: 'Master NovelAI Opus subscription is inactive or expired. Generation temporarily unavailable.'
+          });
+        }
+
         if (req.telemetry.isHardLocked) {
           console.warn(`[GuildWeave Gatekeeper] V5 generation blocked by circuit breaker for browser "${browserId}". Projected V5 Capacity: ${req.telemetry.percent.toFixed(2)}%`);
+          executeCleanup();
           return sendEarlyError(503, {
             statusCode: 503,
             error: 'V5_BATTERY_CRITICAL',
             message: `V5 generation is temporarily locked by the cluster circuit breaker (${req.telemetry.percent.toFixed(2)}% <= ${config.V5_CIRCUIT_BREAKER_PERCENT}%). Try again after battery recharge, or switch to a non-V5 model.`
           });
         }
+      } else if (req.telemetry && req.telemetry.lastFetched > 0 && req.telemetry.subscriptionActive === false) {
+        console.warn(`[GuildWeave Gatekeeper] Legacy generation blocked for browser "${browserId}": Master Opus subscription is inactive.`);
+        executeCleanup();
+        return sendEarlyError(503, {
+          statusCode: 503,
+          error: 'MASTER_SUBSCRIPTION_INACTIVE',
+          message: 'Master NovelAI Opus subscription is inactive or expired. Generation temporarily unavailable.'
+        });
       }
 
       // Validate active Channel A queue lock
-      const requestId = req.headers['x-request-id'];
       if (!requestId) return sendEarlyError(400, { error: 'Missing request ID.' });
 
-      activeTask = queueManager.getProcessingTask(requestId, browserId);
       if (!activeTask) {
         return sendEarlyError(403, {
           statusCode: 403,

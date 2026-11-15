@@ -531,7 +531,13 @@ async function calculateAvailableBalance(userId, heldAnlas = 0) {
 }
 
 /**
- * Enforces the rolling 30-day virtual Anlas reset with strict zero rollover.
+ * Enforces virtual Anlas cycle resets with strict zero rollover and debt offsetting.
+ * Primary mode (billing-cycle driven): when `activeCycleEpoch` is supplied from upstream
+ * `/user/subscription` telemetry, resets occur once per confirmed paid billing cycle
+ * (`last_anlas_reset_epoch < activeCycleEpoch`) and freeze unconditionally while
+ * `subscriptionActive === false` or `isGracePeriod === true`.
+ * Fallback mode: when `activeCycleEpoch === null` (isolated unit tests or mock telemetry),
+ * falls back to the 30-day (`THIRTY_DAYS_MS`) rolling epoch check.
  * Offsets fresh tier allocation by any existing negative overdraft debt, resets
  * subscription-period usage counters (including for Infinity-quota principals), and prevents
  * multi-month accumulation after extended inactivity. Freezes banned accounts without mutating
@@ -540,13 +546,50 @@ async function calculateAvailableBalance(userId, heldAnlas = 0) {
  * Serialized per canonical user_id against TOCTOU races.
  *
  * @param {string} userId - Canonical Security Principal identifier.
- * @param {number} [now=Date.now()] - Epoch timestamp in ms.
+ * @param {number|object} [optionsOrNow=Date.now()] - Epoch timestamp in ms (legacy) or cycle options object.
+ * @param {number} [optionsOrNow.now=Date.now()] - Epoch timestamp in ms.
+ * @param {number|null} [optionsOrNow.activeCycleEpoch=null] - Authoritative billing cycle epoch ms from telemetry.
+ * @param {boolean} [optionsOrNow.isGracePeriod=false] - Whether master subscription is in Chargebee grace period.
+ * @param {boolean} [optionsOrNow.subscriptionActive=true] - Whether master subscription is active and >= Opus tier.
  * @returns {Promise<{user_id: string, virtual_balance: number, previous_balance: number, reset_applied: boolean, last_anlas_reset_epoch: number|null}|null>}
- * @throws {Error} If userId or now fails validation.
+ * @throws {Error} If userId or options fail validation.
  */
-async function evaluateAnlasReset(userId, now = Date.now()) {
+async function evaluateAnlasReset(userId, optionsOrNow = Date.now()) {
   assertNonEmptyString(userId, 'userId');
-  const safeNow = assertValidTimestamp(now, 'now');
+
+  let safeNow;
+  let activeCycleEpoch = null;
+  let isGracePeriod = false;
+  let subscriptionActive = true;
+
+  if (typeof optionsOrNow === 'number') {
+    safeNow = assertValidTimestamp(optionsOrNow, 'now');
+  } else if (optionsOrNow !== null && typeof optionsOrNow === 'object' && !Array.isArray(optionsOrNow)) {
+    const {
+      now = Date.now(),
+      activeCycleEpoch: rawCycleEpoch = null,
+      isGracePeriod: rawGrace = false,
+      subscriptionActive: rawSubActive = true
+    } = optionsOrNow;
+
+    safeNow = assertValidTimestamp(now, 'now');
+    if (rawCycleEpoch !== null) {
+      activeCycleEpoch = assertValidTimestamp(rawCycleEpoch, 'activeCycleEpoch');
+      if (activeCycleEpoch === 0) {
+        throw new Error('[Audit Error] activeCycleEpoch must be a positive timestamp or null.');
+      }
+    }
+    if (typeof rawGrace !== 'boolean') {
+      throw new Error('[Audit Error] isGracePeriod must be a boolean.');
+    }
+    if (typeof rawSubActive !== 'boolean') {
+      throw new Error('[Audit Error] subscriptionActive must be a boolean.');
+    }
+    isGracePeriod = rawGrace;
+    subscriptionActive = rawSubActive;
+  } else {
+    throw new Error('[Audit Error] now or options must be a finite non-negative number or plain object.');
+  }
 
   if (userId === 'admin') {
     return {
@@ -571,7 +614,7 @@ async function evaluateAnlasReset(userId, now = Date.now()) {
     const currentBalance = isUnlimited ? Infinity : Math.trunc(user.virtual_anlas_balance || 0);
     const lastReset = user.last_anlas_reset_epoch;
 
-    if (user.banned === 1) {
+    if (user.banned === 1 || !subscriptionActive || isGracePeriod) {
       return {
         user_id: user.user_id,
         virtual_balance: currentBalance,
@@ -582,9 +625,19 @@ async function evaluateAnlasReset(userId, now = Date.now()) {
     }
 
     const isInitialReset = (lastReset === null || lastReset === undefined);
-    const elapsed = isInitialReset ? THIRTY_DAYS_MS : (safeNow - lastReset);
+    let shouldReset = false;
+    let resetEpochToStamp = safeNow;
 
-    if (!isInitialReset && elapsed < THIRTY_DAYS_MS) {
+    if (activeCycleEpoch !== null) {
+      shouldReset = isInitialReset || (lastReset < activeCycleEpoch);
+      resetEpochToStamp = activeCycleEpoch;
+    } else {
+      const elapsed = isInitialReset ? THIRTY_DAYS_MS : (safeNow - lastReset);
+      shouldReset = isInitialReset || (elapsed >= THIRTY_DAYS_MS);
+      resetEpochToStamp = safeNow;
+    }
+
+    if (!shouldReset) {
       return {
         user_id: user.user_id,
         virtual_balance: currentBalance,
@@ -602,7 +655,7 @@ async function evaluateAnlasReset(userId, now = Date.now()) {
              subscription_period_v5 = 0,
              subscription_period_start_epoch = ?
          WHERE user_id = ?`,
-        [safeNow, safeNow, user.user_id]
+        [resetEpochToStamp, resetEpochToStamp, user.user_id]
       );
 
       return {
@@ -610,12 +663,12 @@ async function evaluateAnlasReset(userId, now = Date.now()) {
         virtual_balance: Infinity,
         previous_balance: Infinity,
         reset_applied: true,
-        last_anlas_reset_epoch: safeNow
+        last_anlas_reset_epoch: resetEpochToStamp
       };
     }
 
     // Strict zero-rollover allocation: positive unused balance is discarded; negative debt offsets fresh quota.
-    // Inactive users spanning >1 month receive exactly 1x monthlyAnlas (zero multi-month stacking).
+    // Inactive users spanning >1 cycle receive exactly 1x monthlyAnlas (zero multi-cycle stacking).
     const debtOffset = currentBalance < 0 ? currentBalance : 0;
     const newBalance = Math.trunc(tierConfig.monthlyAnlas) + debtOffset;
 
@@ -627,7 +680,7 @@ async function evaluateAnlasReset(userId, now = Date.now()) {
            subscription_period_v5 = 0,
            subscription_period_start_epoch = ?
        WHERE user_id = ?`,
-      [newBalance, safeNow, safeNow, user.user_id]
+      [newBalance, resetEpochToStamp, resetEpochToStamp, user.user_id]
     );
 
     return {
@@ -635,7 +688,7 @@ async function evaluateAnlasReset(userId, now = Date.now()) {
       virtual_balance: newBalance,
       previous_balance: currentBalance,
       reset_applied: true,
-      last_anlas_reset_epoch: safeNow
+      last_anlas_reset_epoch: resetEpochToStamp
     };
   });
 }

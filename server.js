@@ -9,6 +9,8 @@
  * - Resilient warm-boot telemetry harvester with shared Promise deduplication
  * - ACS-1 dynamic timeUntilNextPercent normalization, weighted V5 dispatch projection,
  *   adaptive polling escalation (10m -> 2m -> 60s floor), and 5.5% circuit breaker
+ * - Authoritative master subscription billing-cycle tracking (active, tier, expiresAt,
+ *   isGracePeriod, trainingStepsLeft) with SQLite config persistence and fail-closed guards
  * - Bucket 2 surplus pool hydration, clamped [0, 100] telemetry injection, and atomic retry-safe persistence
  */
 
@@ -36,6 +38,8 @@ const IP_SALT = crypto.randomBytes(16).toString('hex');
 
 // ACS-1 Telemetry Projection & Polling Constants
 const SECONDS_PER_DAY = 86400;
+const MIN_CYCLE_ADVANCE_SEC = 15 * SECONDS_PER_DAY;
+const OPUS_MIN_TIER = 3;
 const V5_HIGH_IMAGES_PER_PERCENT = 17.28;
 const V5_MEDIUM_DISPATCH_WEIGHT = 0.557;
 const TELEMETRY_PERIOD_MIN_SEC = 1800;
@@ -46,6 +50,7 @@ const POLL_HIGH_BATTERY_MS = 600000; // 10 minutes (> 30%)
 const POLL_MID_BATTERY_MS = 120000;  // 2 minutes (15% - 30%)
 const POLL_LOW_BATTERY_MS = 60000;   // 60 seconds floor (<= 15%)
 const SURPLUS_PERSIST_MAX_RETRIES = 3;
+const CYCLE_PERSIST_MAX_RETRIES = 3;
 
 const bootConfig = loadConfig(process.env);
 
@@ -67,9 +72,31 @@ function getFallbackNominalMetrics(config = getRuntimeConfig()) {
   };
 }
 
+/**
+ * Parses persisted non-negative integers from SQLite config rows safely.
+ *
+ * @param {*} raw - Stored value candidate.
+ * @returns {number} Parsed non-negative safe integer, or 0 if absent/invalid.
+ */
+function parsePersistedConfigInt(raw) {
+  if (typeof raw === 'number' && Number.isInteger(raw) && raw >= 0 && Number.isSafeInteger(raw)) {
+    return raw;
+  }
+  if (typeof raw === 'string') {
+    const trimmed = raw.trim();
+    if (/^\d+$/.test(trimmed)) {
+      const parsed = Number(trimmed);
+      if (Number.isSafeInteger(parsed)) {
+        return parsed;
+      }
+    }
+  }
+  return 0;
+}
+
 const initialNominal = getFallbackNominalMetrics(bootConfig);
 
-// V5 Master Account Telemetry Registry
+// V5 Master Account Telemetry & Subscription Lifecycle Registry
 let master_v5_percent = 100;
 let master_v5_is_negative = false;
 let last_fetched_at = 0;
@@ -79,10 +106,22 @@ let nominal_daily_v5_compute = initialNominal.cBase;
 let raw_time_until_next_percent = null;
 let dispatches_high_since_sync = 0;
 let dispatches_medium_since_sync = 0;
+
+let master_subscription_active = true;
+let master_is_grace_period = false;
+let master_expires_at = null;
+let master_anlas_total = null;
+let master_last_paid_expires_at = 0;
+let master_anlas_cycle_epoch = 0;
+
 let activeFetchPromise = null;
 let pendingSurplusPersist = null;
 let surplusPersistSeq = 0;
 let surplusPersistChain = Promise.resolve(true);
+
+let pendingCyclePersist = null;
+let cyclePersistSeq = 0;
+let cyclePersistChain = Promise.resolve(true);
 
 let serverInstance = null;
 let heartbeatInterval = null;
@@ -216,7 +255,8 @@ function getPollingIntervalMs(projectedPercent, config = getRuntimeConfig()) {
 }
 
 /**
- * Returns a deterministic snapshot of the active in-memory telemetry projection state.
+ * Returns a deterministic snapshot of the active in-memory telemetry projection
+ * and master subscription billing-cycle state.
  * Latches the circuit breaker for at least one 60s polling window whenever upstream
  * confirms master capacity <= V5_CIRCUIT_BREAKER_PERCENT, preventing sub-second
  * continuous refill interpolation from flapping an exact-boundary 5.5% tank open.
@@ -257,14 +297,101 @@ function getTelemetrySnapshot(now = Date.now()) {
     dispatchesHigh: dispatches_high_since_sync,
     dispatchesMedium: dispatches_medium_since_sync,
     weightedDispatches: projection.weightedDispatches,
-    pollingIntervalMs
+    pollingIntervalMs,
+    subscriptionActive: master_subscription_active,
+    isGracePeriod: master_is_grace_period,
+    masterExpiresAt: master_expires_at,
+    masterLastPaidExpiresAt: master_last_paid_expires_at,
+    activeCycleEpoch: master_anlas_cycle_epoch > 0 ? master_anlas_cycle_epoch : null,
+    masterAnlas: master_anlas_total
   };
+}
+
+/**
+ * Hydrates persisted master subscription billing-cycle markers from SQLite config.
+ *
+ * @param {number|string} lastPaidExpiresAtSec - Persisted Unix seconds of last non-grace paid expiration.
+ * @param {number|string} cycleEpochMs - Persisted millisecond epoch of active billing cycle.
+ */
+function hydrateSubscriptionState(lastPaidExpiresAtSec, cycleEpochMs) {
+  master_last_paid_expires_at = parsePersistedConfigInt(lastPaidExpiresAtSec);
+  master_anlas_cycle_epoch = parsePersistedConfigInt(cycleEpochMs);
+}
+
+/**
+ * Atomically persists master billing-cycle state (`master_last_paid_expires_at` and
+ * `master_anlas_cycle_epoch`) to SQLite `config` with serialized retry resilience.
+ *
+ * @param {number} lastPaidExpiresAtSec - Unix seconds of last paid non-grace expiration.
+ * @param {number} cycleEpochMs - Millisecond epoch of active billing cycle.
+ * @returns {Promise<boolean>} True if persisted or superseded; false on unrecovered error.
+ */
+function persistSubscriptionCycleState(lastPaidExpiresAtSec, cycleEpochMs) {
+  const mySeq = ++cyclePersistSeq;
+  pendingCyclePersist = { expiresAt: lastPaidExpiresAtSec, cycleEpoch: cycleEpochMs, seq: mySeq };
+
+  const executeWrite = async () => {
+    for (let attempt = 1; attempt <= CYCLE_PERSIST_MAX_RETRIES; attempt++) {
+      if (isShuttingDown) {
+        return false;
+      }
+      if (cyclePersistSeq > mySeq) {
+        return true;
+      }
+      try {
+        await database.run(
+          "INSERT OR REPLACE INTO config (key, value) VALUES ('master_last_paid_expires_at', ?), ('master_anlas_cycle_epoch', ?)",
+          [String(lastPaidExpiresAtSec), String(cycleEpochMs)]
+        );
+        if (pendingCyclePersist && pendingCyclePersist.seq === mySeq) {
+          pendingCyclePersist = null;
+        }
+        return true;
+      } catch (err) {
+        if (
+          attempt === CYCLE_PERSIST_MAX_RETRIES ||
+          isShuttingDown ||
+          cyclePersistSeq > mySeq ||
+          (err && typeof err.message === 'string' && err.message.includes('Database has not been initialized'))
+        ) {
+          if (cyclePersistSeq > mySeq) {
+            return true;
+          }
+          console.error(`[GuildWeave Subscription] Failed to persist billing cycle state:`, err.message);
+          return false;
+        }
+        await new Promise(resolve => {
+          const timer = setTimeout(resolve, 50 * attempt);
+          if (timer.unref) timer.unref();
+        });
+      }
+    }
+    return false;
+  };
+
+  cyclePersistChain = cyclePersistChain.catch(() => false).then(executeWrite);
+  return cyclePersistChain;
+}
+
+/**
+ * Waits for any in-flight billing-cycle persistence chain to settle and retries
+ * only if a previous attempt failed and left `pendingCyclePersist` populated.
+ *
+ * @returns {Promise<void>}
+ */
+async function flushPendingCyclePersist() {
+  await cyclePersistChain.catch(() => false);
+  if (!pendingCyclePersist) return;
+  const { expiresAt, cycleEpoch } = pendingCyclePersist;
+  await persistSubscriptionCycleState(expiresAt, cycleEpoch);
 }
 
 /**
  * Applies a validated `/user/subscription` payload to the RAM telemetry registry,
  * normalizing `timeUntilNextPercent`, handling `isNegative` overdrafts with symmetric
- * [-100, 100] sanity bounds (and +0 normalization), and resetting local dispatch counters.
+ * [-100, 100] sanity bounds, tracking `active`/`tier`/`isGracePeriod`/`trainingStepsLeft`,
+ * advancing `master_anlas_cycle_epoch` exclusively and monotonically on genuine non-grace renewals,
+ * and resetting local V5 dispatch counters.
  *
  * @param {object} payload - Parsed JSON response from `/user/subscription`.
  * @param {object} [config=getRuntimeConfig()] - Validated configuration manifest.
@@ -286,14 +413,82 @@ function applyUsageTelemetry(payload, config = getRuntimeConfig(), now = Date.no
     : (isNegative ? -Math.abs(rawPercent) : rawPercent);
   const periodEval = normalizeTelemetryPeriod(usage.timeUntilNextPercent, config);
 
+  const safeNow = (typeof now === 'number' && Number.isFinite(now) && now >= 0) ? now : Date.now();
+  const cycleStampMs = safeNow > 0 ? safeNow : Date.now();
+
+  // Evaluate subscription status (gracefully defaulting to active when minimal usage-only mocks omit metadata)
+  const hasSubMetadata = (typeof payload.active === 'boolean') || (typeof payload.tier === 'number');
+  let nextSubActive = true;
+  if (hasSubMetadata) {
+    const activeOk = payload.active === undefined ? true : (payload.active === true);
+    const tierOk = payload.tier === undefined
+      ? true
+      : (typeof payload.tier === 'number' && Number.isFinite(payload.tier) && payload.tier >= OPUS_MIN_TIER);
+    nextSubActive = activeOk && tierOk;
+  }
+
+  const nextGracePeriod = payload.isGracePeriod === true;
+
+  const rawExpiresCandidate = (typeof payload.expiresAt === 'number' && Number.isFinite(payload.expiresAt) && payload.expiresAt > 0)
+    ? payload.expiresAt
+    : payload.paymentProcessorData?.next_billing_at;
+  let nextExpiresAt = null;
+  if (typeof rawExpiresCandidate === 'number' && Number.isFinite(rawExpiresCandidate) && rawExpiresCandidate > 0) {
+    nextExpiresAt = rawExpiresCandidate > 1e12
+      ? Math.floor(rawExpiresCandidate / 1000)
+      : Math.floor(rawExpiresCandidate);
+  }
+
+  let nextMasterAnlas = null;
+  if (payload.trainingStepsLeft && typeof payload.trainingStepsLeft === 'object' && !Array.isArray(payload.trainingStepsLeft)) {
+    const fixed = (typeof payload.trainingStepsLeft.fixedTrainingStepsLeft === 'number' && Number.isFinite(payload.trainingStepsLeft.fixedTrainingStepsLeft))
+      ? Math.max(0, Math.trunc(payload.trainingStepsLeft.fixedTrainingStepsLeft))
+      : 0;
+    const purchased = (typeof payload.trainingStepsLeft.purchasedTrainingSteps === 'number' && Number.isFinite(payload.trainingStepsLeft.purchasedTrainingSteps))
+      ? Math.max(0, Math.trunc(payload.trainingStepsLeft.purchasedTrainingSteps))
+      : 0;
+    nextMasterAnlas = fixed + purchased;
+  }
+
   master_v5_percent = signedPercent;
   master_v5_is_negative = isNegative || signedPercent < 0;
-  last_fetched_at = (typeof now === 'number' && Number.isFinite(now) && now >= 0) ? now : Date.now();
+  last_fetched_at = safeNow;
   active_period_seconds = periodEval.activePeriodSeconds;
   nominal_daily_v5_compute = periodEval.cBase;
   raw_time_until_next_percent = periodEval.normalizedPeriod;
   dispatches_high_since_sync = 0;
   dispatches_medium_since_sync = 0;
+
+  master_subscription_active = nextSubActive;
+  master_is_grace_period = nextGracePeriod;
+  master_expires_at = nextExpiresAt;
+  master_anlas_total = nextMasterAnlas;
+
+  // Advance authoritative Anlas billing cycle exclusively when paid, >=Opus, non-grace expiration advances >=15 days
+  if (nextExpiresAt !== null && nextSubActive && !nextGracePeriod) {
+    let cycleChanged = false;
+    if (master_last_paid_expires_at === 0) {
+      master_last_paid_expires_at = nextExpiresAt;
+      if (master_anlas_cycle_epoch === 0) {
+        master_anlas_cycle_epoch = cycleStampMs;
+      }
+      cycleChanged = true;
+    } else if ((nextExpiresAt - master_last_paid_expires_at) >= MIN_CYCLE_ADVANCE_SEC) {
+      master_last_paid_expires_at = nextExpiresAt;
+      master_anlas_cycle_epoch = Math.max(master_anlas_cycle_epoch + 1, cycleStampMs);
+      cycleChanged = true;
+      console.log(`[GuildWeave Subscription] Verified Opus billing cycle renewal. New expiresAt: ${nextExpiresAt}, CycleEpoch: ${master_anlas_cycle_epoch}`);
+    } else if ((master_last_paid_expires_at - nextExpiresAt) >= MIN_CYCLE_ADVANCE_SEC) {
+      // Token swapped to a different account with an earlier expiration: re-anchor baseline without resetting user quotas
+      master_last_paid_expires_at = nextExpiresAt;
+      cycleChanged = true;
+      console.log(`[GuildWeave Subscription] Re-anchored master expiresAt baseline to ${nextExpiresAt} without triggering mid-cycle reset.`);
+    }
+
+    if (cycleChanged) {
+      persistSubscriptionCycleState(master_last_paid_expires_at, master_anlas_cycle_epoch);
+    }
+  }
 
   return getTelemetrySnapshot(last_fetched_at);
 }
@@ -324,8 +519,8 @@ function recordV5Dispatch(model, isBasePaid = false) {
 }
 
 /**
- * Resets in-memory telemetry projection state to boot defaults (intended for deterministic tests).
- * Supersedes any in-flight surplus persistence retries via monotonic sequence increment.
+ * Resets in-memory telemetry projection and subscription state to boot defaults (for deterministic tests).
+ * Supersedes any in-flight persistence retries via monotonic sequence increment.
  *
  * @param {object} [overrides={}] - Optional seed fields for test setup.
  */
@@ -351,8 +546,26 @@ function resetTelemetryState(overrides = {}) {
   raw_time_until_next_percent = overrides.timeUntilNextPercent !== undefined ? overrides.timeUntilNextPercent : null;
   dispatches_high_since_sync = overrides.dispatchesHigh !== undefined ? overrides.dispatchesHigh : 0;
   dispatches_medium_since_sync = overrides.dispatchesMedium !== undefined ? overrides.dispatchesMedium : 0;
+
+  master_subscription_active = overrides.subscriptionActive !== undefined ? Boolean(overrides.subscriptionActive) : true;
+  master_is_grace_period = overrides.isGracePeriod !== undefined ? Boolean(overrides.isGracePeriod) : false;
+  master_expires_at = (typeof overrides.expiresAt === 'number' && Number.isFinite(overrides.expiresAt) && overrides.expiresAt > 0)
+    ? Math.floor(overrides.expiresAt)
+    : null;
+  master_anlas_total = (typeof overrides.masterAnlas === 'number' && Number.isFinite(overrides.masterAnlas) && overrides.masterAnlas >= 0)
+    ? Math.trunc(overrides.masterAnlas)
+    : null;
+  master_last_paid_expires_at = (typeof overrides.lastPaidExpiresAt === 'number' && Number.isFinite(overrides.lastPaidExpiresAt) && overrides.lastPaidExpiresAt >= 0)
+    ? Math.floor(overrides.lastPaidExpiresAt)
+    : 0;
+  master_anlas_cycle_epoch = (typeof overrides.activeCycleEpoch === 'number' && Number.isFinite(overrides.activeCycleEpoch) && overrides.activeCycleEpoch >= 0)
+    ? Math.floor(overrides.activeCycleEpoch)
+    : 0;
+
   pendingSurplusPersist = null;
   surplusPersistSeq += 1;
+  pendingCyclePersist = null;
+  cyclePersistSeq += 1;
 }
 
 /**
@@ -413,6 +626,7 @@ function persistSurplusState(poolNcp, accrualEpoch) {
  * @returns {Promise<void>}
  */
 async function flushPendingSurplusPersist() {
+  await surplusPersistChain.catch(() => false);
   if (!pendingSurplusPersist) return;
   const { pool, lastAccrual } = pendingSurplusPersist;
   await persistSurplusState(pool, lastAccrual);
@@ -421,7 +635,7 @@ async function flushPendingSurplusPersist() {
 /**
  * Schedules the next adaptive telemetry heartbeat using projected capacity:
  * 10m (>30%) -> 2m (15%-30%) -> 60s floor (<=15%).
- * Also flushes any deferred SQLite Bucket 2 surplus persistence writes.
+ * Also flushes any deferred SQLite Bucket 2 surplus or billing-cycle persistence writes.
  */
 function scheduleNextHeartbeat() {
   if (isShuttingDown) return;
@@ -437,6 +651,7 @@ function scheduleNextHeartbeat() {
   heartbeatInterval = setTimeout(async () => {
     try {
       await flushPendingSurplusPersist();
+      await flushPendingCyclePersist();
       await syncTelemetry({ rescheduleHeartbeat: false });
     } catch (err) {
       console.warn("[GuildWeave Harvester] Heartbeat refresh failed:", err.message);
@@ -456,7 +671,7 @@ function scheduleNextHeartbeat() {
  *
  * @param {object} [options={}] - Execution options.
  * @param {boolean} [options.rescheduleHeartbeat=true] - Whether to reschedule adaptive heartbeat on completion.
- * @returns {Promise<void>} Resolves when telemetry is synchronized.
+ * @returns {Promise<void>} Resolves when telemetry is synchronized and cycle state settled.
  */
 function syncTelemetry({ rescheduleHeartbeat = true } = {}) {
   if (activeFetchPromise) {
@@ -498,13 +713,14 @@ function syncTelemetry({ rescheduleHeartbeat = true } = {}) {
         const req = transport.request(options, (res) => {
           let rawData = '';
           res.on('data', chunk => rawData += chunk);
-          res.on('end', () => {
+          res.on('end', async () => {
             try {
               if (res.statusCode === 200) {
                 const payload = JSON.parse(rawData);
                 const snapshot = applyUsageTelemetry(payload, config, Date.now());
+                await cyclePersistChain.catch(() => false);
                 console.log(
-                  `[GuildWeave Harvester] Telemetry sync successful. Capacity: ${snapshot.rawProjected.toFixed(2)}% (clamped: ${snapshot.percent.toFixed(2)}%), C_base: ${snapshot.nominalDailyCompute.toFixed(2)}, NextPoll: ${Math.round(snapshot.pollingIntervalMs / 1000)}s, Locked: ${snapshot.isHardLocked}`
+                  `[GuildWeave Harvester] Telemetry sync successful. Capacity: ${snapshot.rawProjected.toFixed(2)}% (clamped: ${snapshot.percent.toFixed(2)}%), C_base: ${snapshot.nominalDailyCompute.toFixed(2)}, Active: ${snapshot.subscriptionActive}, Grace: ${snapshot.isGracePeriod}, NextPoll: ${Math.round(snapshot.pollingIntervalMs / 1000)}s, Locked: ${snapshot.isHardLocked}`
                 );
                 if (rescheduleHeartbeat && serverInstance && !isShuttingDown) {
                   scheduleNextHeartbeat();
@@ -561,6 +777,12 @@ app.use((req, res, next) => {
     get pollingIntervalMs() { return getTelemetrySnapshot().pollingIntervalMs; },
     get dispatchesHigh() { return dispatches_high_since_sync; },
     get dispatchesMedium() { return dispatches_medium_since_sync; },
+    get subscriptionActive() { return master_subscription_active; },
+    get isGracePeriod() { return master_is_grace_period; },
+    get masterExpiresAt() { return master_expires_at; },
+    get masterLastPaidExpiresAt() { return master_last_paid_expires_at; },
+    get activeCycleEpoch() { return master_anlas_cycle_epoch > 0 ? master_anlas_cycle_epoch : null; },
+    get masterAnlas() { return master_anlas_total; },
     getProjectionSnapshot: (now = Date.now()) => getTelemetrySnapshot(now),
     recordDispatch: (model, isBasePaid = false) => recordV5Dispatch(model, isBasePaid),
     triggerSync: () => {
@@ -631,6 +853,16 @@ database.initDatabase(bootConfig.DATABASE_PATH)
       queueManager.hydrateSurplusPool('0', '0');
     }
 
+    // Hydrate Master Billing Cycle markers from SQLite config before warm-boot sync
+    try {
+      const expiresRow = await database.get("SELECT value FROM config WHERE key = 'master_last_paid_expires_at'");
+      const cycleRow = await database.get("SELECT value FROM config WHERE key = 'master_anlas_cycle_epoch'");
+      hydrateSubscriptionState(expiresRow ? expiresRow.value : '0', cycleRow ? cycleRow.value : '0');
+    } catch (cycleHydrateErr) {
+      console.warn("[GuildWeave Boot] Billing cycle hydration failed. Falling back to 0:", cycleHydrateErr.message);
+      hydrateSubscriptionState('0', '0');
+    }
+
     queueManager.setOnSurplusAccrual((newPoolNcp, accrualEpoch) => {
       return persistSurplusState(newPoolNcp, accrualEpoch);
     });
@@ -686,6 +918,9 @@ module.exports = {
   applyUsageTelemetry,
   recordV5Dispatch,
   resetTelemetryState,
+  hydrateSubscriptionState,
+  persistSubscriptionCycleState,
+  flushPendingCyclePersist,
   persistSurplusState,
   flushPendingSurplusPersist
 };
