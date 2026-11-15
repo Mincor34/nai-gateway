@@ -125,7 +125,17 @@ router.all('/:subdomain/{*splat}', async (req, res) => {
         });
       }
 
-      // V5 Capacity Safeguard: Await fresh data rather than executing sacrificial client drops
+      // Reject unverified X-Base-Paid=true bypass claims prior to Commit 8 Anlas ledger integration
+      if (req.headers['x-base-paid'] === 'true') {
+        console.warn(`[VPS Gatekeeper] Rejected premature X-Base-Paid=true claim from browser "${browserId}".`);
+        return sendEarlyError(400, {
+          statusCode: 400,
+          error: 'BASE_PAID_UNSUPPORTED',
+          message: 'Anlas base-paid parametric bypasses are not active on this gateway version.'
+        });
+      }
+
+      // V5 Capacity Safeguard & Operational Circuit Breaker
       if (genModelHeader === 'V5') {
         if (!req.telemetry) {
           console.error(`[VPS Gatekeeper] Critical: Telemetry context missing on V5 execution. Failing closed.`);
@@ -151,11 +161,11 @@ router.all('/:subdomain/{*splat}', async (req, res) => {
         }
 
         if (req.telemetry.isHardLocked) {
-          console.warn(`[VPS Gatekeeper] V5 generation rejected for browser "${browserId}". Verified V5 Capacity: ${req.telemetry.percent}%`);
-          return sendEarlyError(429, {
-            statusCode: 429,
-            error: 'V5_CAPACITY_DEPLETED',
-            message: `v5 generation is temporarily disabled due to low master account capacity (${req.telemetry.percent}% < 10%). Try again in a few minutes, or switch to an older model.`
+          console.warn(`[VPS Gatekeeper] V5 generation blocked by circuit breaker for browser "${browserId}". Projected V5 Capacity: ${req.telemetry.percent.toFixed(2)}%`);
+          return sendEarlyError(503, {
+            statusCode: 503,
+            error: 'V5_BATTERY_CRITICAL',
+            message: `V5 generation is temporarily locked by the cluster circuit breaker (${req.telemetry.percent.toFixed(2)}% <= ${config.V5_CIRCUIT_BREAKER_PERCENT}%). Try again after battery recharge, or switch to a non-V5 model.`
           });
         }
       }
@@ -263,12 +273,17 @@ router.all('/:subdomain/{*splat}', async (req, res) => {
       const payloadBuffer = Buffer.concat(bodyChunks, accumulatedBytes);
       bodyChunks.length = 0;
 
+      // Extract model identifier synchronously so upstreamRes PoNR dispatch weighting avoids waiting on setImmediate
+      const extractedModel = (isImageGen && genModelHeader === 'V5')
+        ? (auditEngine.extractParametersFromRawBody(payloadBuffer, req.headers['content-type'])?.model || null)
+        : null;
+
       // Asynchronous Audit & Session Tracking
       setImmediate(async () => {
         try {
           await run('UPDATE devices SET total_requests = total_requests + 1, last_active_at = ? WHERE browser_id = ?', [Date.now(), browserId]);
           if (isImageGen && deviceSecret !== config.ADMIN_SECRET_KEY) {
-            const auditResult = await auditEngine.runBackgroundAudit(browserId, payloadBuffer, genModelHeader === 'V5');
+            const auditResult = await auditEngine.runBackgroundAudit(browserId, payloadBuffer, genModelHeader === 'V5', req.headers['content-type']);
             if (auditResult && auditResult.banned) {
               queueManager.evict({ user_id: auditResult.userId });
             }
@@ -285,7 +300,7 @@ router.all('/:subdomain/{*splat}', async (req, res) => {
 
       if (isClientConsenting && isAdminAuthorized) {
         console.log(`\n--- [VPS Debug Telemetry] Untruncated Structured Payload (Client: "${browserId}") ---`);
-        console.log(auditEngine.formatPayloadForLogging(payloadBuffer));
+        console.log(auditEngine.formatPayloadForLogging(payloadBuffer, req.headers['content-type']));
         console.log("------------------------------------------------------------------------------------\n");
       }
 
@@ -302,7 +317,7 @@ router.all('/:subdomain/{*splat}', async (req, res) => {
       // WAF Shield: Strip length and metadata markers to recalculate Content-Length cleanly
       const stripHeaders = [
         'x-browser-id', 'x-request-id', 'x-gen-width', 'x-gen-height', 'x-gen-steps', 'x-gen-samples', 'x-debug-mode', 'x-script-version',
-        'x-gen-model', 'x-precise-refs', 'connection', 'content-length', 'transfer-encoding'
+        'x-gen-model', 'x-precise-refs', 'x-base-paid', 'connection', 'content-length', 'transfer-encoding'
       ];
       stripHeaders.forEach(h => delete headers[h]);
 
@@ -316,16 +331,22 @@ router.all('/:subdomain/{*splat}', async (req, res) => {
         console.log(`[VPS Telemetry] Received upstream headers. Status: ${upstreamRes.statusCode}`);
 
         const tierConfig = config.TIER_CONFIGS[device.priority_tier];
-        if (upstreamRes.statusCode === 200 && isImageGen && tierConfig && tierConfig.maxAllowance !== Infinity) {
-          setImmediate(async () => {
-            try {
-              // Deduct allowance from canonical user_id (affects all user devices synchronously)
-              const remaining = await auditEngine.getOrUpdateAllowance(device.user_id, device.priority_tier, true);
-              console.log(`[VPS Audit Ledger] Deducted 1 token for User "${device.user_id}" (${device.priority_tier}). Remaining balance: ${remaining}`);
-            } catch (err) {
-              console.error('[VPS Audit] Failed to deduct metered token:', err);
-            }
-          });
+        if (upstreamRes.statusCode === 200 && isImageGen) {
+          if (genModelHeader === 'V5' && req.telemetry && typeof req.telemetry.recordDispatch === 'function') {
+            req.telemetry.recordDispatch(extractedModel, false);
+          }
+
+          if (tierConfig && tierConfig.maxAllowance !== Infinity) {
+            setImmediate(async () => {
+              try {
+                // Deduct allowance from canonical user_id (affects all user devices synchronously)
+                const remaining = await auditEngine.getOrUpdateAllowance(device.user_id, device.priority_tier, true);
+                console.log(`[VPS Audit Ledger] Deducted 1 token for User "${device.user_id}" (${device.priority_tier}). Remaining balance: ${remaining}`);
+              } catch (err) {
+                console.error('[VPS Audit] Failed to deduct metered token:', err);
+              }
+            });
+          }
         }
 
         req.socket.setNoDelay(true);

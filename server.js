@@ -7,7 +7,9 @@
  * - Stream-safe unparsed /proxy mount
  * - Post-stream standard body-parsers for /auth, /queue, /admin
  * - Resilient warm-boot telemetry harvester with shared Promise deduplication
- * - Active telemetry heartbeat loop to eliminate stale-state client drops
+ * - ACS-1 dynamic timeUntilNextPercent normalization, weighted V5 dispatch projection,
+ *   adaptive polling escalation (10m -> 2m -> 60s floor), and 5.5% circuit breaker
+ * - Bucket 2 surplus pool hydration, clamped [0, 100] telemetry injection, and atomic retry-safe persistence
  */
 
 'use strict';
@@ -17,8 +19,9 @@ const http = require('http');
 const https = require('https');
 const crypto = require('crypto');
 const { loadConfig } = require('./config');
-const { initDatabase, get } = require('./database');
+const database = require('./database');
 const queueManager = require('./queueManager');
+const { isV5ModelFamily, isV5MediumModel } = require('./auditEngine');
 
 // Route Controllers (Level 4)
 const proxyRouter = require('./routes/proxyRouter');
@@ -31,32 +34,445 @@ const app = express();
 // IP Telemetry Cryptographic Salt
 const IP_SALT = crypto.randomBytes(16).toString('hex');
 
+// ACS-1 Telemetry Projection & Polling Constants
+const SECONDS_PER_DAY = 86400;
+const V5_HIGH_IMAGES_PER_PERCENT = 17.28;
+const V5_MEDIUM_DISPATCH_WEIGHT = 0.557;
+const TELEMETRY_PERIOD_MIN_SEC = 1800;
+const TELEMETRY_PERIOD_MAX_SEC = 10000;
+const C_BASE_MIN = 100.0;
+const C_BASE_MAX = 300.0;
+const POLL_HIGH_BATTERY_MS = 600000; // 10 minutes (> 30%)
+const POLL_MID_BATTERY_MS = 120000;  // 2 minutes (15% - 30%)
+const POLL_LOW_BATTERY_MS = 60000;   // 60 seconds floor (<= 15%)
+const SURPLUS_PERSIST_MAX_RETRIES = 3;
+
+const bootConfig = loadConfig(process.env);
+
+function getRuntimeConfig() {
+  return loadConfig(process.env);
+}
+
+/**
+ * Resolves clamped nominal daily compute and its corresponding seconds-per-percent period.
+ *
+ * @param {object} [config=getRuntimeConfig()] - Validated configuration manifest.
+ * @returns {{cBase: number, periodSeconds: number}} Clamped fallback nominal compute and period.
+ */
+function getFallbackNominalMetrics(config = getRuntimeConfig()) {
+  const cBase = Math.max(C_BASE_MIN, Math.min(C_BASE_MAX, config.NOMINAL_DAILY_V5_COMPUTE));
+  return {
+    cBase,
+    periodSeconds: (SECONDS_PER_DAY * V5_HIGH_IMAGES_PER_PERCENT) / cBase
+  };
+}
+
+const initialNominal = getFallbackNominalMetrics(bootConfig);
+
 // V5 Master Account Telemetry Registry
 let master_v5_percent = 100;
+let master_v5_is_negative = false;
 let last_fetched_at = 0;
-let is_hard_locked = false;
+let last_network_attempt_at = 0;
+let active_period_seconds = initialNominal.periodSeconds;
+let nominal_daily_v5_compute = initialNominal.cBase;
+let raw_time_until_next_percent = null;
+let dispatches_high_since_sync = 0;
+let dispatches_medium_since_sync = 0;
 let activeFetchPromise = null;
+let pendingSurplusPersist = null;
+let surplusPersistSeq = 0;
+let surplusPersistChain = Promise.resolve(true);
+
+let serverInstance = null;
+let heartbeatInterval = null;
+let isShuttingDown = false;
+
+/**
+ * Normalizes NovelAI's `timeUntilNextPercent` metric into seconds, validates sanity bounds
+ * [1800, 10000], derives clamped C_base in [100.0, 300.0], and falls back strictly to
+ * clamped config.NOMINAL_DAILY_V5_COMPUTE when missing or out of bounds.
+ *
+ * @param {*} rawTimeUntilNextPercent - Upstream timeUntilNextPercent value (seconds or ms).
+ * @param {object} [config=getRuntimeConfig()] - Validated configuration manifest.
+ * @returns {{valid: boolean, normalizedPeriod: number|null, cBase: number, activePeriodSeconds: number}}
+ */
+function normalizeTelemetryPeriod(rawTimeUntilNextPercent, config = getRuntimeConfig()) {
+  const fallback = getFallbackNominalMetrics(config);
+
+  if (typeof rawTimeUntilNextPercent !== 'number' || !Number.isFinite(rawTimeUntilNextPercent) || rawTimeUntilNextPercent <= 0) {
+    return {
+      valid: false,
+      normalizedPeriod: null,
+      cBase: fallback.cBase,
+      activePeriodSeconds: fallback.periodSeconds
+    };
+  }
+
+  const normalized = rawTimeUntilNextPercent > TELEMETRY_PERIOD_MAX_SEC
+    ? Math.floor(rawTimeUntilNextPercent / 1000)
+    : rawTimeUntilNextPercent;
+
+  if (!Number.isFinite(normalized) || normalized < TELEMETRY_PERIOD_MIN_SEC || normalized > TELEMETRY_PERIOD_MAX_SEC) {
+    return {
+      valid: false,
+      normalizedPeriod: null,
+      cBase: fallback.cBase,
+      activePeriodSeconds: fallback.periodSeconds
+    };
+  }
+
+  const rawCBase = (SECONDS_PER_DAY / normalized) * V5_HIGH_IMAGES_PER_PERCENT;
+  const cBase = Math.max(C_BASE_MIN, Math.min(C_BASE_MAX, rawCBase));
+
+  return {
+    valid: true,
+    normalizedPeriod: normalized,
+    cBase,
+    activePeriodSeconds: normalized
+  };
+}
+
+/**
+ * Computes continuous master V5 battery capacity projection using elapsed seconds,
+ * active replenishment velocity, and cost-weighted local dispatch counts.
+ *
+ * @param {object} params - Projection state inputs.
+ * @param {number} params.lastPercent - Signed last telemetry percent from upstream.
+ * @param {number} params.lastFetchedAt - Epoch ms of last successful upstream sync.
+ * @param {number} params.activePeriodSeconds - Seconds per 1% replenishment.
+ * @param {number} params.dispatchesHigh - V5 High dispatches since last sync.
+ * @param {number} params.dispatchesMedium - V5 Medium dispatches since last sync.
+ * @param {number} [params.now=Date.now()] - Current epoch ms.
+ * @returns {{rawProjected: number, clampedProjected: number, weightedDispatches: number, refillVelocity: number, elapsedSeconds: number}}
+ */
+function computeProjectedCapacity({
+  lastPercent,
+  lastFetchedAt,
+  activePeriodSeconds,
+  dispatchesHigh,
+  dispatchesMedium,
+  now = Date.now()
+}) {
+  const rawLastPercent = (typeof lastPercent === 'number' && Number.isFinite(lastPercent)) ? lastPercent : 100;
+  const safeLastPercent = rawLastPercent === 0 ? 0 : rawLastPercent;
+  const safeNow = (typeof now === 'number' && Number.isFinite(now) && now >= 0) ? now : Date.now();
+  const elapsedSeconds = (typeof lastFetchedAt === 'number' && Number.isFinite(lastFetchedAt) && lastFetchedAt > 0)
+    ? Math.max(0, (safeNow - lastFetchedAt) / 1000)
+    : 0;
+
+  const fallbackPeriod = getFallbackNominalMetrics().periodSeconds;
+  const safePeriod = (typeof activePeriodSeconds === 'number' && Number.isFinite(activePeriodSeconds) && activePeriodSeconds > 0)
+    ? activePeriodSeconds
+    : fallbackPeriod;
+  const refillVelocity = 1 / safePeriod;
+
+  const safeHigh = (typeof dispatchesHigh === 'number' && Number.isFinite(dispatchesHigh) && dispatchesHigh > 0) ? dispatchesHigh : 0;
+  const safeMedium = (typeof dispatchesMedium === 'number' && Number.isFinite(dispatchesMedium) && dispatchesMedium > 0) ? dispatchesMedium : 0;
+  const weightedDispatches = safeHigh + (V5_MEDIUM_DISPATCH_WEIGHT * safeMedium);
+
+  const rawMin = Math.min(
+    100,
+    safeLastPercent + (elapsedSeconds * refillVelocity) - (weightedDispatches / V5_HIGH_IMAGES_PER_PERCENT)
+  );
+  const rawProjected = rawMin === 0 ? 0 : rawMin;
+  const clampedProjected = Math.max(0, Math.min(100, rawProjected));
+
+  return {
+    rawProjected,
+    clampedProjected,
+    weightedDispatches,
+    refillVelocity,
+    elapsedSeconds
+  };
+}
+
+/**
+ * Evaluates adaptive telemetry polling interval bounded to a strict 60-second minimum floor.
+ * - > 30%: 10 minutes (600,000 ms)
+ * - 15% - 30%: 2 minutes (120,000 ms)
+ * - <= 15%: 60 seconds (60,000 ms)
+ *
+ * @param {number} projectedPercent - Current projected battery percentage.
+ * @param {object} [config=getRuntimeConfig()] - Validated configuration manifest.
+ * @returns {number} Polling interval in milliseconds.
+ */
+function getPollingIntervalMs(projectedPercent, config = getRuntimeConfig()) {
+  const configuredCooldown = (typeof config.TELEMETRY_COOLDOWN_MS === 'number' && Number.isFinite(config.TELEMETRY_COOLDOWN_MS))
+    ? config.TELEMETRY_COOLDOWN_MS
+    : POLL_LOW_BATTERY_MS;
+  const floorMs = Math.max(POLL_LOW_BATTERY_MS, configuredCooldown);
+
+  if (typeof projectedPercent !== 'number' || !Number.isFinite(projectedPercent)) {
+    return floorMs;
+  }
+  if (projectedPercent > 30) {
+    return Math.max(floorMs, POLL_HIGH_BATTERY_MS);
+  }
+  if (projectedPercent > 15) {
+    return Math.max(floorMs, POLL_MID_BATTERY_MS);
+  }
+  return floorMs;
+}
+
+/**
+ * Returns a deterministic snapshot of the active in-memory telemetry projection state.
+ * Latches the circuit breaker for at least one 60s polling window whenever upstream
+ * confirms master capacity <= V5_CIRCUIT_BREAKER_PERCENT, preventing sub-second
+ * continuous refill interpolation from flapping an exact-boundary 5.5% tank open.
+ *
+ * @param {number} [now=Date.now()] - Epoch timestamp in ms.
+ * @returns {object} Telemetry snapshot.
+ */
+function getTelemetrySnapshot(now = Date.now()) {
+  const config = getRuntimeConfig();
+  const projection = computeProjectedCapacity({
+    lastPercent: master_v5_percent,
+    lastFetchedAt: last_fetched_at,
+    activePeriodSeconds: active_period_seconds,
+    dispatchesHigh: dispatches_high_since_sync,
+    dispatchesMedium: dispatches_medium_since_sync,
+    now
+  });
+
+  const isLatchedWithinPollWindow =
+    master_v5_percent <= config.V5_CIRCUIT_BREAKER_PERCENT &&
+    projection.elapsedSeconds < (POLL_LOW_BATTERY_MS / 1000);
+  const isHardLocked =
+    projection.rawProjected <= config.V5_CIRCUIT_BREAKER_PERCENT ||
+    isLatchedWithinPollWindow;
+  const pollingIntervalMs = getPollingIntervalMs(projection.clampedProjected, config);
+
+  return {
+    percent: projection.clampedProjected,
+    rawProjected: projection.rawProjected,
+    lastAnchorPercent: master_v5_percent,
+    isNegative: master_v5_is_negative || projection.rawProjected < 0,
+    lastFetched: last_fetched_at,
+    lastNetworkAttempt: last_network_attempt_at,
+    isHardLocked,
+    nominalDailyCompute: nominal_daily_v5_compute,
+    timeUntilNextPercent: raw_time_until_next_percent,
+    activePeriodSeconds: active_period_seconds,
+    dispatchesHigh: dispatches_high_since_sync,
+    dispatchesMedium: dispatches_medium_since_sync,
+    weightedDispatches: projection.weightedDispatches,
+    pollingIntervalMs
+  };
+}
+
+/**
+ * Applies a validated `/user/subscription` payload to the RAM telemetry registry,
+ * normalizing `timeUntilNextPercent`, handling `isNegative` overdrafts with symmetric
+ * [-100, 100] sanity bounds (and +0 normalization), and resetting local dispatch counters.
+ *
+ * @param {object} payload - Parsed JSON response from `/user/subscription`.
+ * @param {object} [config=getRuntimeConfig()] - Validated configuration manifest.
+ * @param {number} [now=Date.now()] - Epoch timestamp in ms.
+ * @returns {object} Updated telemetry snapshot.
+ * @throws {Error} If payload.usage.percent is missing, non-numeric, non-finite, or outside [-100, 100].
+ */
+function applyUsageTelemetry(payload, config = getRuntimeConfig(), now = Date.now()) {
+  const usage = payload && typeof payload === 'object' ? payload.usage : null;
+  const rawPercent = usage ? usage.percent : undefined;
+
+  if (typeof rawPercent !== 'number' || !Number.isFinite(rawPercent) || rawPercent < -100 || rawPercent > 100) {
+    throw new Error('Malformed subscription response payload: usage.percent missing or invalid.');
+  }
+
+  const isNegative = usage.isNegative === true;
+  const signedPercent = rawPercent === 0
+    ? 0
+    : (isNegative ? -Math.abs(rawPercent) : rawPercent);
+  const periodEval = normalizeTelemetryPeriod(usage.timeUntilNextPercent, config);
+
+  master_v5_percent = signedPercent;
+  master_v5_is_negative = isNegative || signedPercent < 0;
+  last_fetched_at = (typeof now === 'number' && Number.isFinite(now) && now >= 0) ? now : Date.now();
+  active_period_seconds = periodEval.activePeriodSeconds;
+  nominal_daily_v5_compute = periodEval.cBase;
+  raw_time_until_next_percent = periodEval.normalizedPeriod;
+  dispatches_high_since_sync = 0;
+  dispatches_medium_since_sync = 0;
+
+  return getTelemetrySnapshot(last_fetched_at);
+}
+
+/**
+ * Records a Point-of-No-Return (PoNR) V5 generation dispatch for weighted RAM projection.
+ * Exempts Anlas base-paid generations (`isBasePaid = true`) and non-V5 models.
+ *
+ * @param {string|null|undefined} model - Extracted model identifier.
+ * @param {boolean} [isBasePaid=false] - Whether base generation cost was paid with Anlas.
+ * @returns {boolean} True if dispatch was recorded against V5 battery projection.
+ */
+function recordV5Dispatch(model, isBasePaid = false) {
+  if (isBasePaid === true) {
+    return false;
+  }
+
+  if (typeof model === 'string' && model.trim().length > 0 && !isV5ModelFamily(model)) {
+    return false;
+  }
+
+  if (isV5MediumModel(model)) {
+    dispatches_medium_since_sync += 1;
+  } else {
+    dispatches_high_since_sync += 1;
+  }
+  return true;
+}
+
+/**
+ * Resets in-memory telemetry projection state to boot defaults (intended for deterministic tests).
+ * Supersedes any in-flight surplus persistence retries via monotonic sequence increment.
+ *
+ * @param {object} [overrides={}] - Optional seed fields for test setup.
+ */
+function resetTelemetryState(overrides = {}) {
+  const config = getRuntimeConfig();
+  const fallback = getFallbackNominalMetrics(config);
+  master_v5_percent = (typeof overrides.percent === 'number' && Number.isFinite(overrides.percent))
+    ? (overrides.percent === 0 ? 0 : overrides.percent)
+    : 100;
+  master_v5_is_negative = overrides.isNegative !== undefined ? Boolean(overrides.isNegative) : (master_v5_percent < 0);
+  last_fetched_at = (typeof overrides.lastFetchedAt === 'number' && Number.isFinite(overrides.lastFetchedAt))
+    ? overrides.lastFetchedAt
+    : 0;
+  last_network_attempt_at = (typeof overrides.lastNetworkAttemptAt === 'number' && Number.isFinite(overrides.lastNetworkAttemptAt))
+    ? overrides.lastNetworkAttemptAt
+    : 0;
+  nominal_daily_v5_compute = (typeof overrides.nominalDailyCompute === 'number' && Number.isFinite(overrides.nominalDailyCompute))
+    ? Math.max(C_BASE_MIN, Math.min(C_BASE_MAX, overrides.nominalDailyCompute))
+    : fallback.cBase;
+  active_period_seconds = (typeof overrides.activePeriodSeconds === 'number' && Number.isFinite(overrides.activePeriodSeconds) && overrides.activePeriodSeconds > 0)
+    ? overrides.activePeriodSeconds
+    : (SECONDS_PER_DAY * V5_HIGH_IMAGES_PER_PERCENT) / nominal_daily_v5_compute;
+  raw_time_until_next_percent = overrides.timeUntilNextPercent !== undefined ? overrides.timeUntilNextPercent : null;
+  dispatches_high_since_sync = overrides.dispatchesHigh !== undefined ? overrides.dispatchesHigh : 0;
+  dispatches_medium_since_sync = overrides.dispatchesMedium !== undefined ? overrides.dispatchesMedium : 0;
+  pendingSurplusPersist = null;
+  surplusPersistSeq += 1;
+}
+
+/**
+ * Atomically persists Bucket 2 Cluster Surplus Pool state to SQLite `config` table
+ * using a serialized single-statement upsert with bounded retry resilience against
+ * transient `SQLITE_BUSY` / lock contention. Superseded or shutdown writes abort
+ * cleanly without overwriting newer state.
+ *
+ * @param {number} poolNcp - Surplus pool value in NCP.
+ * @param {number} accrualEpoch - Evaluation epoch timestamp in ms.
+ * @returns {Promise<boolean>} True if persisted to SQLite; false if deferred to pendingSurplusPersist.
+ */
+function persistSurplusState(poolNcp, accrualEpoch) {
+  const mySeq = ++surplusPersistSeq;
+  pendingSurplusPersist = { pool: poolNcp, lastAccrual: accrualEpoch, seq: mySeq };
+
+  const executeWrite = async () => {
+    for (let attempt = 1; attempt <= SURPLUS_PERSIST_MAX_RETRIES; attempt++) {
+      if (isShuttingDown) {
+        return false;
+      }
+      if (surplusPersistSeq > mySeq) {
+        return true; // Superseded by a newer write request or state reset
+      }
+      try {
+        await database.run(
+          "INSERT OR REPLACE INTO config (key, value) VALUES ('v5_surplus_pool', ?), ('v5_surplus_last_accrual', ?)",
+          [String(poolNcp), String(accrualEpoch)]
+        );
+        if (pendingSurplusPersist && pendingSurplusPersist.seq === mySeq) {
+          pendingSurplusPersist = null;
+        }
+        return true;
+      } catch (err) {
+        if (attempt === SURPLUS_PERSIST_MAX_RETRIES || isShuttingDown || surplusPersistSeq > mySeq) {
+          if (surplusPersistSeq > mySeq) {
+            return true;
+          }
+          console.error(`[VPS Surplus] Failed to persist Bucket 2 surplus state after ${attempt} attempts:`, err.message);
+          return false;
+        }
+        await new Promise(resolve => {
+          const timer = setTimeout(resolve, 50 * attempt);
+          if (timer.unref) timer.unref();
+        });
+      }
+    }
+    return false;
+  };
+
+  surplusPersistChain = surplusPersistChain.catch(() => false).then(executeWrite);
+  return surplusPersistChain;
+}
+
+/**
+ * Attempts to flush any deferred Bucket 2 surplus persistence write.
+ *
+ * @returns {Promise<void>}
+ */
+async function flushPendingSurplusPersist() {
+  if (!pendingSurplusPersist) return;
+  const { pool, lastAccrual } = pendingSurplusPersist;
+  await persistSurplusState(pool, lastAccrual);
+}
+
+/**
+ * Schedules the next adaptive telemetry heartbeat using projected capacity:
+ * 10m (>30%) -> 2m (15%-30%) -> 60s floor (<=15%).
+ * Also flushes any deferred SQLite Bucket 2 surplus persistence writes.
+ */
+function scheduleNextHeartbeat() {
+  if (isShuttingDown) return;
+  if (heartbeatInterval) {
+    clearTimeout(heartbeatInterval);
+    heartbeatInterval = null;
+  }
+
+  const config = getRuntimeConfig();
+  const snapshot = getTelemetrySnapshot();
+  const delayMs = getPollingIntervalMs(snapshot.percent, config);
+
+  heartbeatInterval = setTimeout(async () => {
+    try {
+      await flushPendingSurplusPersist();
+      await syncTelemetry({ rescheduleHeartbeat: false });
+    } catch (err) {
+      console.warn("[VPS Harvester] Heartbeat refresh failed:", err.message);
+    } finally {
+      scheduleNextHeartbeat();
+    }
+  }, delayMs);
+
+  if (heartbeatInterval.unref) {
+    heartbeatInterval.unref();
+  }
+}
 
 /**
  * Asynchronously synchronizes master account subscription telemetry.
  * Leverages shared Promise resolution to prevent cache stampedes.
  *
+ * @param {object} [options={}] - Execution options.
+ * @param {boolean} [options.rescheduleHeartbeat=true] - Whether to reschedule adaptive heartbeat on completion.
  * @returns {Promise<void>} Resolves when telemetry is synchronized.
  */
-function syncTelemetry() {
+function syncTelemetry({ rescheduleHeartbeat = true } = {}) {
   if (activeFetchPromise) {
     return activeFetchPromise;
   }
 
   activeFetchPromise = (async () => {
     try {
-      const config = loadConfig(process.env);
-      const configRecord = await get('SELECT value FROM config WHERE key = ?', ['master_token']);
+      const config = getRuntimeConfig();
+      const configRecord = await database.get('SELECT value FROM config WHERE key = ?', ['master_token']);
       if (!configRecord || !configRecord.value) {
         console.warn("[VPS Harvester] Telemetry sync skipped: No master_token configured in database yet.");
         return;
       }
       const masterToken = configRecord.value;
+      last_network_attempt_at = Date.now();
 
       console.log("[VPS Harvester] Fetching master subscription telemetry...");
 
@@ -86,16 +502,14 @@ function syncTelemetry() {
             try {
               if (res.statusCode === 200) {
                 const payload = JSON.parse(rawData);
-                const percent = payload.usage?.percent;
-                if (typeof percent === 'number') {
-                  master_v5_percent = percent;
-                  last_fetched_at = Date.now();
-                  is_hard_locked = (percent < 10);
-                  console.log(`[VPS Harvester] Telemetry sync successful. Capacity: ${master_v5_percent}%, Locked: ${is_hard_locked}`);
-                  resolve();
-                } else {
-                  reject(new Error("Malformed subscription response payload: usage.percent missing."));
+                const snapshot = applyUsageTelemetry(payload, config, Date.now());
+                console.log(
+                  `[VPS Harvester] Telemetry sync successful. Capacity: ${snapshot.rawProjected.toFixed(2)}% (clamped: ${snapshot.percent.toFixed(2)}%), C_base: ${snapshot.nominalDailyCompute.toFixed(2)}, NextPoll: ${Math.round(snapshot.pollingIntervalMs / 1000)}s, Locked: ${snapshot.isHardLocked}`
+                );
+                if (rescheduleHeartbeat && serverInstance && !isShuttingDown) {
+                  scheduleNextHeartbeat();
                 }
+                resolve();
               } else {
                 reject(new Error(`Upstream returned error status code: ${res.statusCode}`));
               }
@@ -124,25 +538,54 @@ function syncTelemetry() {
   return activeFetchPromise;
 }
 
+// Wire Level 3 QueueCoordinator telemetry provider with strict [0, 100] clamping.
+// Returns null until initial telemetry fetch completes so Bucket 2 never mints phantom surplus on cold boot.
+queueManager.setTelemetryProvider(() => {
+  if (last_fetched_at === 0) {
+    return null;
+  }
+  return getTelemetrySnapshot().percent;
+});
+
 // Global Telemetry Attachment Middleware
 app.use((req, res, next) => {
   req.telemetry = {
-    get percent() { return master_v5_percent; },
+    get percent() { return getTelemetrySnapshot().percent; },
+    get rawPercent() { return getTelemetrySnapshot().rawProjected; },
+    get isNegative() { return getTelemetrySnapshot().isNegative; },
     get lastFetched() { return last_fetched_at; },
-    get isHardLocked() { return is_hard_locked; },
+    get isHardLocked() { return getTelemetrySnapshot().isHardLocked; },
+    get nominalDailyCompute() { return nominal_daily_v5_compute; },
+    get timeUntilNextPercent() { return raw_time_until_next_percent; },
+    get activePeriodSeconds() { return active_period_seconds; },
+    get pollingIntervalMs() { return getTelemetrySnapshot().pollingIntervalMs; },
+    get dispatchesHigh() { return dispatches_high_since_sync; },
+    get dispatchesMedium() { return dispatches_medium_since_sync; },
+    getProjectionSnapshot: (now = Date.now()) => getTelemetrySnapshot(now),
+    recordDispatch: (model, isBasePaid = false) => recordV5Dispatch(model, isBasePaid),
     triggerSync: () => {
-      const config = loadConfig(process.env);
+      const config = getRuntimeConfig();
       const now = Date.now();
-      if (!activeFetchPromise && (now - last_fetched_at > config.TELEMETRY_COOLDOWN_MS)) {
+      const snapshot = getTelemetrySnapshot(now);
+      const cooldownMs = getPollingIntervalMs(snapshot.percent, config);
+      const lastAttemptOrSync = Math.max(last_fetched_at, last_network_attempt_at);
+      if (!activeFetchPromise && (now - lastAttemptOrSync >= cooldownMs)) {
         setImmediate(() => {
           syncTelemetry().catch(err => console.error("[VPS Telemetry] Out-of-band sync failed:", err.message));
         });
       }
     },
     ensureFresh: async () => {
-      const config = loadConfig(process.env);
+      const config = getRuntimeConfig();
       const now = Date.now();
       if (last_fetched_at === 0 || (now - last_fetched_at > config.TELEMETRY_STALE_MS)) {
+        const cooldownFloorMs = Math.max(
+          POLL_LOW_BATTERY_MS,
+          Number.isFinite(config.TELEMETRY_COOLDOWN_MS) ? config.TELEMETRY_COOLDOWN_MS : POLL_LOW_BATTERY_MS
+        );
+        if (last_network_attempt_at > 0 && (now - last_network_attempt_at < cooldownFloorMs) && !activeFetchPromise) {
+          throw new Error('Telemetry sync suppressed during upstream rate-limit cooldown.');
+        }
         await syncTelemetry();
       }
     }
@@ -176,36 +619,46 @@ app.use('/auth', authRouter);
 app.use('/queue', queueRouter);
 app.use('/admin', adminRouter);
 
-// Start Queue Scavenger GC cycle
-queueManager.startGc();
-
-let serverInstance = null;
-let heartbeatInterval = null;
-
-// Bootstrap Sequence Guard
-const bootConfig = loadConfig(process.env);
-
-initDatabase(bootConfig.DATABASE_PATH)
+database.initDatabase(bootConfig.DATABASE_PATH)
   .then(async () => {
+    // Hydrate Bucket 2 Cluster Surplus Pool from SQLite config before starting GC or HTTP server
+    try {
+      const poolRow = await database.get("SELECT value FROM config WHERE key = 'v5_surplus_pool'");
+      const accrualRow = await database.get("SELECT value FROM config WHERE key = 'v5_surplus_last_accrual'");
+      queueManager.hydrateSurplusPool(poolRow ? poolRow.value : '0', accrualRow ? accrualRow.value : '0');
+    } catch (hydrateErr) {
+      console.warn("[VPS Boot] Bucket 2 surplus pool hydration failed. Falling back to 0:", hydrateErr.message);
+      queueManager.hydrateSurplusPool('0', '0');
+    }
+
+    queueManager.setOnSurplusAccrual((newPoolNcp, accrualEpoch) => {
+      return persistSurplusState(newPoolNcp, accrualEpoch);
+    });
+
     try {
       console.log("[VPS Boot] Executing warm boot subscription sync...");
-      await syncTelemetry();
+      await syncTelemetry({ rescheduleHeartbeat: false });
     } catch (warmBootErr) {
       console.warn("[VPS Boot] Warm boot telemetry pull failed. Initializing with default metrics:", warmBootErr.message);
     }
 
-    // Active Telemetry Heartbeat: Refresh every 10 minutes to eliminate stale client drops
-    const heartbeatMs = Math.min(600000, Math.floor(bootConfig.TELEMETRY_STALE_MS / 2));
-    heartbeatInterval = setInterval(() => {
-      syncTelemetry().catch(err => console.warn("[VPS Harvester] Heartbeat refresh failed:", err.message));
-    }, heartbeatMs);
+    // Start Queue Scavenger GC cycle strictly after DB hydration
+    queueManager.startGc();
 
-    if (heartbeatInterval.unref) {
-      heartbeatInterval.unref();
-    }
+    // Active Adaptive Telemetry Heartbeat (10m -> 2m -> 60s floor)
+    scheduleNextHeartbeat();
     
     serverInstance = app.listen(bootConfig.PORT, '127.0.0.1', () => {
       console.log(`Gateway coordinator running on port ${bootConfig.PORT}`);
+    });
+
+    serverInstance.on('close', () => {
+      isShuttingDown = true;
+      if (heartbeatInterval) {
+        clearTimeout(heartbeatInterval);
+        heartbeatInterval = null;
+      }
+      queueManager.stopGc();
     });
   })
   .catch((err) => {
@@ -225,5 +678,14 @@ module.exports = {
     return heartbeatInterval;
   },
   queueManager,
-  syncTelemetry
+  syncTelemetry,
+  normalizeTelemetryPeriod,
+  computeProjectedCapacity,
+  getPollingIntervalMs,
+  getTelemetrySnapshot,
+  applyUsageTelemetry,
+  recordV5Dispatch,
+  resetTelemetryState,
+  persistSurplusState,
+  flushPendingSurplusPersist
 };
