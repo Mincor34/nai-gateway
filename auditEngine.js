@@ -4,21 +4,31 @@
  * Strict unidirectional constraints:
  * - Imports Level 0 (database.js) and Level 1 (config.js).
  * - Blind to HTTP transport (Express), socket streams, and queue RAM states.
- * - Handles parameter parsing, security auditing, Anlas tracking, and authoritative principal authentication.
+ * - Handles parameter parsing, security auditing, Anlas tracking, authoritative principal authentication,
+ *   and ACS-1 dual-ledger balance derivation, debt lockouts, and temporal accruals.
  * - Relational Normalization: Evaluates quotas, allowances, Anlas deductions, and bans strictly
  *   against the canonical user_id (Security Principal), eliminating multi-device quota inflation.
- * - ACS-1 Domain Engine: Authoritative NovelAI Anlas formula and bounded zero-copy binary multipart parser.
+ * - ACS-1 Domain Engine: Authoritative NovelAI Anlas formula, bounded zero-copy binary multipart parser,
+ *   and integer-only NCP/Anlas financial ledger mutations.
  */
 
 'use strict';
 
-const { get, run } = require('./database');
+const { get, all, run } = require('./database');
 const { loadConfig } = require('./config');
 
 // NovelAI Pricing Formula Constants (from anlas-calculation.md)
 const ANLAS_ALPHA = 2.951823174884865e-6;
 const ANLAS_BETA = 5.753298233447344e-7;
 const ANLAS_MAX_PER_IMAGE_CAP = 140;
+const ANLAS_MIN_PER_IMAGE_FLOOR = 2;
+
+// ACS-1 Ledger Temporal & Compute Constants
+const DAY_MS = 86400000;
+const THIRTY_DAYS_MS = 30 * DAY_MS;
+const V5_HIGH_NCP_COST = 18;
+const V5_DAILY_COMPUTE_MIN = 100.0;
+const V5_DAILY_COMPUTE_MAX = 300.0;
 
 // Maximum permissible byte ceiling for the extracted JSON metadata slice (~20MB).
 // Accommodates up to 12 full-resolution Base64 reference images while bounding
@@ -35,6 +45,9 @@ const PART_NAME_MASK_REGEX = /name\s*=\s*["']?mask["']?\s*(?:;|\r|\n|$)/i;
 // Whitelist of user prompt keys that must never be subjected to Base64 truncation heuristics
 const TELEMETRY_PROMPT_KEYS = Object.freeze(new Set(['prompt', 'input', 'uc', 'negative_prompt', 'negativeprompt']));
 
+// Per-principal async serialization registry to eliminate TOCTOU accrual/reset races
+const userMutationLocks = new Map();
+
 /**
  * Evaluates the runtime system configuration dynamically.
  *
@@ -42,6 +55,80 @@ const TELEMETRY_PROMPT_KEYS = Object.freeze(new Set(['prompt', 'input', 'uc', 'n
  */
 function getConfig() {
   return loadConfig(process.env);
+}
+
+/**
+ * Serializes asynchronous ledger mutations per canonical user_id without opening
+ * competing raw SQLite transactions on the shared connection handle.
+ *
+ * @param {string} userId - Canonical Security Principal identifier.
+ * @param {Function} fn - Asynchronous critical-section callback.
+ * @returns {Promise<*>} Result of critical-section execution.
+ */
+async function withUserLock(userId, fn) {
+  const previous = userMutationLocks.get(userId) || Promise.resolve();
+  let release;
+  const current = new Promise(resolve => {
+    release = resolve;
+  });
+  const tail = previous.catch(() => {}).then(() => current);
+  userMutationLocks.set(userId, tail);
+
+  await previous.catch(() => {});
+  try {
+    return await fn();
+  } finally {
+    release();
+    if (userMutationLocks.get(userId) === tail) {
+      userMutationLocks.delete(userId);
+    }
+  }
+}
+
+/**
+ * Validates that an identifier is a non-empty, non-whitespace string (fail-closed).
+ *
+ * @param {*} value - Identifier candidate.
+ * @param {string} fieldName - Parameter name for diagnostic errors.
+ * @returns {string} Validated identifier string.
+ * @throws {Error} If value is not a non-empty string.
+ */
+function assertNonEmptyString(value, fieldName) {
+  if (typeof value !== 'string' || value.trim().length === 0) {
+    throw new Error(`[Audit Error] ${fieldName} must be a non-empty string.`);
+  }
+  return value;
+}
+
+/**
+ * Validates that a discrete financial or compute quantity is a non-negative safe integer (fail-closed).
+ * Rejects booleans, floats, NaN, Infinity, negative numbers, arrays, objects, and strings.
+ *
+ * @param {*} value - Numeric candidate.
+ * @param {string} fieldName - Parameter name for diagnostic errors.
+ * @returns {number} Validated non-negative safe integer.
+ * @throws {Error} If value violates integer boundaries.
+ */
+function assertNonNegativeSafeInt(value, fieldName) {
+  if (typeof value !== 'number' || !Number.isInteger(value) || value < 0 || value > Number.MAX_SAFE_INTEGER) {
+    throw new Error(`[Audit Error] ${fieldName} must be a non-negative safe integer.`);
+  }
+  return value;
+}
+
+/**
+ * Validates a non-negative finite epoch timestamp in milliseconds (fail-closed).
+ *
+ * @param {*} value - Epoch timestamp candidate.
+ * @param {string} fieldName - Parameter name for diagnostic errors.
+ * @returns {number} Validated epoch timestamp.
+ * @throws {Error} If value is not a finite non-negative number.
+ */
+function assertValidTimestamp(value, fieldName) {
+  if (typeof value !== 'number' || !Number.isFinite(value) || value < 0) {
+    throw new Error(`[Audit Error] ${fieldName} must be a finite non-negative number.`);
+  }
+  return value;
 }
 
 /**
@@ -101,7 +188,12 @@ async function verifyDevice(browserId, deviceSecret, { requireApproval = true } 
       discord_id: 'admin',
       discord_username: 'Administrator',
       anlas_consumed: 0,
-      metered_allowance: Infinity
+      metered_allowance: Infinity,
+      virtual_anlas_balance: Infinity,
+      v5_banked_balance: Infinity,
+      v5_daily_consumed: 0,
+      subscription_period_anlas: 0,
+      subscription_period_v5: 0
     };
   } else {
     device = await get(
@@ -110,7 +202,12 @@ async function verifyDevice(browserId, deviceSecret, { requireApproval = true } 
         d.discord_id as legacy_discord_id, d.priority_tier as legacy_tier, d.banned as legacy_banned,
         d.user_id as d_user_id,
         u.priority_tier as u_tier, u.banned as u_banned, u.ban_reason, u.anlas_consumed as u_anlas,
-        u.metered_allowance as u_allowance, u.last_allowance_update_at as u_update_at, u.discord_username as u_username
+        u.metered_allowance as u_allowance, u.last_allowance_update_at as u_update_at, u.discord_username as u_username,
+        u.virtual_anlas_balance as u_virtual_anlas, u.last_anlas_reset_epoch as u_last_anlas_reset,
+        u.v5_banked_balance as u_v5_banked, u.v5_last_accrual_epoch as u_v5_last_accrual,
+        u.v5_daily_consumed as u_v5_daily_consumed,
+        u.subscription_period_anlas as u_sub_anlas, u.subscription_period_v5 as u_sub_v5,
+        u.subscription_period_start_epoch as u_sub_start
       FROM devices d
       LEFT JOIN users u ON u.user_id = COALESCE(d.user_id, d.discord_id, d.browser_id)
       WHERE d.browser_id = ? AND d.device_secret = ?`,
@@ -126,6 +223,17 @@ async function verifyDevice(browserId, deviceSecret, { requireApproval = true } 
       device.metered_allowance = device.u_allowance !== undefined && device.u_allowance !== null ? device.u_allowance : (device.metered_allowance || 100);
       device.last_allowance_update_at = device.u_update_at || device.last_allowance_update_at || Date.now();
       device.discord_username = device.u_username || device.discord_username || null;
+
+      const tierConfig = config.TIER_CONFIGS[device.priority_tier] || config.TIER_CONFIGS['Normal'];
+      const rawVirtualAnlas = device.u_virtual_anlas !== undefined && device.u_virtual_anlas !== null ? device.u_virtual_anlas : 0;
+      device.virtual_anlas_balance = tierConfig.monthlyAnlas === Infinity ? Infinity : rawVirtualAnlas;
+      device.last_anlas_reset_epoch = device.u_last_anlas_reset ?? null;
+      device.v5_banked_balance = device.u_v5_banked !== undefined && device.u_v5_banked !== null ? device.u_v5_banked : 0;
+      device.v5_last_accrual_epoch = device.u_v5_last_accrual ?? null;
+      device.v5_daily_consumed = device.u_v5_daily_consumed !== undefined && device.u_v5_daily_consumed !== null ? device.u_v5_daily_consumed : 0;
+      device.subscription_period_anlas = device.u_sub_anlas !== undefined && device.u_sub_anlas !== null ? device.u_sub_anlas : 0;
+      device.subscription_period_v5 = device.u_sub_v5 !== undefined && device.u_sub_v5 !== null ? device.u_sub_v5 : 0;
+      device.subscription_period_start_epoch = device.u_sub_start ?? null;
     }
   }
 
@@ -282,7 +390,7 @@ function calculateAnlasCostDetails(params, { isOpus = true } = {}) {
   }
 
   // Minimum floor of 2 Anlas per billable image
-  const perImageAnlas = Math.max(Math.ceil(w * strengthFactor), 2);
+  const perImageAnlas = Math.max(Math.ceil(w * strengthFactor), ANLAS_MIN_PER_IMAGE_FLOOR);
 
   if (perImageAnlas > ANLAS_MAX_PER_IMAGE_CAP) {
     throw new Error(`Per-image cost of ${perImageAnlas} Anlas exceeds maximum cap of ${ANLAS_MAX_PER_IMAGE_CAP} Anlas.`);
@@ -358,6 +466,640 @@ function calculateAnlasCostDetails(params, { isOpus = true } = {}) {
 function calculateAnlasCost(params, options = {}) {
   const details = calculateAnlasCostDetails(params, options);
   return details.total;
+}
+
+/**
+ * Pure read-only balance evaluator (Command Query Separation).
+ * Computes dynamic available Anlas balance by deducting caller-supplied active cross-channel
+ * reservation holds (heldAnlas = sum of Channel A + Channel B holds from Level 3) against the
+ * user's persisted SQLite virtual Anlas balance. Preserves negative overdraft debt balances.
+ *
+ * Strict Level 2 isolation: accepts heldAnlas as an explicit scalar parameter from Level 4
+ * rather than importing Level 3 queue state.
+ *
+ * @param {string} userId - Canonical Security Principal identifier.
+ * @param {number} [heldAnlas=0] - Non-negative integer sum of active Anlas reservation holds.
+ * @returns {Promise<{user_id: string, priority_tier: string, virtual_balance: number, held_anlas: number, available_balance: number, is_in_debt: boolean}|null>}
+ * @throws {Error} If userId is invalid or heldAnlas is not a non-negative safe integer.
+ */
+async function calculateAvailableBalance(userId, heldAnlas = 0) {
+  assertNonEmptyString(userId, 'userId');
+  const validatedHeld = assertNonNegativeSafeInt(heldAnlas, 'heldAnlas');
+
+  if (userId === 'admin') {
+    return {
+      user_id: 'admin',
+      priority_tier: 'Admin',
+      virtual_balance: Infinity,
+      held_anlas: 0,
+      available_balance: Infinity,
+      is_in_debt: false
+    };
+  }
+
+  const user = await get(
+    'SELECT user_id, priority_tier, virtual_anlas_balance FROM users WHERE user_id = ?',
+    [userId]
+  );
+  if (!user) return null;
+
+  const config = getConfig();
+  const tierConfig = config.TIER_CONFIGS[user.priority_tier] || config.TIER_CONFIGS['Normal'];
+
+  if (tierConfig.monthlyAnlas === Infinity) {
+    return {
+      user_id: user.user_id,
+      priority_tier: user.priority_tier,
+      virtual_balance: Infinity,
+      held_anlas: validatedHeld,
+      available_balance: Infinity,
+      is_in_debt: false
+    };
+  }
+
+  const virtualBalance = Math.trunc(user.virtual_anlas_balance || 0);
+  const availableBalance = virtualBalance - validatedHeld;
+
+  return {
+    user_id: user.user_id,
+    priority_tier: user.priority_tier,
+    virtual_balance: virtualBalance,
+    held_anlas: validatedHeld,
+    available_balance: availableBalance,
+    is_in_debt: virtualBalance < 0
+  };
+}
+
+/**
+ * Enforces the rolling 30-day virtual Anlas reset with strict zero rollover.
+ * Offsets fresh tier allocation by any existing negative overdraft debt, resets
+ * subscription-period usage counters (including for Infinity-quota principals), and prevents
+ * multi-month accumulation after extended inactivity. Freezes banned accounts without mutating
+ * balances or period epochs.
+ * Note: Level 4 onboarding callers (/auth/status) must only invoke resets on approved devices.
+ * Serialized per canonical user_id against TOCTOU races.
+ *
+ * @param {string} userId - Canonical Security Principal identifier.
+ * @param {number} [now=Date.now()] - Epoch timestamp in ms.
+ * @returns {Promise<{user_id: string, virtual_balance: number, previous_balance: number, reset_applied: boolean, last_anlas_reset_epoch: number|null}|null>}
+ * @throws {Error} If userId or now fails validation.
+ */
+async function evaluateAnlasReset(userId, now = Date.now()) {
+  assertNonEmptyString(userId, 'userId');
+  const safeNow = assertValidTimestamp(now, 'now');
+
+  if (userId === 'admin') {
+    return {
+      user_id: 'admin',
+      virtual_balance: Infinity,
+      previous_balance: Infinity,
+      reset_applied: false,
+      last_anlas_reset_epoch: null
+    };
+  }
+
+  return withUserLock(userId, async () => {
+    const user = await get(
+      'SELECT user_id, priority_tier, banned, virtual_anlas_balance, last_anlas_reset_epoch, subscription_period_start_epoch FROM users WHERE user_id = ?',
+      [userId]
+    );
+    if (!user) return null;
+
+    const config = getConfig();
+    const tierConfig = config.TIER_CONFIGS[user.priority_tier] || config.TIER_CONFIGS['Normal'];
+    const isUnlimited = tierConfig.monthlyAnlas === Infinity;
+    const currentBalance = isUnlimited ? Infinity : Math.trunc(user.virtual_anlas_balance || 0);
+    const lastReset = user.last_anlas_reset_epoch;
+
+    if (user.banned === 1) {
+      return {
+        user_id: user.user_id,
+        virtual_balance: currentBalance,
+        previous_balance: currentBalance,
+        reset_applied: false,
+        last_anlas_reset_epoch: lastReset ?? null
+      };
+    }
+
+    const isInitialReset = (lastReset === null || lastReset === undefined);
+    const elapsed = isInitialReset ? THIRTY_DAYS_MS : (safeNow - lastReset);
+
+    if (!isInitialReset && elapsed < THIRTY_DAYS_MS) {
+      return {
+        user_id: user.user_id,
+        virtual_balance: currentBalance,
+        previous_balance: currentBalance,
+        reset_applied: false,
+        last_anlas_reset_epoch: lastReset
+      };
+    }
+
+    if (isUnlimited) {
+      await run(
+        `UPDATE users
+         SET last_anlas_reset_epoch = ?,
+             subscription_period_anlas = 0,
+             subscription_period_v5 = 0,
+             subscription_period_start_epoch = ?
+         WHERE user_id = ?`,
+        [safeNow, safeNow, user.user_id]
+      );
+
+      return {
+        user_id: user.user_id,
+        virtual_balance: Infinity,
+        previous_balance: Infinity,
+        reset_applied: true,
+        last_anlas_reset_epoch: safeNow
+      };
+    }
+
+    // Strict zero-rollover allocation: positive unused balance is discarded; negative debt offsets fresh quota.
+    // Inactive users spanning >1 month receive exactly 1x monthlyAnlas (zero multi-month stacking).
+    const debtOffset = currentBalance < 0 ? currentBalance : 0;
+    const newBalance = Math.trunc(tierConfig.monthlyAnlas) + debtOffset;
+
+    await run(
+      `UPDATE users
+       SET virtual_anlas_balance = ?,
+           last_anlas_reset_epoch = ?,
+           subscription_period_anlas = 0,
+           subscription_period_v5 = 0,
+           subscription_period_start_epoch = ?
+       WHERE user_id = ?`,
+      [newBalance, safeNow, safeNow, user.user_id]
+    );
+
+    return {
+      user_id: user.user_id,
+      virtual_balance: newBalance,
+      previous_balance: currentBalance,
+      reset_applied: true,
+      last_anlas_reset_epoch: safeNow
+    };
+  });
+}
+
+/**
+ * Lazily accrues daily V5 Normalized Compute Points (NCP) for Bucket 1 (Personal Rollover Bank).
+ * Evaluates proportional cluster weights strictly across distinct, unbanned, approved canonical
+ * users (1 weight per user_id regardless of linked device count), caps balances at
+ * tierConfig.v5MaxBankDays, resets v5_daily_consumed on day rollovers, and preserves strict
+ * integer balances in SQLite. Always reports accurate active daily_share_ncp, max_bank_ncp,
+ * and total_cluster_weight even when the 24-hour accrual boundary has not yet elapsed.
+ * Leaves unapproved or banned principals unmutated, and avoids stamping v5_last_accrual_epoch
+ * on zero-weight principals with zero balance so tier upgrades take effect without a 24h wait.
+ * Serialized per canonical user_id against TOCTOU races.
+ *
+ * @param {string} userId - Canonical Security Principal identifier.
+ * @param {object} [options={}] - Accrual evaluation overrides.
+ * @param {number} [options.now=Date.now()] - Epoch timestamp in ms.
+ * @param {number|null} [options.nominalDailyCompute=null] - Optional validated C_base High-equivalent image rate.
+ * @returns {Promise<{user_id: string, v5_banked_balance: number, v5_daily_consumed: number, accrual_applied: boolean, daily_share_ncp: number, max_bank_ncp: number, total_cluster_weight: number, v5_last_accrual_epoch: number|null}|null>}
+ * @throws {Error} If userId, options, or now fails validation.
+ */
+async function evaluateV5Accrual(userId, options = {}) {
+  assertNonEmptyString(userId, 'userId');
+  if (options === null || typeof options !== 'object' || Array.isArray(options)) {
+    throw new Error('[Audit Error] options must be a plain object.');
+  }
+
+  const { now = Date.now(), nominalDailyCompute = null } = options;
+  const safeNow = assertValidTimestamp(now, 'now');
+
+  if (nominalDailyCompute !== null) {
+    if (typeof nominalDailyCompute !== 'number' || !Number.isFinite(nominalDailyCompute) || nominalDailyCompute <= 0) {
+      throw new Error('[Audit Error] nominalDailyCompute must be a positive finite number or null.');
+    }
+  }
+
+  if (userId === 'admin') {
+    return {
+      user_id: 'admin',
+      v5_banked_balance: Infinity,
+      v5_daily_consumed: 0,
+      accrual_applied: false,
+      daily_share_ncp: Infinity,
+      max_bank_ncp: Infinity,
+      total_cluster_weight: 0,
+      v5_last_accrual_epoch: null
+    };
+  }
+
+  return withUserLock(userId, async () => {
+    const user = await get(
+      'SELECT user_id, priority_tier, banned, v5_banked_balance, v5_last_accrual_epoch, v5_daily_consumed FROM users WHERE user_id = ?',
+      [userId]
+    );
+    if (!user) return null;
+
+    const config = getConfig();
+    const tierConfig = config.TIER_CONFIGS[user.priority_tier] || config.TIER_CONFIGS['Normal'];
+    const currentBanked = Math.max(0, Math.trunc(user.v5_banked_balance || 0));
+    const currentDailyConsumed = Math.max(0, Math.trunc(user.v5_daily_consumed || 0));
+    const lastAccrual = user.v5_last_accrual_epoch;
+
+    // Determine nominal daily cluster compute in integer NCP
+    const cBase = nominalDailyCompute !== null
+      ? Math.max(V5_DAILY_COMPUTE_MIN, Math.min(V5_DAILY_COMPUTE_MAX, nominalDailyCompute))
+      : config.NOMINAL_DAILY_V5_COMPUTE;
+    const nominalDailyNcp = Math.floor(cBase * V5_HIGH_NCP_COST);
+
+    // Aggregate W_all across distinct canonical users who are unbanned and hold >=1 approved device
+    const approvedUsers = await all(
+      `SELECT u.user_id, u.priority_tier
+       FROM users u
+       WHERE u.banned = 0
+         AND EXISTS (SELECT 1 FROM devices d WHERE d.user_id = u.user_id AND d.approved = 1)`
+    );
+
+    let totalWeight = 0;
+    let isTargetApproved = false;
+    for (const row of approvedUsers) {
+      const rowTier = config.TIER_CONFIGS[row.priority_tier] || config.TIER_CONFIGS['Normal'];
+      const w = Number.isInteger(rowTier.v5Weight) && rowTier.v5Weight > 0 ? rowTier.v5Weight : 0;
+      totalWeight += w;
+      if (row.user_id === user.user_id) {
+        isTargetApproved = true;
+      }
+    }
+
+    // Preserve existing bank and epoch untouched when principal is banned or has zero approved devices
+    if (user.banned === 1 || !isTargetApproved) {
+      return {
+        user_id: user.user_id,
+        v5_banked_balance: currentBanked,
+        v5_daily_consumed: currentDailyConsumed,
+        accrual_applied: false,
+        daily_share_ncp: 0,
+        max_bank_ncp: 0,
+        total_cluster_weight: totalWeight,
+        v5_last_accrual_epoch: lastAccrual ?? null
+      };
+    }
+
+    const userWeight = (Number.isInteger(tierConfig.v5Weight) && tierConfig.v5Weight > 0)
+      ? tierConfig.v5Weight
+      : 0;
+    const maxBankDays = tierConfig.v5MaxBankDays ?? 0;
+
+    let dailyShareNcp = 0;
+    if (userWeight > 0 && totalWeight > 0) {
+      dailyShareNcp = Math.floor(nominalDailyNcp * (userWeight / totalWeight));
+    }
+
+    const maxBankNcp = maxBankDays === Infinity
+      ? Infinity
+      : dailyShareNcp * Math.max(0, Math.trunc(maxBankDays));
+
+    // Avoid locking zero-weight principals (e.g. Metered) into a 24h cooldown unless downgrading existing state
+    if (userWeight === 0 && maxBankNcp === 0 && currentBanked === 0 && currentDailyConsumed === 0) {
+      return {
+        user_id: user.user_id,
+        v5_banked_balance: 0,
+        v5_daily_consumed: 0,
+        accrual_applied: false,
+        daily_share_ncp: 0,
+        max_bank_ncp: 0,
+        total_cluster_weight: totalWeight,
+        v5_last_accrual_epoch: lastAccrual ?? null
+      };
+    }
+
+    const isInitialAccrual = (lastAccrual === null || lastAccrual === undefined);
+    if (!isInitialAccrual && (safeNow - lastAccrual < DAY_MS)) {
+      return {
+        user_id: user.user_id,
+        v5_banked_balance: currentBanked,
+        v5_daily_consumed: currentDailyConsumed,
+        accrual_applied: false,
+        daily_share_ncp: dailyShareNcp,
+        max_bank_ncp: maxBankNcp,
+        total_cluster_weight: totalWeight,
+        v5_last_accrual_epoch: lastAccrual
+      };
+    }
+
+    const wholeDays = isInitialAccrual ? 1 : Math.floor((safeNow - lastAccrual) / DAY_MS);
+    const nextAccrualEpoch = isInitialAccrual ? safeNow : (lastAccrual + (wholeDays * DAY_MS));
+
+    const accruedNcp = dailyShareNcp * wholeDays;
+    const uncappedBalance = currentBanked + accruedNcp;
+    const newBanked = maxBankNcp === Infinity
+      ? Math.min(Number.MAX_SAFE_INTEGER, uncappedBalance)
+      : Math.min(maxBankNcp, uncappedBalance);
+
+    await run(
+      `UPDATE users
+       SET v5_banked_balance = ?,
+           v5_last_accrual_epoch = ?,
+           v5_daily_consumed = 0
+       WHERE user_id = ?`,
+      [newBanked, nextAccrualEpoch, user.user_id]
+    );
+
+    return {
+      user_id: user.user_id,
+      v5_banked_balance: newBanked,
+      v5_daily_consumed: 0,
+      accrual_applied: true,
+      daily_share_ncp: dailyShareNcp,
+      max_bank_ncp: maxBankNcp,
+      total_cluster_weight: totalWeight,
+      v5_last_accrual_epoch: nextAccrualEpoch
+    };
+  });
+}
+
+/**
+ * Authorizes an Anlas spending operation against debt lockouts, spend caps, and
+ * cross-channel available balance (deducting active heldAnlas passed from Level 4).
+ * Enforces HTTP 403 DEBT_LOCKED whenever an account in negative Anlas debt attempts
+ * any Anlas-consuming bypass or addon request, while keeping 0-Anlas free Opus requests open.
+ * Fails closed on contradictory X-Base-Paid=true payloads declaring <2 Anlas so 0-balance
+ * clients cannot enter the 50MB staging semaphore on forged base-paid headers.
+ *
+ * @param {string} userId - Canonical Security Principal identifier.
+ * @param {object} [options={}] - Spend authorization context.
+ * @param {number} [options.declaredAnlas=0] - Client X-Declared-Anlas ceiling.
+ * @param {number|null} [options.requiredAnlas=null] - Server authoritative C_auth cost (if post-buffer).
+ * @param {boolean} [options.isBasePaid=false] - Whether X-Base-Paid is asserted.
+ * @param {number} [options.heldAnlas=0] - Active cross-channel Anlas holds for this user.
+ * @returns {Promise<{ok: boolean, status?: number, error?: string, message?: string, virtual_balance?: number, available_balance?: number, held_anlas?: number, debt_free_bypass?: boolean}>}
+ * @throws {Error} If parameters fail fail-closed integer/boolean validation.
+ */
+async function authorizeAnlasSpend(userId, options = {}) {
+  assertNonEmptyString(userId, 'userId');
+  if (options === null || typeof options !== 'object' || Array.isArray(options)) {
+    throw new Error('[Audit Error] options must be a plain object.');
+  }
+
+  const {
+    declaredAnlas = 0,
+    requiredAnlas = null,
+    isBasePaid = false,
+    heldAnlas = 0
+  } = options;
+
+  const validatedDeclared = assertNonNegativeSafeInt(declaredAnlas, 'declaredAnlas');
+  const validatedHeld = assertNonNegativeSafeInt(heldAnlas, 'heldAnlas');
+  const validatedRequired = requiredAnlas !== null
+    ? assertNonNegativeSafeInt(requiredAnlas, 'requiredAnlas')
+    : null;
+
+  if (typeof isBasePaid !== 'boolean') {
+    throw new Error('[Audit Error] isBasePaid must be a boolean.');
+  }
+
+  const balanceInfo = await calculateAvailableBalance(userId, validatedHeld);
+  if (!balanceInfo) {
+    return {
+      ok: false,
+      status: 401,
+      error: 'USER_NOT_FOUND',
+      message: 'Access Denied: Canonical user ledger record not found.'
+    };
+  }
+
+  if (balanceInfo.virtual_balance === Infinity) {
+    return {
+      ok: true,
+      virtual_balance: Infinity,
+      available_balance: Infinity,
+      held_anlas: validatedHeld
+    };
+  }
+
+  const requestsAnlas = validatedDeclared > 0 || isBasePaid || (validatedRequired !== null && validatedRequired > 0);
+
+  // Rule 1: Debt Lockout Enforcement (Active debt locks all bypass/addon Anlas usage)
+  if (balanceInfo.is_in_debt) {
+    if (requestsAnlas) {
+      return {
+        ok: false,
+        status: 403,
+        error: 'DEBT_LOCKED',
+        message: `Access Denied: Account holds an Anlas debt (${balanceInfo.virtual_balance} Anlas). Anlas-consuming generations are locked until balance restoration. Free Opus generations remain operational.`,
+        virtual_balance: balanceInfo.virtual_balance,
+        available_balance: balanceInfo.available_balance,
+        held_anlas: validatedHeld
+      };
+    }
+    return {
+      ok: true,
+      virtual_balance: balanceInfo.virtual_balance,
+      available_balance: balanceInfo.available_balance,
+      held_anlas: validatedHeld,
+      debt_free_bypass: true
+    };
+  }
+
+  // Rule 2: Zero-cost free Opus request in good standing
+  const effectiveCost = validatedRequired !== null ? validatedRequired : validatedDeclared;
+  if (effectiveCost === 0 && !isBasePaid) {
+    return {
+      ok: true,
+      virtual_balance: balanceInfo.virtual_balance,
+      available_balance: balanceInfo.available_balance,
+      held_anlas: validatedHeld
+    };
+  }
+
+  // Rule 2b: Base-paid generation minimum floor invariant (>= 2 Anlas)
+  // Prevents X-Base-Paid=true + X-Declared-Anlas=0 from passing Stage 1 with 0 available balance.
+  const minimumExpectedCost = isBasePaid ? Math.max(effectiveCost, ANLAS_MIN_PER_IMAGE_FLOOR) : effectiveCost;
+
+  // Rule 3: Cross-channel available balance sufficiency
+  if (minimumExpectedCost > balanceInfo.available_balance) {
+    return {
+      ok: false,
+      status: 403,
+      error: 'INSUFFICIENT_ANLAS',
+      message: `Insufficient virtual Anlas balance (${balanceInfo.available_balance} available after ${validatedHeld} held, ${minimumExpectedCost} required).`,
+      virtual_balance: balanceInfo.virtual_balance,
+      available_balance: balanceInfo.available_balance,
+      held_anlas: validatedHeld
+    };
+  }
+
+  // Rule 4: Declared spend ceiling enforcement (minimum 2 Anlas when X-Base-Paid=true, and C_auth <= X-Declared-Anlas)
+  if (isBasePaid && validatedDeclared < ANLAS_MIN_PER_IMAGE_FLOOR) {
+    return {
+      ok: false,
+      status: 400,
+      error: 'SPEND_CAP_EXCEEDED',
+      message: `X-Base-Paid=true requires X-Declared-Anlas >= ${ANLAS_MIN_PER_IMAGE_FLOOR} (received ${validatedDeclared}).`,
+      virtual_balance: balanceInfo.virtual_balance,
+      available_balance: balanceInfo.available_balance,
+      held_anlas: validatedHeld
+    };
+  }
+
+  if (validatedRequired !== null && validatedRequired > validatedDeclared) {
+    return {
+      ok: false,
+      status: 400,
+      error: 'SPEND_CAP_EXCEEDED',
+      message: `Authoritative cost (${validatedRequired} Anlas) exceeds X-Declared-Anlas spend cap (${validatedDeclared} Anlas).`,
+      virtual_balance: balanceInfo.virtual_balance,
+      available_balance: balanceInfo.available_balance,
+      held_anlas: validatedHeld
+    };
+  }
+
+  return {
+    ok: true,
+    virtual_balance: balanceInfo.virtual_balance,
+    available_balance: balanceInfo.available_balance,
+    held_anlas: validatedHeld
+  };
+}
+
+/**
+ * Commits an authoritative Point-of-No-Return (PoNR) virtual Anlas debit to SQLite.
+ * Preserves negative overdraft integer balances if concurrent or manual adjustments drive
+ * finite-quota accounts below zero, exempts Infinity-quota tiers from accumulating phantom
+ * debt while still recording subscription-period and lifetime Anlas metrics, and mirrors
+ * lifetime consumption onto the originating device record.
+ *
+ * @param {string} userId - Canonical Security Principal identifier.
+ * @param {number} amount - Non-negative integer Anlas to debit.
+ * @param {string|null} [browserId=null] - Optional originating hardware footprint for device metrics.
+ * @returns {Promise<{committed: boolean, virtual_balance: number}>}
+ * @throws {Error} If identifiers or amount fail validation.
+ */
+async function commitAnlasDebit(userId, amount, browserId = null) {
+  assertNonEmptyString(userId, 'userId');
+  const validatedAmount = assertNonNegativeSafeInt(amount, 'amount');
+  if (browserId !== null) {
+    assertNonEmptyString(browserId, 'browserId');
+  }
+
+  if (userId === 'admin') {
+    return { committed: false, virtual_balance: Infinity };
+  }
+
+  if (validatedAmount === 0) {
+    const row = await get('SELECT priority_tier, virtual_anlas_balance FROM users WHERE user_id = ?', [userId]);
+    if (!row) {
+      return { committed: false, virtual_balance: 0 };
+    }
+    const config = getConfig();
+    const tierConfig = config.TIER_CONFIGS[row.priority_tier] || config.TIER_CONFIGS['Normal'];
+    return {
+      committed: false,
+      virtual_balance: tierConfig.monthlyAnlas === Infinity ? Infinity : Math.trunc(row.virtual_anlas_balance || 0)
+    };
+  }
+
+  return withUserLock(userId, async () => {
+    const userRow = await get('SELECT priority_tier FROM users WHERE user_id = ?', [userId]);
+    if (!userRow) {
+      return { committed: false, virtual_balance: 0 };
+    }
+
+    const config = getConfig();
+    const tierConfig = config.TIER_CONFIGS[userRow.priority_tier] || config.TIER_CONFIGS['Normal'];
+    const isUnlimitedAnlas = tierConfig.monthlyAnlas === Infinity;
+
+    await run(
+      `UPDATE users
+       SET virtual_anlas_balance = CASE WHEN ? THEN virtual_anlas_balance ELSE virtual_anlas_balance - ? END,
+           subscription_period_anlas = subscription_period_anlas + ?,
+           anlas_consumed = anlas_consumed + ?
+       WHERE user_id = ?`,
+      [isUnlimitedAnlas ? 1 : 0, validatedAmount, validatedAmount, validatedAmount, userId]
+    );
+
+    if (browserId) {
+      await run(
+        'UPDATE devices SET anlas_consumed = anlas_consumed + ? WHERE browser_id = ?',
+        [validatedAmount, browserId]
+      );
+    }
+
+    if (isUnlimitedAnlas) {
+      return { committed: true, virtual_balance: Infinity };
+    }
+
+    const updated = await get('SELECT virtual_anlas_balance FROM users WHERE user_id = ?', [userId]);
+    return {
+      committed: true,
+      virtual_balance: updated ? Math.trunc(updated.virtual_anlas_balance || 0) : 0
+    };
+  });
+}
+
+/**
+ * Commits an authoritative Point-of-No-Return (PoNR) V5 personal bank NCP deduction to SQLite.
+ * Treats zero-cost debits as a read-only no-op consistent with commitAnlasDebit, clamps
+ * remaining v5_banked_balance via MAX(0, ...), and increments daily and subscription-period
+ * V5 generation counters.
+ *
+ * @param {string} userId - Canonical Security Principal identifier.
+ * @param {number} ncpCost - Non-negative integer NCP to deduct (18 High, 10 Medium).
+ * @returns {Promise<{committed: boolean, v5_banked_balance: number}>}
+ * @throws {Error} If userId or ncpCost fails validation.
+ */
+async function commitV5Debit(userId, ncpCost) {
+  assertNonEmptyString(userId, 'userId');
+  const validatedNcp = assertNonNegativeSafeInt(ncpCost, 'ncpCost');
+
+  if (userId === 'admin') {
+    return { committed: false, v5_banked_balance: Infinity };
+  }
+
+  if (validatedNcp === 0) {
+    const row = await get('SELECT v5_banked_balance FROM users WHERE user_id = ?', [userId]);
+    return {
+      committed: false,
+      v5_banked_balance: row ? Math.max(0, Math.trunc(row.v5_banked_balance || 0)) : 0
+    };
+  }
+
+  return withUserLock(userId, async () => {
+    const result = await run(
+      `UPDATE users
+       SET v5_banked_balance = MAX(0, v5_banked_balance - ?),
+           v5_daily_consumed = v5_daily_consumed + 1,
+           subscription_period_v5 = subscription_period_v5 + 1
+       WHERE user_id = ?`,
+      [validatedNcp, userId]
+    );
+
+    if (!result || result.changes === 0) {
+      return { committed: false, v5_banked_balance: 0 };
+    }
+
+    const updated = await get('SELECT v5_banked_balance FROM users WHERE user_id = ?', [userId]);
+    return {
+      committed: true,
+      v5_banked_balance: updated ? Math.max(0, Math.trunc(updated.v5_banked_balance || 0)) : 0
+    };
+  });
+}
+
+/**
+ * Records a Point-of-No-Return (PoNR) Bucket 2 (Cluster Surplus) V5 generation
+ * against the user's daily and subscription-period V5 counters without deducting personal bank NCP.
+ *
+ * @param {string} userId - Canonical Security Principal identifier.
+ * @returns {Promise<void>}
+ * @throws {Error} If userId is invalid.
+ */
+async function recordSurplusV5Usage(userId) {
+  assertNonEmptyString(userId, 'userId');
+  if (userId === 'admin') return;
+
+  await withUserLock(userId, async () => {
+    await run(
+      `UPDATE users
+       SET v5_daily_consumed = v5_daily_consumed + 1,
+           subscription_period_v5 = subscription_period_v5 + 1
+       WHERE user_id = ?`,
+      [userId]
+    );
+  });
 }
 
 /**
@@ -960,6 +1702,13 @@ module.exports = {
   isV5MediumModel,
   calculateAnlasCost,
   calculateAnlasCostDetails,
+  calculateAvailableBalance,
+  evaluateAnlasReset,
+  evaluateV5Accrual,
+  authorizeAnlasSpend,
+  commitAnlasDebit,
+  commitV5Debit,
+  recordSurplusV5Usage,
   extractParametersFromRawBody,
   sanitizeObjectForLogging,
   formatPayloadForLogging,
@@ -967,5 +1716,7 @@ module.exports = {
   getOrUpdateAllowance,
   getNextRefillTime,
   MAX_JSON_PART_BYTES,
-  TELEMETRY_PROMPT_KEYS
+  TELEMETRY_PROMPT_KEYS,
+  DAY_MS,
+  THIRTY_DAYS_MS
 };
