@@ -9,7 +9,7 @@
  * - Relational Normalization: Evaluates quotas, allowances, Anlas deductions, and bans strictly
  *   against the canonical user_id (Security Principal), eliminating multi-device quota inflation.
  * - ACS-1 Domain Engine: Authoritative NovelAI Anlas formula, bounded zero-copy binary multipart parser,
- *   and integer-only NCP/Anlas financial ledger mutations.
+ *   isolated Channel B vibe payload validator, and integer-only NCP/Anlas financial ledger mutations.
  */
 
 'use strict';
@@ -41,6 +41,7 @@ const NEEDLE_LF_LF = Buffer.from('\n\n');
 const PART_NAME_REQUEST_REGEX = /name\s*=\s*["']?request["']?\s*(?:;|\r|\n|$)/i;
 const PART_NAME_IMAGE_REGEX = /name\s*=\s*["']?image["']?\s*(?:;|\r|\n|$)/i;
 const PART_NAME_MASK_REGEX = /name\s*=\s*["']?mask["']?\s*(?:;|\r|\n|$)/i;
+const PART_CONTENT_TYPE_IMAGE_REGEX = /content-type\s*:\s*image\//i;
 
 // Whitelist of user prompt keys that must never be subjected to Base64 truncation heuristics
 const TELEMETRY_PROMPT_KEYS = Object.freeze(new Set(['prompt', 'input', 'uc', 'negative_prompt', 'negativeprompt']));
@@ -1156,6 +1157,43 @@ async function recordSurplusV5Usage(userId) {
 }
 
 /**
+ * Extracts an RFC 2046 multipart boundary from Content-Type or raw buffer prefix.
+ *
+ * @param {Buffer} buffer - Raw payload buffer.
+ * @param {string|null} [contentType=null] - Inbound HTTP Content-Type header string.
+ * @returns {string|null} Extracted boundary token or null.
+ */
+function extractMultipartBoundary(buffer, contentType = null) {
+  if (typeof contentType === 'string') {
+    const match = contentType.match(/boundary\s*=\s*(?:"([^"]+)"|([^;]+))/i);
+    if (match) {
+      const candidate = (match[1] || match[2]).trim();
+      if (candidate.length > 0) return candidate;
+    }
+  }
+
+  let offset = 0;
+  while (offset < buffer.length && (buffer[offset] === 0x20 || buffer[offset] === 0x0A || buffer[offset] === 0x0D || buffer[offset] === 0x09)) {
+    offset++;
+  }
+  if (offset + 2 < buffer.length && buffer[offset] === 0x2D && buffer[offset + 1] === 0x2D) {
+    let lineEnd = -1;
+    for (let i = offset + 2; i < Math.min(buffer.length, offset + 512); i++) {
+      if (buffer[i] === 0x0A) {
+        lineEnd = (i > offset + 2 && buffer[i - 1] === 0x0D) ? i - 1 : i;
+        break;
+      }
+    }
+    if (lineEnd !== -1) {
+      const extracted = buffer.subarray(offset + 2, lineEnd).toString('utf8').trim();
+      if (extracted.length > 0) return extracted;
+    }
+  }
+
+  return null;
+}
+
+/**
  * Internal zero-copy binary parser.
  * Traverses boundary frames in multipart streams without scanning arbitrary binary data.
  * Collects a structural manifest of parts (detecting binary image and mask presence)
@@ -1168,34 +1206,7 @@ async function recordSurplusV5Usage(userId) {
 function extractDescriptorFromBuffer(buffer, contentType = null) {
   if (!buffer || !Buffer.isBuffer(buffer) || buffer.length === 0) return null;
 
-  let boundary = null;
-
-  if (typeof contentType === 'string') {
-    const match = contentType.match(/boundary\s*=\s*(?:"([^"]+)"|([^;]+))/i);
-    if (match) {
-      boundary = (match[1] || match[2]).trim();
-    }
-  }
-
-  // Fallback boundary extraction from raw buffer prefix
-  if (!boundary) {
-    let offset = 0;
-    while (offset < buffer.length && (buffer[offset] === 0x20 || buffer[offset] === 0x0A || buffer[offset] === 0x0D || buffer[offset] === 0x09)) {
-      offset++;
-    }
-    if (offset + 2 < buffer.length && buffer[offset] === 0x2D && buffer[offset + 1] === 0x2D) {
-      let lineEnd = -1;
-      for (let i = offset + 2; i < Math.min(buffer.length, offset + 512); i++) {
-        if (buffer[i] === 0x0A) {
-          lineEnd = (i > offset + 2 && buffer[i - 1] === 0x0D) ? i - 1 : i;
-          break;
-        }
-      }
-      if (lineEnd !== -1) {
-        boundary = buffer.subarray(offset + 2, lineEnd).toString('utf8').trim();
-      }
-    }
-  }
+  const boundary = extractMultipartBoundary(buffer, contentType);
 
   // ---------------------------------------------------------------------------
   // 1. Multipart/FormData Extraction via Linear Boundary Traversal
@@ -1394,6 +1405,192 @@ function extractDescriptorFromBuffer(buffer, contentType = null) {
   }
 
   return null;
+}
+
+/**
+ * Dedicated zero-copy payload validator for Channel B `/ai/encode-vibe` requests.
+ * Completely bypasses generation parameter extraction (`name="request"`), verifying
+ * non-empty image presence across:
+ * - RFC 2046 multipart/form-data (`name="image"` or `Content-Type: image/*` part with >0 body bytes),
+ * - JSON payloads (`{ image: "<non-empty base64 or data URI>" }`), or
+ * - Raw binary image streams (PNG, JPEG, WebP, GIF, BMP magic bytes or `image/*` / `application/octet-stream`).
+ *
+ * @param {Buffer} buffer - Accumulated raw client request buffer.
+ * @param {string|null} [contentType=null] - Inbound HTTP Content-Type header value.
+ * @returns {{ok: boolean, format?: string, reason?: string}} Validation outcome.
+ */
+function validateVibeEncodePayload(buffer, contentType = null) {
+  if (!buffer || !Buffer.isBuffer(buffer) || buffer.length === 0) {
+    return { ok: false, reason: 'Vibe encoding payload must not be empty.' };
+  }
+
+  // 1. Multipart/FormData branch: verify non-empty image part without expecting name="request"
+  const boundary = extractMultipartBoundary(buffer, contentType);
+  if (boundary) {
+    const delimiter = Buffer.from(`--${boundary}`);
+    let partSearchOffset = 0;
+
+    while (partSearchOffset < buffer.length) {
+      const boundaryIdx = buffer.indexOf(delimiter, partSearchOffset);
+      if (boundaryIdx === -1) break;
+
+      if (boundaryIdx > 0 && buffer[boundaryIdx - 1] !== 0x0A) {
+        partSearchOffset = boundaryIdx + 1;
+        continue;
+      }
+
+      let cursor = boundaryIdx + delimiter.length;
+      let isClosing = false;
+      if (cursor + 1 < buffer.length && buffer[cursor] === 0x2D && buffer[cursor + 1] === 0x2D) {
+        isClosing = true;
+        cursor += 2;
+      }
+
+      while (cursor < buffer.length && (buffer[cursor] === 0x20 || buffer[cursor] === 0x09)) {
+        cursor++;
+      }
+
+      if (cursor < buffer.length && buffer[cursor] === 0x0D) cursor++;
+      if (cursor < buffer.length && buffer[cursor] === 0x0A) cursor++;
+
+      if (isClosing) {
+        break;
+      }
+
+      const partHeaderStart = cursor;
+      const maxHeaderScan = Math.min(buffer.length, partHeaderStart + 4096);
+      const headerWindow = buffer.subarray(partHeaderStart, maxHeaderScan);
+
+      let headerEnd = -1;
+      let headerDelimLen = 0;
+
+      const crlfEnd = headerWindow.indexOf(NEEDLE_CRLF_CRLF);
+      const lfEnd = headerWindow.indexOf(NEEDLE_LF_LF);
+
+      if (crlfEnd !== -1 && lfEnd !== -1) {
+        if (crlfEnd <= lfEnd) {
+          headerEnd = partHeaderStart + crlfEnd;
+          headerDelimLen = 4;
+        } else {
+          headerEnd = partHeaderStart + lfEnd;
+          headerDelimLen = 2;
+        }
+      } else if (crlfEnd !== -1) {
+        headerEnd = partHeaderStart + crlfEnd;
+        headerDelimLen = 4;
+      } else if (lfEnd !== -1) {
+        headerEnd = partHeaderStart + lfEnd;
+        headerDelimLen = 2;
+      }
+
+      if (headerEnd === -1) {
+        partSearchOffset = boundaryIdx + delimiter.length;
+        continue;
+      }
+
+      const partHeaderText = buffer.subarray(partHeaderStart, headerEnd).toString('utf8');
+      if (PART_NAME_IMAGE_REGEX.test(partHeaderText) || PART_CONTENT_TYPE_IMAGE_REGEX.test(partHeaderText)) {
+        const bodyStart = headerEnd + headerDelimLen;
+        let searchBoundaryFrom = bodyStart;
+
+        while (searchBoundaryFrom < buffer.length) {
+          const nextBoundaryIdx = buffer.indexOf(delimiter, searchBoundaryFrom);
+          if (nextBoundaryIdx === -1) break;
+
+          if (nextBoundaryIdx > 0 && buffer[nextBoundaryIdx - 1] !== 0x0A) {
+            searchBoundaryFrom = nextBoundaryIdx + 1;
+            continue;
+          }
+
+          let bodyEnd = nextBoundaryIdx;
+          if (bodyEnd > bodyStart && buffer[bodyEnd - 1] === 0x0A) {
+            bodyEnd--;
+            if (bodyEnd > bodyStart && buffer[bodyEnd - 1] === 0x0D) {
+              bodyEnd--;
+            }
+          }
+
+          if (bodyEnd > bodyStart) {
+            return { ok: true, format: 'multipart' };
+          }
+          break;
+        }
+      }
+
+      partSearchOffset = boundaryIdx + delimiter.length;
+    }
+
+    return { ok: false, reason: 'Multipart vibe encoding payload is missing a non-empty image part.' };
+  }
+
+  // 2. Direct JSON branch: require non-empty string image property
+  const scanLimit = Math.min(buffer.length, 4096);
+  let firstNonWsByte = -1;
+  let startIdx = -1;
+  for (let i = 0; i < scanLimit; i++) {
+    const b = buffer[i];
+    if (b !== 0x20 && b !== 0x0A && b !== 0x0D && b !== 0x09) {
+      firstNonWsByte = b;
+      startIdx = i;
+      break;
+    }
+  }
+
+  if (firstNonWsByte === 0x7B) { // '{'
+    let endIdx = buffer.length - 1;
+    while (endIdx >= startIdx) {
+      const b = buffer[endIdx];
+      if (b !== 0x20 && b !== 0x0A && b !== 0x0D && b !== 0x09) {
+        break;
+      }
+      endIdx--;
+    }
+
+    const jsonLength = endIdx - startIdx + 1;
+    if (jsonLength > 0 && jsonLength <= MAX_JSON_PART_BYTES && buffer[endIdx] === 0x7D) {
+      try {
+        const parsed = JSON.parse(buffer.subarray(startIdx, endIdx + 1).toString('utf8'));
+        if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+          if (typeof parsed.image === 'string' && parsed.image.trim().length > 0) {
+            return { ok: true, format: 'json' };
+          }
+          return { ok: false, reason: 'JSON vibe encoding payload must include a non-empty "image" field.' };
+        }
+      } catch (_) {
+        return { ok: false, reason: 'Malformed JSON in vibe encoding payload.' };
+      }
+    }
+
+    return { ok: false, reason: 'Malformed or oversized JSON in vibe encoding payload.' };
+  }
+
+  // 3. Raw binary image branch: match standard image magic bytes or explicit binary image MIME types
+  const isPng = buffer.length >= 8 &&
+    buffer[0] === 0x89 && buffer[1] === 0x50 && buffer[2] === 0x4E && buffer[3] === 0x47 &&
+    buffer[4] === 0x0D && buffer[5] === 0x0A && buffer[6] === 0x1A && buffer[7] === 0x0A;
+  const isJpeg = buffer.length >= 3 &&
+    buffer[0] === 0xFF && buffer[1] === 0xD8 && buffer[2] === 0xFF;
+  const isWebp = buffer.length >= 12 &&
+    buffer.subarray(0, 4).toString('ascii') === 'RIFF' &&
+    buffer.subarray(8, 12).toString('ascii') === 'WEBP';
+  const isGif = buffer.length >= 6 && (
+    buffer.subarray(0, 6).toString('ascii') === 'GIF87a' ||
+    buffer.subarray(0, 6).toString('ascii') === 'GIF89a'
+  );
+  const isBmp = buffer.length >= 2 && buffer[0] === 0x42 && buffer[1] === 0x4D;
+
+  if (isPng || isJpeg || isWebp || isGif || isBmp) {
+    return { ok: true, format: 'binary' };
+  }
+
+  if (typeof contentType === 'string') {
+    const normalizedType = contentType.trim().toLowerCase();
+    if (normalizedType.startsWith('image/') || normalizedType.startsWith('application/octet-stream')) {
+      return { ok: true, format: 'binary' };
+    }
+  }
+
+  return { ok: false, reason: 'Vibe encoding payload must contain valid image binary data or a JSON "image" field.' };
 }
 
 /**
@@ -1763,6 +1960,7 @@ module.exports = {
   commitV5Debit,
   recordSurplusV5Usage,
   extractParametersFromRawBody,
+  validateVibeEncodePayload,
   sanitizeObjectForLogging,
   formatPayloadForLogging,
   runBackgroundAudit,
