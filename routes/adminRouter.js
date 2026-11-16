@@ -1,6 +1,8 @@
 /**
  * LEVEL 4: ADMINISTRATIVE ROUTER (routes/adminRouter.js)
  * Isolates all privileged control panel, Discord bot, and management interactions.
+ * Exposes dual-ledger Anlas/V5 NCP telemetry, Cluster Surplus state, subscription-period
+ * aggregates, and atomic balance adjustment / debt reconciliation controls.
  * Relational Normalization: Operates on canonical users as parents and devices as children.
  */
 
@@ -9,13 +11,61 @@
 const express = require('express');
 const { run, get, all } = require('../database');
 const queueManager = require('../queueManager');
-const { getOrUpdateAllowance } = require('../auditEngine');
+const auditEngine = require('../auditEngine');
 const { loadConfig } = require('../config');
 
 const router = express.Router();
 
 function getConfig() {
   return loadConfig(process.env);
+}
+
+/**
+ * Validates an optional identifier parameter (must be undefined/null or a non-empty string).
+ *
+ * @param {*} value - Candidate identifier.
+ * @returns {boolean} True if omitted/null or valid non-empty string.
+ */
+function isOptionalNonEmptyString(value) {
+  if (value === undefined || value === null) return true;
+  return typeof value === 'string' && value.trim().length > 0;
+}
+
+/**
+ * Resolves a canonical user_id from explicit user_id/discord_id or hardware browser_id.
+ *
+ * @param {object} body - Request JSON body.
+ * @returns {Promise<{ok: boolean, status?: number, error?: string, userId?: string}>}
+ */
+async function resolveTargetUserId(body) {
+  if (!body || typeof body !== 'object' || Array.isArray(body)) {
+    return { ok: false, status: 400, error: 'Request body must be a JSON object.' };
+  }
+
+  const rawUser = (body.user_id !== undefined && body.user_id !== null) ? body.user_id : body.discord_id;
+  if (rawUser !== undefined && rawUser !== null) {
+    if (typeof rawUser !== 'string' || rawUser.trim().length === 0) {
+      return { ok: false, status: 400, error: 'user_id / discord_id must be a non-empty string.' };
+    }
+    const trimmed = rawUser.trim();
+    if (trimmed.toLowerCase() === 'admin') {
+      return { ok: false, status: 400, error: 'Cannot adjust synthetic admin principal.' };
+    }
+    return { ok: true, userId: trimmed };
+  }
+
+  if (body.browser_id !== undefined && body.browser_id !== null) {
+    if (typeof body.browser_id !== 'string' || body.browser_id.trim().length === 0) {
+      return { ok: false, status: 400, error: 'browser_id must be a non-empty string.' };
+    }
+    const dev = await get('SELECT user_id, discord_id FROM devices WHERE browser_id = ?', [body.browser_id.trim()]);
+    if (!dev) {
+      return { ok: false, status: 404, error: 'Target device not found.' };
+    }
+    return { ok: true, userId: dev.user_id || dev.discord_id || body.browser_id.trim() };
+  }
+
+  return { ok: false, status: 400, error: 'Missing target identifier (user_id, discord_id, or browser_id).' };
 }
 
 // Strict Middleware for Administrative Endpoints
@@ -43,18 +93,54 @@ router.get('/devices', async (req, res) => {
     for (const u of users) {
       const isLinked = !u.user_id.startsWith('b_');
       let meteredAllowance = null;
-      const tierConfig = config.TIER_CONFIGS[u.priority_tier];
+      const tierConfig = config.TIER_CONFIGS[u.priority_tier] || config.TIER_CONFIGS['Normal'];
       if (tierConfig && tierConfig.maxAllowance !== Infinity) {
-        meteredAllowance = await getOrUpdateAllowance(u.user_id, u.priority_tier, false);
+        meteredAllowance = await auditEngine.getOrUpdateAllowance(u.user_id, u.priority_tier, false);
       }
 
+      const heldAnlas = queueManager.getHeldAnlasForUser(u.user_id);
+      const balanceInfo = await auditEngine.calculateAvailableBalance(u.user_id, heldAnlas);
+      const isAnlasUnlimited = tierConfig.monthlyAnlas === Infinity || u.user_id === 'admin';
+
+      const heldPersonalNcp = queueManager.getHeldNcpForUser(u.user_id, 'personal');
+      const heldSurplusNcp = queueManager.getHeldNcpForUser(u.user_id, 'surplus');
+      const v5Banked = Math.max(0, Math.trunc(u.v5_banked_balance || 0));
+      const v5Available = Math.max(0, v5Banked - heldPersonalNcp);
+
+      const virtualAnlasBalance = isAnlasUnlimited
+        ? null
+        : (balanceInfo ? balanceInfo.virtual_balance : Math.trunc(u.virtual_anlas_balance || 0));
+      const availableAnlasBalance = isAnlasUnlimited
+        ? null
+        : (balanceInfo ? balanceInfo.available_balance : ((virtualAnlasBalance || 0) - heldAnlas));
+      const isInDebt = isAnlasUnlimited
+        ? false
+        : (balanceInfo ? balanceInfo.is_in_debt : ((virtualAnlasBalance || 0) < 0));
+
       groups[u.user_id] = {
+        user_id: u.user_id,
         discord_id: isLinked ? u.user_id : null,
         discord_username: u.discord_username || (isLinked ? `User (${u.user_id.substring(0, 6)})` : "Unlinked Device"),
         priority_tier: u.priority_tier,
         approved: 0,
         banned: u.banned,
         anlas_consumed: u.anlas_consumed,
+        virtual_anlas_balance: virtualAnlasBalance,
+        available_anlas_balance: availableAnlasBalance,
+        held_anlas: heldAnlas,
+        anlas_unlimited: isAnlasUnlimited,
+        is_in_debt: isInDebt,
+        last_anlas_reset_epoch: u.last_anlas_reset_epoch ?? null,
+        v5_banked_balance: v5Banked,
+        v5_available_balance: v5Available,
+        v5_held_ncp: heldPersonalNcp + heldSurplusNcp,
+        v5_held_personal_ncp: heldPersonalNcp,
+        v5_held_surplus_ncp: heldSurplusNcp,
+        v5_daily_consumed: u.v5_daily_consumed || 0,
+        v5_last_accrual_epoch: u.v5_last_accrual_epoch ?? null,
+        subscription_period_anlas: u.subscription_period_anlas || 0,
+        subscription_period_v5: u.subscription_period_v5 || 0,
+        subscription_period_start_epoch: u.subscription_period_start_epoch ?? null,
         total_requests: 0,
         last_active_at: 0,
         is_online: false,
@@ -78,6 +164,8 @@ router.get('/devices', async (req, res) => {
         approved: d.approved,
         banned: groups[d.user_id].banned,
         anlas_consumed: groups[d.user_id].anlas_consumed,
+        virtual_anlas_balance: groups[d.user_id].virtual_anlas_balance,
+        v5_banked_balance: groups[d.user_id].v5_banked_balance,
         total_requests: d.total_requests || 0,
         last_active_at: lastActive,
         is_online: isOnline,
@@ -105,10 +193,15 @@ router.get('/devices', async (req, res) => {
 
 router.get('/user-devices', async (req, res) => {
   const { discord_id } = req.query;
-  if (!discord_id) return res.status(400).json({ error: "Missing discord_id parameter" });
+  if (typeof discord_id !== 'string' || discord_id.trim().length === 0) {
+    return res.status(400).json({ error: "Missing discord_id parameter" });
+  }
   try {
     const devices = await all(
-      `SELECT d.browser_id, d.label, d.approved, u.banned, u.priority_tier, u.anlas_consumed, d.total_requests, d.last_active_at 
+      `SELECT d.browser_id, d.label, d.approved, u.banned, u.priority_tier, u.anlas_consumed,
+              u.virtual_anlas_balance, u.v5_banked_balance, u.v5_daily_consumed,
+              u.subscription_period_anlas, u.subscription_period_v5,
+              d.total_requests, d.last_active_at 
        FROM devices d 
        JOIN users u ON d.user_id = u.user_id 
        WHERE d.user_id = ?`, 
@@ -130,8 +223,11 @@ router.get('/unnotified-bans', async (req, res) => {
 });
 
 router.post('/mark-ban-notified', async (req, res) => {
-  const { discord_id } = req.body;
-  if (!discord_id) return res.status(400).json({ error: "Missing discord_id parameter" });
+  const body = (req.body && typeof req.body === 'object' && !Array.isArray(req.body)) ? req.body : {};
+  const { discord_id } = body;
+  if (typeof discord_id !== 'string' || discord_id.trim().length === 0) {
+    return res.status(400).json({ error: "Missing discord_id parameter" });
+  }
   try {
     await run('UPDATE users SET ban_notified = 1 WHERE user_id = ?', [discord_id]);
     res.json({ success: true });
@@ -141,8 +237,19 @@ router.post('/mark-ban-notified', async (req, res) => {
 });
 
 router.post('/approve', async (req, res) => {
-  const { browser_id, discord_id, priority_tier } = req.body;
-  const targetTier = priority_tier || 'Normal';
+  const config = getConfig();
+  const body = (req.body && typeof req.body === 'object' && !Array.isArray(req.body)) ? req.body : {};
+  const { browser_id, discord_id, priority_tier } = body;
+  if (!isOptionalNonEmptyString(discord_id) || !isOptionalNonEmptyString(browser_id)) {
+    return res.status(400).json({ error: 'Invalid discord_id or browser_id parameter.' });
+  }
+  const targetTier = (priority_tier === undefined || priority_tier === null || priority_tier === '')
+    ? 'Normal'
+    : priority_tier;
+  if (typeof targetTier !== 'string' || !Object.prototype.hasOwnProperty.call(config.TIER_CONFIGS, targetTier)) {
+    return res.status(400).json({ error: `Invalid priority_tier "${String(targetTier)}".` });
+  }
+
   try {
     if (discord_id) {
       await run('UPDATE users SET priority_tier = ? WHERE user_id = ?', [targetTier, discord_id]);
@@ -161,7 +268,11 @@ router.post('/approve', async (req, res) => {
 });
 
 router.post('/revoke', async (req, res) => {
-  const { browser_id, discord_id } = req.body;
+  const body = (req.body && typeof req.body === 'object' && !Array.isArray(req.body)) ? req.body : {};
+  const { browser_id, discord_id } = body;
+  if (!isOptionalNonEmptyString(discord_id) || !isOptionalNonEmptyString(browser_id)) {
+    return res.status(400).json({ error: 'Invalid discord_id or browser_id parameter.' });
+  }
   try {
     if (discord_id) {
       await run('UPDATE devices SET approved = 0 WHERE user_id = ?', [discord_id]);
@@ -175,7 +286,14 @@ router.post('/revoke', async (req, res) => {
 });
 
 router.post('/ban', async (req, res) => {
-  const { discord_id, browser_id, reason } = req.body;
+  const body = (req.body && typeof req.body === 'object' && !Array.isArray(req.body)) ? req.body : {};
+  const { discord_id, browser_id, reason } = body;
+  if (!isOptionalNonEmptyString(discord_id) || !isOptionalNonEmptyString(browser_id)) {
+    return res.status(400).json({ error: 'Invalid discord_id or browser_id parameter.' });
+  }
+  if (reason !== undefined && reason !== null && typeof reason !== 'string') {
+    return res.status(400).json({ error: 'reason must be a string when provided.' });
+  }
   try {
     const banReason = reason || "Banned via Admin Console";
     let targetUserId = discord_id;
@@ -187,8 +305,13 @@ router.post('/ban', async (req, res) => {
 
     if (targetUserId) {
       await run('UPDATE users SET banned = 1, ban_reason = ?, ban_notified = 0 WHERE user_id = ?', [banReason, targetUserId]);
+      await run('UPDATE devices SET banned = 1 WHERE user_id = ? OR discord_id = ? OR browser_id = ?', [targetUserId, targetUserId, browser_id || null]);
       console.log(`[GuildWeave Admin] Banned Canonical User: "${targetUserId}"`);
-      queueManager.evict({ user_id: targetUserId });
+      queueManager.evict({
+        user_id: targetUserId,
+        discord_id: discord_id || null,
+        browser_id: browser_id || null
+      });
     }
     res.json({ success: true });
   } catch (err) {
@@ -197,16 +320,31 @@ router.post('/ban', async (req, res) => {
 });
 
 router.post('/unban', async (req, res) => {
-  const { discord_id, browser_id } = req.body;
+  const body = (req.body && typeof req.body === 'object' && !Array.isArray(req.body)) ? req.body : {};
+  const { discord_id, browser_id } = body;
+  if (!isOptionalNonEmptyString(discord_id) || !isOptionalNonEmptyString(browser_id)) {
+    return res.status(400).json({ error: 'Invalid discord_id or browser_id parameter.' });
+  }
   try {
     let targetUserId = discord_id;
+    let linkedDiscordId = discord_id || null;
     if (!targetUserId && browser_id) {
-      const dev = await get('SELECT user_id FROM devices WHERE browser_id = ?', [browser_id]);
-      if (dev) targetUserId = dev.user_id;
+      const dev = await get('SELECT user_id, discord_id FROM devices WHERE browser_id = ?', [browser_id]);
+      if (dev) {
+        targetUserId = dev.user_id;
+        linkedDiscordId = dev.discord_id || (dev.user_id && !dev.user_id.startsWith('b_') ? dev.user_id : null);
+      }
     }
 
     if (targetUserId) {
       await run('UPDATE users SET banned = 0, ban_reason = NULL, ban_notified = 0 WHERE user_id = ?', [targetUserId]);
+      await run('UPDATE devices SET banned = 0 WHERE user_id = ? OR discord_id = ? OR browser_id = ?', [targetUserId, targetUserId, browser_id || null]);
+      if (linkedDiscordId) {
+        await run('DELETE FROM banned_discords WHERE discord_id = ?', [linkedDiscordId]);
+      }
+      if (!targetUserId.startsWith('b_')) {
+        await run('DELETE FROM banned_discords WHERE discord_id = ?', [targetUserId]);
+      }
       console.log(`[GuildWeave Admin] Unbanned Canonical User: "${targetUserId}"`);
     }
     res.json({ success: true });
@@ -215,8 +353,184 @@ router.post('/unban', async (req, res) => {
   }
 });
 
+/**
+ * Manual Balance Adjustment Endpoint.
+ * Atomically modifies canonical `virtual_anlas_balance` and/or `v5_banked_balance` via Level 2
+ * `withUserLock` serialization while preserving all active Channel A/B reservation holds.
+ */
+router.post('/adjust-balance', async (req, res) => {
+  const body = (req.body && typeof req.body === 'object' && !Array.isArray(req.body)) ? req.body : null;
+  const target = await resolveTargetUserId(body);
+  if (!target.ok) {
+    return res.status(target.status).json({ error: target.error });
+  }
+
+  const {
+    anlas_delta,
+    virtual_anlas_balance,
+    v5_ncp_delta,
+    v5_banked_balance,
+    reason
+  } = body;
+
+  const hasAnlasDelta = anlas_delta !== undefined;
+  const hasAnlasSet = virtual_anlas_balance !== undefined;
+  const hasV5Delta = v5_ncp_delta !== undefined;
+  const hasV5Set = v5_banked_balance !== undefined;
+
+  if (hasAnlasDelta && hasAnlasSet) {
+    return res.status(400).json({ error: 'Cannot specify both anlas_delta and virtual_anlas_balance.' });
+  }
+  if (hasV5Delta && hasV5Set) {
+    return res.status(400).json({ error: 'Cannot specify both v5_ncp_delta and v5_banked_balance.' });
+  }
+  if (!hasAnlasDelta && !hasAnlasSet && !hasV5Delta && !hasV5Set) {
+    return res.status(400).json({ error: 'At least one adjustment (anlas_delta, virtual_anlas_balance, v5_ncp_delta, or v5_banked_balance) is required.' });
+  }
+
+  const isSafeInt = (v) => typeof v === 'number' && Number.isInteger(v) && Number.isSafeInteger(v);
+  if (hasAnlasDelta && !isSafeInt(anlas_delta)) {
+    return res.status(400).json({ error: 'anlas_delta must be a safe integer.' });
+  }
+  if (hasAnlasSet && !isSafeInt(virtual_anlas_balance)) {
+    return res.status(400).json({ error: 'virtual_anlas_balance must be a safe integer.' });
+  }
+  if (hasV5Delta && !isSafeInt(v5_ncp_delta)) {
+    return res.status(400).json({ error: 'v5_ncp_delta must be a safe integer.' });
+  }
+  if (hasV5Set && (!isSafeInt(v5_banked_balance) || v5_banked_balance < 0)) {
+    return res.status(400).json({ error: 'v5_banked_balance must be a non-negative safe integer.' });
+  }
+  if (reason !== undefined && reason !== null && typeof reason !== 'string') {
+    return res.status(400).json({ error: 'reason must be a string when provided.' });
+  }
+
+  try {
+    const adjustment = await auditEngine.adjustUserBalances(target.userId, {
+      ...(hasAnlasDelta ? { anlasDelta: anlas_delta } : {}),
+      ...(hasAnlasSet ? { virtualAnlasBalance: virtual_anlas_balance } : {}),
+      ...(hasV5Delta ? { v5NcpDelta: v5_ncp_delta } : {}),
+      ...(hasV5Set ? { v5BankedBalance: v5_banked_balance } : {})
+    });
+
+    if (!adjustment) {
+      return res.status(404).json({ error: 'Canonical user record not found.' });
+    }
+
+    const config = getConfig();
+    const tierConfig = config.TIER_CONFIGS[adjustment.priority_tier] || config.TIER_CONFIGS['Normal'];
+    const isAnlasUnlimited = tierConfig.monthlyAnlas === Infinity;
+
+    const heldAnlas = queueManager.getHeldAnlasForUser(target.userId);
+    const balanceInfo = await auditEngine.calculateAvailableBalance(target.userId, heldAnlas);
+    const heldPersonalNcp = queueManager.getHeldNcpForUser(target.userId, 'personal');
+    const v5Available = Math.max(0, adjustment.v5_banked_balance - heldPersonalNcp);
+
+    console.log(
+      `[GuildWeave Admin] Adjusted balances for "${target.userId}"` +
+      ` (Anlas: ${adjustment.previous_anlas_balance} -> ${adjustment.virtual_anlas_balance},` +
+      ` V5 NCP: ${adjustment.previous_v5_balance} -> ${adjustment.v5_banked_balance})` +
+      (reason ? ` | Reason: ${reason}` : '')
+    );
+
+    res.json({
+      success: true,
+      user_id: target.userId,
+      previous_anlas_balance: isAnlasUnlimited ? null : adjustment.previous_anlas_balance,
+      virtual_anlas_balance: isAnlasUnlimited ? null : (balanceInfo ? balanceInfo.virtual_balance : adjustment.virtual_anlas_balance),
+      available_anlas_balance: isAnlasUnlimited ? null : (balanceInfo ? balanceInfo.available_balance : (adjustment.virtual_anlas_balance - heldAnlas)),
+      held_anlas: heldAnlas,
+      anlas_unlimited: isAnlasUnlimited,
+      is_in_debt: isAnlasUnlimited ? false : (balanceInfo ? balanceInfo.is_in_debt : adjustment.is_in_debt),
+      previous_v5_balance: adjustment.previous_v5_balance,
+      v5_banked_balance: adjustment.v5_banked_balance,
+      v5_available_balance: v5Available,
+      v5_held_personal_ncp: heldPersonalNcp
+    });
+  } catch (err) {
+    if (err && typeof err.message === 'string' && err.message.startsWith('[Audit Error]')) {
+      return res.status(400).json({ error: err.message });
+    }
+    res.status(500).json({ error: err.message });
+  }
+});
+
+/**
+ * Debt Reconciliation Endpoint.
+ * Forgives negative Anlas overdraft debt to 0 (default) or credits a positive payment
+ * toward the negative balance while never altering positive non-debt balances.
+ */
+router.post('/reconcile-debt', async (req, res) => {
+  const body = (req.body && typeof req.body === 'object' && !Array.isArray(req.body)) ? req.body : null;
+  const target = await resolveTargetUserId(body);
+  if (!target.ok) {
+    return res.status(target.status).json({ error: target.error });
+  }
+
+  const { credit_amount = null, cap_at_zero = false, reason } = body;
+
+  if (credit_amount !== null && credit_amount !== undefined) {
+    if (typeof credit_amount !== 'number' || !Number.isInteger(credit_amount) || credit_amount <= 0 || !Number.isSafeInteger(credit_amount)) {
+      return res.status(400).json({ error: 'credit_amount must be a positive safe integer or null.' });
+    }
+  }
+  if (typeof cap_at_zero !== 'boolean') {
+    return res.status(400).json({ error: 'cap_at_zero must be a boolean.' });
+  }
+  if (reason !== undefined && reason !== null && typeof reason !== 'string') {
+    return res.status(400).json({ error: 'reason must be a string when provided.' });
+  }
+
+  try {
+    const result = await auditEngine.reconcileUserDebt(target.userId, {
+      creditAmount: credit_amount ?? null,
+      capAtZero: cap_at_zero
+    });
+
+    if (!result) {
+      return res.status(404).json({ error: 'Canonical user record not found.' });
+    }
+
+    const config = getConfig();
+    const tierConfig = config.TIER_CONFIGS[result.priority_tier] || config.TIER_CONFIGS['Normal'];
+    const isAnlasUnlimited = tierConfig.monthlyAnlas === Infinity;
+
+    const heldAnlas = queueManager.getHeldAnlasForUser(target.userId);
+    const balanceInfo = await auditEngine.calculateAvailableBalance(target.userId, heldAnlas);
+
+    if (result.reconciled) {
+      console.log(
+        `[GuildWeave Admin] Reconciled debt for "${target.userId}": ${result.previous_balance} -> ${result.virtual_balance}` +
+        (reason ? ` | Reason: ${reason}` : '')
+      );
+    }
+
+    res.json({
+      success: true,
+      user_id: target.userId,
+      reconciled: result.reconciled,
+      was_in_debt: result.was_in_debt,
+      previous_balance: isAnlasUnlimited ? null : result.previous_balance,
+      virtual_anlas_balance: isAnlasUnlimited ? null : (balanceInfo ? balanceInfo.virtual_balance : result.virtual_balance),
+      available_anlas_balance: isAnlasUnlimited ? null : (balanceInfo ? balanceInfo.available_balance : (result.virtual_balance - heldAnlas)),
+      held_anlas: heldAnlas,
+      anlas_unlimited: isAnlasUnlimited,
+      is_in_debt: isAnlasUnlimited ? false : (balanceInfo ? balanceInfo.is_in_debt : result.is_in_debt)
+    });
+  } catch (err) {
+    if (err && typeof err.message === 'string' && err.message.startsWith('[Audit Error]')) {
+      return res.status(400).json({ error: err.message });
+    }
+    res.status(500).json({ error: err.message });
+  }
+});
+
 router.post('/prune-device', async (req, res) => {
-  const { browser_id } = req.body;
+  const body = (req.body && typeof req.body === 'object' && !Array.isArray(req.body)) ? req.body : {};
+  const { browser_id } = body;
+  if (typeof browser_id !== 'string' || browser_id.trim().length === 0) {
+    return res.status(400).json({ error: 'Missing or invalid browser_id parameter.' });
+  }
   try {
     await run('DELETE FROM devices WHERE browser_id = ?', [browser_id]);
     console.log(`[GuildWeave Admin] Pruned individual browser registration: "${browser_id}"`);
@@ -225,8 +539,13 @@ router.post('/prune-device', async (req, res) => {
 });
 
 router.post('/update-token', async (req, res) => {
+  const body = (req.body && typeof req.body === 'object' && !Array.isArray(req.body)) ? req.body : null;
+  const masterToken = body ? body.master_token : undefined;
+  if (typeof masterToken !== 'string' || masterToken.trim().length === 0) {
+    return res.status(400).json({ error: 'Missing or invalid master_token string.' });
+  }
   try {
-    await run('INSERT OR REPLACE INTO config (key, value) VALUES (?, ?)', ['master_token', req.body.master_token]);
+    await run('INSERT OR REPLACE INTO config (key, value) VALUES (?, ?)', ['master_token', masterToken]);
     console.log('[GuildWeave Admin] Pushed fresh master Opus session token to configuration schema.');
     res.json({ success: true });
   } catch (err) { res.status(500).json({ error: err.message }); }
@@ -234,8 +553,17 @@ router.post('/update-token', async (req, res) => {
 
 router.post('/link', async (req, res) => {
   const config = getConfig();
-  const { browser_id, discord_id, discord_username, priority_tier } = req.body;
-  if (!browser_id || !discord_id || !priority_tier) return res.status(400).json({ error: "Missing required linking parameters." });
+  const body = (req.body && typeof req.body === 'object' && !Array.isArray(req.body)) ? req.body : {};
+  const { browser_id, discord_id, discord_username, priority_tier } = body;
+  if (typeof browser_id !== 'string' || !browser_id.trim() || typeof discord_id !== 'string' || !discord_id.trim() || !priority_tier) {
+    return res.status(400).json({ error: "Missing required linking parameters." });
+  }
+  if (typeof priority_tier !== 'string' || !Object.prototype.hasOwnProperty.call(config.TIER_CONFIGS, priority_tier)) {
+    return res.status(400).json({ error: `Invalid priority_tier "${String(priority_tier)}".` });
+  }
+  if (discord_username !== undefined && discord_username !== null && typeof discord_username !== 'string') {
+    return res.status(400).json({ error: 'Invalid discord_username parameter.' });
+  }
 
   try {
     // 1. Assert user ban state
@@ -270,7 +598,7 @@ router.post('/link', async (req, res) => {
     await run('UPDATE devices SET user_id = ?, approved = 1 WHERE browser_id = ?', [discord_id, browser_id]);
     
     // Clean up abandoned unlinked user record if it exists
-    if (device.user_id !== discord_id && device.user_id.startsWith('b_')) {
+    if (device.user_id && device.user_id !== discord_id && device.user_id.startsWith('b_')) {
       await run('DELETE FROM users WHERE user_id = ?', [device.user_id]);
     }
 
@@ -280,9 +608,19 @@ router.post('/link', async (req, res) => {
 });
 
 router.post('/sync-usernames', async (req, res) => {
-  const { mappings } = req.body;
+  const body = (req.body && typeof req.body === 'object' && !Array.isArray(req.body)) ? req.body : {};
+  const { mappings } = body;
   if (!mappings || !Array.isArray(mappings)) {
     return res.status(400).json({ error: "Missing or invalid mappings payload array." });
+  }
+  for (const m of mappings) {
+    if (
+      !m || typeof m !== 'object' || Array.isArray(m) ||
+      typeof m.discord_id !== 'string' || m.discord_id.trim().length === 0 ||
+      typeof m.discord_username !== 'string'
+    ) {
+      return res.status(400).json({ error: "Each mapping entry must contain string discord_id and discord_username." });
+    }
   }
 
   try {
@@ -298,8 +636,15 @@ router.post('/sync-usernames', async (req, res) => {
 });
 
 router.post('/sync-tier', async (req, res) => {
-  const { discord_id, priority_tier } = req.body;
-  if (!discord_id || !priority_tier) return res.status(400).json({ error: "Missing sync parameters." });
+  const config = getConfig();
+  const body = (req.body && typeof req.body === 'object' && !Array.isArray(req.body)) ? req.body : {};
+  const { discord_id, priority_tier } = body;
+  if (typeof discord_id !== 'string' || !discord_id.trim() || !priority_tier) {
+    return res.status(400).json({ error: "Missing sync parameters." });
+  }
+  if (typeof priority_tier !== 'string' || !Object.prototype.hasOwnProperty.call(config.TIER_CONFIGS, priority_tier)) {
+    return res.status(400).json({ error: `Invalid priority_tier "${String(priority_tier)}".` });
+  }
 
   try {
     const user = await get('SELECT banned FROM users WHERE user_id = ?', [discord_id]);
@@ -312,8 +657,11 @@ router.post('/sync-tier', async (req, res) => {
 });
 
 router.post('/revoke-discord', async (req, res) => {
-  const { discord_id } = req.body;
-  if (!discord_id) return res.status(400).json({ error: "Missing discord_id parameter." });
+  const body = (req.body && typeof req.body === 'object' && !Array.isArray(req.body)) ? req.body : {};
+  const { discord_id } = body;
+  if (typeof discord_id !== 'string' || discord_id.trim().length === 0) {
+    return res.status(400).json({ error: "Missing discord_id parameter." });
+  }
 
   try {
     await run('UPDATE devices SET approved = 0 WHERE user_id = ?', [discord_id]);
@@ -323,6 +671,7 @@ router.post('/revoke-discord', async (req, res) => {
 });
 
 router.get('/global-stats', async (req, res) => {
+  const config = getConfig();
   try {
     const devicesCount = await get('SELECT COUNT(*) as count FROM devices');
     const linkedUsersCount = await get("SELECT COUNT(*) as count FROM users WHERE user_id NOT LIKE 'b_%'");
@@ -335,6 +684,39 @@ router.get('/global-stats', async (req, res) => {
     const bannedCount = await get('SELECT COUNT(*) as count FROM users WHERE banned = 1');
     const bannedList = await all('SELECT user_id as discord_id, ban_reason as reason FROM users WHERE banned = 1');
 
+    const ledgerAggregates = await get(
+      `SELECT
+         SUM(subscription_period_anlas) as period_anlas,
+         SUM(subscription_period_v5) as period_v5,
+         SUM(CASE WHEN virtual_anlas_balance > 0 THEN virtual_anlas_balance ELSE 0 END) as positive_virtual_anlas,
+         SUM(CASE WHEN virtual_anlas_balance < 0 THEN virtual_anlas_balance ELSE 0 END) as total_anlas_debt,
+         SUM(v5_banked_balance) as total_v5_banked,
+         SUM(CASE WHEN virtual_anlas_balance < 0 THEN 1 ELSE 0 END) as in_debt_count
+       FROM users`
+    );
+
+    const surplusState = queueManager.getSurplusPool();
+    const surplusHeld = queueManager.getHeldSurplusNcp();
+    const surplusAvailable = queueManager.getAvailableSurplusNcp();
+
+    const telemetrySnap = (req.telemetry && typeof req.telemetry.getProjectionSnapshot === 'function')
+      ? req.telemetry.getProjectionSnapshot(Date.now())
+      : {
+        percent: req.telemetry?.percent ?? 100,
+        rawProjected: req.telemetry?.rawPercent ?? (req.telemetry?.percent ?? 100),
+        isNegative: req.telemetry?.isNegative ?? false,
+        lastFetched: req.telemetry?.lastFetched ?? 0,
+        isHardLocked: req.telemetry?.isHardLocked ?? false,
+        nominalDailyCompute: req.telemetry?.nominalDailyCompute ?? config.NOMINAL_DAILY_V5_COMPUTE,
+        timeUntilNextPercent: req.telemetry?.timeUntilNextPercent ?? null,
+        activePeriodSeconds: req.telemetry?.activePeriodSeconds ?? ((86400 * 17.28) / config.NOMINAL_DAILY_V5_COMPUTE),
+        subscriptionActive: req.telemetry?.subscriptionActive ?? true,
+        isGracePeriod: req.telemetry?.isGracePeriod ?? false,
+        masterExpiresAt: req.telemetry?.masterExpiresAt ?? null,
+        activeCycleEpoch: req.telemetry?.activeCycleEpoch ?? null,
+        masterAnlas: req.telemetry?.masterAnlas ?? null
+      };
+
     res.json({
       total_devices: devicesCount.count,
       linked_users: linkedUsersCount.count,
@@ -343,7 +725,32 @@ router.get('/global-stats', async (req, res) => {
       top_anlas_consumers: topAnlas,
       top_request_makers: topRequests,
       banned_count: bannedCount.count,
-      banned_list: bannedList
+      banned_list: bannedList,
+      total_subscription_period_anlas: ledgerAggregates?.period_anlas || 0,
+      total_subscription_period_v5: ledgerAggregates?.period_v5 || 0,
+      total_virtual_anlas_balance: ledgerAggregates?.positive_virtual_anlas || 0,
+      total_anlas_debt: ledgerAggregates?.total_anlas_debt || 0,
+      total_v5_banked_balance: ledgerAggregates?.total_v5_banked || 0,
+      in_debt_users_count: ledgerAggregates?.in_debt_count || 0,
+      v5_surplus_pool: surplusState.pool,
+      v5_surplus_held: surplusHeld,
+      v5_surplus_available: surplusAvailable,
+      v5_surplus_last_accrual: surplusState.lastAccrual,
+      telemetry: {
+        master_v5_percent: telemetrySnap.percent,
+        master_v5_raw_percent: telemetrySnap.rawProjected,
+        master_v5_is_negative: telemetrySnap.isNegative,
+        is_hard_locked: telemetrySnap.isHardLocked,
+        time_until_next_percent: telemetrySnap.timeUntilNextPercent,
+        active_period_seconds: telemetrySnap.activePeriodSeconds,
+        nominal_daily_compute: telemetrySnap.nominalDailyCompute,
+        last_fetched_at: telemetrySnap.lastFetched,
+        subscription_active: telemetrySnap.subscriptionActive,
+        is_grace_period: telemetrySnap.isGracePeriod,
+        master_expires_at: telemetrySnap.masterExpiresAt,
+        active_cycle_epoch: telemetrySnap.activeCycleEpoch,
+        master_anlas: telemetrySnap.masterAnlas
+      }
     });
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -355,8 +762,9 @@ router.get('/global-stats', async (req, res) => {
  * Enables the administrator to arm or disarm an ephemeral capture window (default: 10 minutes).
  */
 router.post('/debug-target', (req, res) => {
-  const { browser_id, enable, ttl_ms } = req.body;
-  if (!browser_id || typeof browser_id !== 'string') {
+  const body = (req.body && typeof req.body === 'object' && !Array.isArray(req.body)) ? req.body : {};
+  const { browser_id, enable, ttl_ms } = body;
+  if (!browser_id || typeof browser_id !== 'string' || browser_id.trim().length === 0) {
     return res.status(400).json({ error: "Missing or invalid 'browser_id' string parameter." });
   }
 

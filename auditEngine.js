@@ -5,7 +5,8 @@
  * - Imports Level 0 (database.js) and Level 1 (config.js).
  * - Blind to HTTP transport (Express), socket streams, and queue RAM states.
  * - Handles parameter parsing, security auditing, Anlas tracking, authoritative principal authentication,
- *   synchronous security ban commits, and ACS-1 dual-ledger balance derivation, debt lockouts, and temporal accruals.
+ *   synchronous security ban commits, and ACS-1 dual-ledger balance derivation, debt lockouts,
+ *   temporal accruals, and serialized administrative balance/debt mutations.
  * - Relational Normalization: Evaluates quotas, allowances, Anlas deductions, and bans strictly
  *   against the canonical user_id (Security Principal), eliminating multi-device quota inflation.
  * - ACS-1 Domain Engine: Authoritative NovelAI Anlas formula, bounded zero-copy binary multipart parser,
@@ -46,7 +47,7 @@ const PART_CONTENT_TYPE_IMAGE_REGEX = /content-type\s*:\s*image\//i;
 // Whitelist of user prompt keys that must never be subjected to Base64 truncation heuristics
 const TELEMETRY_PROMPT_KEYS = Object.freeze(new Set(['prompt', 'input', 'uc', 'negative_prompt', 'negativeprompt']));
 
-// Per-principal async serialization registry to eliminate TOCTOU accrual/reset races
+// Per-principal async serialization registry to eliminate TOCTOU accrual/reset/adjustment races
 const userMutationLocks = new Map();
 
 /**
@@ -104,6 +105,7 @@ function assertNonEmptyString(value, fieldName) {
 /**
  * Validates that a discrete financial or compute quantity is a non-negative safe integer (fail-closed).
  * Rejects booleans, floats, NaN, Infinity, negative numbers, arrays, objects, and strings.
+ * Normalizes IEEE-754 -0 to +0.
  *
  * @param {*} value - Numeric candidate.
  * @param {string} fieldName - Parameter name for diagnostic errors.
@@ -114,7 +116,23 @@ function assertNonNegativeSafeInt(value, fieldName) {
   if (typeof value !== 'number' || !Number.isInteger(value) || value < 0 || value > Number.MAX_SAFE_INTEGER) {
     throw new Error(`[Audit Error] ${fieldName} must be a non-negative safe integer.`);
   }
-  return value;
+  return value === 0 ? 0 : value;
+}
+
+/**
+ * Validates that a signed integer delta or balance is a safe integer (fail-closed).
+ * Normalizes IEEE-754 -0 to +0.
+ *
+ * @param {*} value - Numeric candidate.
+ * @param {string} fieldName - Parameter name for diagnostic errors.
+ * @returns {number} Validated safe integer.
+ * @throws {Error} If value is not a safe integer.
+ */
+function assertSignedSafeInt(value, fieldName) {
+  if (typeof value !== 'number' || !Number.isInteger(value) || !Number.isSafeInteger(value)) {
+    throw new Error(`[Audit Error] ${fieldName} must be a safe integer.`);
+  }
+  return value === 0 ? 0 : value;
 }
 
 /**
@@ -1224,6 +1242,216 @@ async function recordSurplusV5Usage(userId) {
 }
 
 /**
+ * Atomically adjusts a canonical principal's `virtual_anlas_balance` and/or `v5_banked_balance`
+ * under the per-user serialization lock (`withUserLock`), preventing TOCTOU lost updates against
+ * concurrent PoNR debits and lazy accruals. Rejects virtual Anlas adjustments on unlimited-quota
+ * (`monthlyAnlas === Infinity`) tiers so hidden SQLite debt cannot accumulate behind masked UI views.
+ * SQLite `trg_sync_users_update_balances` mirrors updated balances across all linked hardware devices automatically.
+ *
+ * @param {string} userId - Canonical Security Principal identifier.
+ * @param {object} [options={}] - Adjustment parameters.
+ * @param {number} [options.anlasDelta] - Signed safe integer delta for virtual_anlas_balance.
+ * @param {number} [options.virtualAnlasBalance] - Explicit signed safe integer balance override.
+ * @param {number} [options.v5NcpDelta] - Signed safe integer delta for v5_banked_balance (clamped >= 0).
+ * @param {number} [options.v5BankedBalance] - Explicit non-negative safe integer V5 balance override.
+ * @returns {Promise<{user_id: string, priority_tier: string, previous_anlas_balance: number, virtual_anlas_balance: number, previous_v5_balance: number, v5_banked_balance: number, is_in_debt: boolean}|null>}
+ * @throws {Error} If identifiers, tier eligibility, or numeric parameters violate fail-closed bounds.
+ */
+async function adjustUserBalances(userId, options = {}) {
+  assertNonEmptyString(userId, 'userId');
+  if (userId.trim().toLowerCase() === 'admin') {
+    throw new Error('[Audit Error] Cannot adjust synthetic admin principal balances.');
+  }
+  if (options === null || typeof options !== 'object' || Array.isArray(options)) {
+    throw new Error('[Audit Error] options must be a plain object.');
+  }
+
+  const {
+    anlasDelta,
+    virtualAnlasBalance,
+    v5NcpDelta,
+    v5BankedBalance
+  } = options;
+
+  const hasAnlasDelta = anlasDelta !== undefined;
+  const hasAnlasSet = virtualAnlasBalance !== undefined;
+  const hasV5Delta = v5NcpDelta !== undefined;
+  const hasV5Set = v5BankedBalance !== undefined;
+
+  if (hasAnlasDelta && hasAnlasSet) {
+    throw new Error('[Audit Error] Cannot specify both anlasDelta and virtualAnlasBalance.');
+  }
+  if (hasV5Delta && hasV5Set) {
+    throw new Error('[Audit Error] Cannot specify both v5NcpDelta and v5BankedBalance.');
+  }
+  if (!hasAnlasDelta && !hasAnlasSet && !hasV5Delta && !hasV5Set) {
+    throw new Error('[Audit Error] At least one balance adjustment field is required.');
+  }
+
+  const validatedAnlasDelta = hasAnlasDelta ? assertSignedSafeInt(anlasDelta, 'anlasDelta') : null;
+  const validatedAnlasSet = hasAnlasSet ? assertSignedSafeInt(virtualAnlasBalance, 'virtualAnlasBalance') : null;
+  const validatedV5Delta = hasV5Delta ? assertSignedSafeInt(v5NcpDelta, 'v5NcpDelta') : null;
+  const validatedV5Set = hasV5Set ? assertNonNegativeSafeInt(v5BankedBalance, 'v5BankedBalance') : null;
+
+  return withUserLock(userId, async () => {
+    const user = await get(
+      'SELECT user_id, priority_tier, virtual_anlas_balance, v5_banked_balance FROM users WHERE user_id = ?',
+      [userId]
+    );
+    if (!user) return null;
+
+    const config = getConfig();
+    const tierConfig = config.TIER_CONFIGS[user.priority_tier] || config.TIER_CONFIGS['Normal'];
+    if (tierConfig.monthlyAnlas === Infinity && (validatedAnlasDelta !== null || validatedAnlasSet !== null)) {
+      throw new Error(`[Audit Error] Cannot adjust virtual Anlas for unlimited-quota tier "${user.priority_tier}".`);
+    }
+
+    const rawPrevAnlas = Math.trunc(user.virtual_anlas_balance || 0);
+    const prevAnlas = rawPrevAnlas === 0 ? 0 : rawPrevAnlas;
+    const prevV5 = Math.max(0, Math.trunc(user.v5_banked_balance || 0));
+
+    let nextAnlas = prevAnlas;
+    if (validatedAnlasDelta !== null) {
+      nextAnlas = prevAnlas + validatedAnlasDelta;
+      if (!Number.isSafeInteger(nextAnlas)) {
+        throw new Error('[Audit Error] Resulting virtual_anlas_balance exceeds safe integer bounds.');
+      }
+    } else if (validatedAnlasSet !== null) {
+      nextAnlas = validatedAnlasSet;
+    }
+    if (nextAnlas === 0) nextAnlas = 0;
+
+    let nextV5 = prevV5;
+    if (validatedV5Delta !== null) {
+      const candidateV5 = prevV5 + validatedV5Delta;
+      if (!Number.isSafeInteger(candidateV5)) {
+        throw new Error('[Audit Error] Resulting v5_banked_balance exceeds safe integer bounds.');
+      }
+      nextV5 = Math.max(0, candidateV5);
+    } else if (validatedV5Set !== null) {
+      nextV5 = validatedV5Set;
+    }
+    if (nextV5 === 0) nextV5 = 0;
+
+    await run(
+      'UPDATE users SET virtual_anlas_balance = ?, v5_banked_balance = ? WHERE user_id = ?',
+      [nextAnlas, nextV5, user.user_id]
+    );
+
+    return {
+      user_id: user.user_id,
+      priority_tier: user.priority_tier,
+      previous_anlas_balance: prevAnlas,
+      virtual_anlas_balance: nextAnlas,
+      previous_v5_balance: prevV5,
+      v5_banked_balance: nextV5,
+      is_in_debt: nextAnlas < 0
+    };
+  });
+}
+
+/**
+ * Reconciles an outstanding negative virtual Anlas debt for a canonical principal
+ * under `withUserLock`. Supports full forgiveness (`creditAmount === null`, restoring
+ * negative balance to `0`) or partial paydown (`creditAmount > 0`), while strictly
+ * guaranteeing that unlimited-quota tiers and non-indebted accounts (`virtual_anlas_balance >= 0`)
+ * are never modified or wiped.
+ *
+ * @param {string} userId - Canonical Security Principal identifier.
+ * @param {object} [options={}] - Reconciliation options.
+ * @param {number|null} [options.creditAmount=null] - Positive safe integer Anlas to credit toward debt, or null for full forgiveness to 0.
+ * @param {boolean} [options.capAtZero=false] - Whether partial credit payments exceeding debt cap at 0.
+ * @returns {Promise<{user_id: string, priority_tier: string, reconciled: boolean, was_in_debt: boolean, previous_balance: number, virtual_balance: number, is_in_debt: boolean}|null>}
+ * @throws {Error} If parameters fail validation.
+ */
+async function reconcileUserDebt(userId, options = {}) {
+  assertNonEmptyString(userId, 'userId');
+  if (userId.trim().toLowerCase() === 'admin') {
+    throw new Error('[Audit Error] Cannot reconcile synthetic admin principal.');
+  }
+  if (options === null || typeof options !== 'object' || Array.isArray(options)) {
+    throw new Error('[Audit Error] options must be a plain object.');
+  }
+
+  const { creditAmount = null, capAtZero = false } = options;
+
+  let validatedCredit = null;
+  if (creditAmount !== null && creditAmount !== undefined) {
+    validatedCredit = assertNonNegativeSafeInt(creditAmount, 'creditAmount');
+    if (validatedCredit === 0) {
+      throw new Error('[Audit Error] creditAmount must be a positive safe integer or null.');
+    }
+  }
+  if (typeof capAtZero !== 'boolean') {
+    throw new Error('[Audit Error] capAtZero must be a boolean.');
+  }
+
+  return withUserLock(userId, async () => {
+    const user = await get(
+      'SELECT user_id, priority_tier, virtual_anlas_balance FROM users WHERE user_id = ?',
+      [userId]
+    );
+    if (!user) return null;
+
+    const config = getConfig();
+    const tierConfig = config.TIER_CONFIGS[user.priority_tier] || config.TIER_CONFIGS['Normal'];
+    if (tierConfig.monthlyAnlas === Infinity) {
+      return {
+        user_id: user.user_id,
+        priority_tier: user.priority_tier,
+        reconciled: false,
+        was_in_debt: false,
+        previous_balance: 0,
+        virtual_balance: 0,
+        is_in_debt: false
+      };
+    }
+
+    const rawCurrentBalance = Math.trunc(user.virtual_anlas_balance || 0);
+    const currentBalance = rawCurrentBalance === 0 ? 0 : rawCurrentBalance;
+
+    if (currentBalance >= 0) {
+      return {
+        user_id: user.user_id,
+        priority_tier: user.priority_tier,
+        reconciled: false,
+        was_in_debt: false,
+        previous_balance: currentBalance,
+        virtual_balance: currentBalance,
+        is_in_debt: false
+      };
+    }
+
+    let nextBalance;
+    if (validatedCredit !== null) {
+      const summed = currentBalance + validatedCredit;
+      if (!Number.isSafeInteger(summed)) {
+        throw new Error('[Audit Error] Resulting virtual_anlas_balance exceeds safe integer bounds.');
+      }
+      nextBalance = capAtZero ? Math.min(0, summed) : summed;
+    } else {
+      nextBalance = 0;
+    }
+    if (nextBalance === 0) nextBalance = 0;
+
+    await run(
+      'UPDATE users SET virtual_anlas_balance = ? WHERE user_id = ?',
+      [nextBalance, user.user_id]
+    );
+
+    return {
+      user_id: user.user_id,
+      priority_tier: user.priority_tier,
+      reconciled: true,
+      was_in_debt: true,
+      previous_balance: currentBalance,
+      virtual_balance: nextBalance,
+      is_in_debt: nextBalance < 0
+    };
+  });
+}
+
+/**
  * Extracts an RFC 2046 multipart boundary from Content-Type or raw buffer prefix.
  *
  * @param {Buffer} buffer - Raw payload buffer.
@@ -2018,6 +2246,8 @@ module.exports = {
   commitAnlasDebit,
   commitV5Debit,
   recordSurplusV5Usage,
+  adjustUserBalances,
+  reconcileUserDebt,
   extractParametersFromRawBody,
   validateVibeEncodePayload,
   sanitizeObjectForLogging,
