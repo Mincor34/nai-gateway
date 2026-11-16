@@ -5,7 +5,7 @@
  * - Imports Level 0 (database.js) and Level 1 (config.js).
  * - Blind to HTTP transport (Express), socket streams, and queue RAM states.
  * - Handles parameter parsing, security auditing, Anlas tracking, authoritative principal authentication,
- *   and ACS-1 dual-ledger balance derivation, debt lockouts, and temporal accruals.
+ *   synchronous security ban commits, and ACS-1 dual-ledger balance derivation, debt lockouts, and temporal accruals.
  * - Relational Normalization: Evaluates quotas, allowances, Anlas deductions, and bans strictly
  *   against the canonical user_id (Security Principal), eliminating multi-device quota inflation.
  * - ACS-1 Domain Engine: Authoritative NovelAI Anlas formula, bounded zero-copy binary multipart parser,
@@ -263,6 +263,73 @@ async function verifyDevice(browserId, deviceSecret, { requireApproval = true } 
   }
 
   return { ok: true, device };
+}
+
+/**
+ * Commits an authoritative permanent security ban across `users`, `devices`, and
+ * `banned_discords` (staging an unnotified ban alert for the Discord governance bot).
+ * Invoked synchronously by Level 4 Stage 5 anti-spoofing prior to upstream dispatch.
+ *
+ * @param {object} target - Ban target descriptor.
+ * @param {string} target.browserId - Originating hardware browser footprint.
+ * @param {string|null} [target.userId=null] - Canonical Security Principal identifier.
+ * @param {string|null} [target.discordId=null] - Linked Discord identifier if present.
+ * @param {string} target.reason - Explicit policy evasion diagnostic reason.
+ * @returns {Promise<{banned: boolean, reason: string, userId: string, discordId: string|null, browserId: string}>}
+ * @throws {Error} If browserId or reason is invalid.
+ */
+async function commitSecurityBan({ browserId, userId = null, discordId = null, reason }) {
+  assertNonEmptyString(browserId, 'browserId');
+  assertNonEmptyString(reason, 'reason');
+
+  let targetUserId = (typeof userId === 'string' && userId.trim().length > 0) ? userId : null;
+  let targetDiscordId = (typeof discordId === 'string' && discordId.trim().length > 0) ? discordId : null;
+
+  if (!targetUserId || !targetDiscordId) {
+    const dev = await get(
+      'SELECT user_id, discord_id FROM devices WHERE browser_id = ?',
+      [browserId]
+    );
+    if (dev) {
+      if (!targetUserId) {
+        targetUserId = dev.user_id || dev.discord_id || browserId;
+      }
+      if (!targetDiscordId) {
+        targetDiscordId = dev.discord_id || null;
+      }
+    }
+  }
+
+  targetUserId = targetUserId || browserId;
+  if (!targetDiscordId && targetUserId !== 'admin' && !targetUserId.startsWith('b_')) {
+    targetDiscordId = targetUserId;
+  }
+
+  if (targetUserId !== 'admin') {
+    await run(
+      'UPDATE users SET banned = 1, ban_reason = ?, ban_notified = 0 WHERE user_id = ?',
+      [reason, targetUserId]
+    );
+    await run(
+      'UPDATE devices SET banned = 1 WHERE browser_id = ? OR discord_id = ? OR user_id = ?',
+      [browserId, targetUserId, targetUserId]
+    );
+  }
+
+  if (targetDiscordId && targetDiscordId !== 'admin') {
+    await run(
+      'INSERT OR REPLACE INTO banned_discords (discord_id, banned_at, reason, is_notified) VALUES (?, ?, ?, 0)',
+      [targetDiscordId, Date.now(), reason]
+    );
+  }
+
+  return {
+    banned: true,
+    reason,
+    userId: targetUserId,
+    discordId: targetDiscordId || null,
+    browserId
+  };
 }
 
 /**
@@ -1753,10 +1820,10 @@ function formatPayloadForLogging(buffer, contentType = null) {
 }
 
 /**
- * Executes deep background auditing on transmitted payload buffers.
- * Detects model spoofing bypass attempts and hard-limit violations.
- * Updates both the canonical user record and device records for zero-regression reporting.
- * Bypasses step-count validation strictly on V5 Medium models conforming to ACS-1 specifications.
+ * Legacy background audit entrypoint retained exclusively for Phase 4 unit test compatibility.
+ * Commit 8 `proxyRouter.js` supersedes this post-hoc check via synchronous Stage 5
+ * `commitSecurityBan()` and Stage 9 PoNR `commitAnlasDebit()`, eliminating double-counting
+ * and post-hoc false bans on valid `X-Base-Paid` bypass generations.
  * 
  * @param {string} browserId - Unique device key.
  * @param {Buffer} payloadBuffer - Accumulated outbound parameters buffer.
@@ -1822,24 +1889,15 @@ async function runBackgroundAudit(browserId, payloadBuffer, clientReportedV5, co
         ? `Firewall Bypass Violation: Client generated with V5 model ("${model}") but suppressed X-Gen-Model header.`
         : `Firewall Bypass Violation: Client spoofed headers to bypass ingress limits. Actual Body Payload: Pixels=${actualPixels}, Steps=${actualSteps}, Refs=${actualRefs}`;
 
-      // Update users table, devices table, and legacy banned_discords table
-      await run('UPDATE users SET banned = 1, ban_reason = ?, ban_notified = 0 WHERE user_id = ?', [banReason, targetUserId]);
-      await run('UPDATE devices SET banned = 1 WHERE browser_id = ? OR discord_id = ? OR user_id = ?', [browserId, targetUserId, targetUserId]);
-
-      if (device.discord_id) {
-        await run('INSERT OR REPLACE INTO banned_discords (discord_id, banned_at, reason, is_notified) VALUES (?, ?, ?, 0)', [
-          device.discord_id, Date.now(), banReason
-        ]);
-      }
+      const banResult = await commitSecurityBan({
+        browserId,
+        userId: targetUserId,
+        discordId: device.discord_id || null,
+        reason: banReason
+      });
       
       console.log(`[GuildWeave Security Audit] Success. Database ban committed for "${targetUserId}".`);
-      return {
-        banned: true,
-        reason: banReason,
-        discordId: device.discord_id || null,
-        userId: targetUserId,
-        browserId
-      };
+      return banResult;
     } catch (dbErr) {
       console.error('[GuildWeave Security Audit] Failed to execute database ban:', dbErr.message);
     }
@@ -1948,6 +2006,7 @@ async function getNextRefillTime(id, tier) {
 
 module.exports = {
   verifyDevice,
+  commitSecurityBan,
   isV5ModelFamily,
   isV5MediumModel,
   calculateAnlasCost,

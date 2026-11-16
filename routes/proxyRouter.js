@@ -3,10 +3,13 @@
  * 
  * Enforces strict req.pause() Stream Safety before executing database transactions.
  * Enforces ACS-1 ingress staging semaphore (activeBufferingStreams <= INGRESS_SEMAPHORE_MAX),
- * upload inactivity & duration deadlines, TTL re-anchoring at req.on('end'), and isolated
- * Channel B `/ai/encode-vibe` PoNR 2-Anlas settlement.
- * Orchestrates payload WAF buffering, upstream piping, and asynchronous security auditing.
- * Relational Normalization: Deducts allowances, charges Anlas, and evaluates bans against canonical user_id.
+ * upload inactivity & duration deadlines, TTL re-anchoring at req.on('end'), synchronous
+ * Stage 5 anti-spoofing parameter reconciliation, Stage 6 V5 model-aware deadband firewall,
+ * Stage 7 authoritative cost calculation (`C_auth`) + in-memory holds + V5 NCP verification,
+ * and Stage 9 Point-of-No-Return (PoNR) SQLite settlement strictly on upstream HTTP 200 OK.
+ * Orchestrates payload WAF buffering, upstream piping, and isolated Channel B `/ai/encode-vibe`
+ * PoNR 2-Anlas settlement under a unified per-principal Anlas authorization gate.
+ * Relational Normalization: Deducts allowances, charges Anlas/NCP, and evaluates bans against canonical user_id.
  */
 
 'use strict';
@@ -23,12 +26,15 @@ const { loadConfig } = require('../config');
 const router = express.Router();
 
 const VIBE_ENCODE_ANLAS_COST = 2;
+const BASE_PAID_MIN_ANLAS = 2;
+const V5_HIGH_NCP_COST = 18;
+const V5_MEDIUM_NCP_COST = 10;
 
 // Atomic Ingress Staging Concurrency Counter (bounds concurrent 50MB upload buffers)
 let activeBufferingStreams = 0;
 
-// Per-principal serialization gate for Channel B vibe spend-check + slot reservation
-const userVibeAuthLocks = new Map();
+// Unified per-principal serialization gate for cross-channel Anlas balance checks, holds & PoNR commits
+const userAnlasAuthLocks = new Map();
 
 router.getActiveBufferingStreams = () => activeBufferingStreams;
 
@@ -37,32 +43,92 @@ function getConfig() {
 }
 
 /**
- * Serializes asynchronous `/ai/encode-vibe` balance evaluation + Channel B hold placement
- * per canonical user_id so concurrent requests cannot interleave between SQLite balance reads
- * and synchronous in-memory hold placement.
+ * Serializes asynchronous Anlas balance evaluation, in-memory hold placement, and PoNR
+ * SQLite debit + hold release per canonical user_id across both Channel A image bypasses
+ * and Channel B vibe encodes, preventing concurrent requests from interleaving across
+ * SQLite writes and RAM hold teardown (including post-200 client socket aborts).
  *
  * @param {string} userId - Canonical Security Principal identifier.
  * @param {Function} fn - Asynchronous critical-section callback.
  * @returns {Promise<*>} Result of critical-section execution.
  */
-async function withUserVibeAuthLock(userId, fn) {
-  const previous = userVibeAuthLocks.get(userId) || Promise.resolve();
+async function withUserAnlasAuthLock(userId, fn) {
+  const previous = userAnlasAuthLocks.get(userId) || Promise.resolve();
   let release;
   const current = new Promise(resolve => {
     release = resolve;
   });
   const tail = previous.catch(() => {}).then(() => current);
-  userVibeAuthLocks.set(userId, tail);
+  userAnlasAuthLocks.set(userId, tail);
 
   await previous.catch(() => {});
   try {
     return await fn();
   } finally {
     release();
-    if (userVibeAuthLocks.get(userId) === tail) {
-      userVibeAuthLocks.delete(userId);
+    if (userAnlasAuthLocks.get(userId) === tail) {
+      userAnlasAuthLocks.delete(userId);
     }
   }
+}
+
+/**
+ * Strictly parses an optional non-negative safe integer HTTP header.
+ *
+ * @param {*} raw - Raw header value.
+ * @param {number} [defaultValue=0] - Fallback when header is omitted.
+ * @returns {{ok: boolean, provided: boolean, value: number}}
+ */
+function parseStrictNonNegativeIntHeader(raw, defaultValue = 0) {
+  if (raw === undefined) {
+    return { ok: true, provided: false, value: defaultValue };
+  }
+  if (typeof raw !== 'string') {
+    return { ok: false, provided: true, value: 0 };
+  }
+  const trimmed = raw.trim();
+  if (!/^\d+$/.test(trimmed)) {
+    return { ok: false, provided: true, value: 0 };
+  }
+  const parsed = Number(trimmed);
+  if (!Number.isSafeInteger(parsed)) {
+    return { ok: false, provided: true, value: 0 };
+  }
+  return { ok: true, provided: true, value: parsed };
+}
+
+/**
+ * Strictly parses an optional boolean ('true' | 'false') HTTP header.
+ *
+ * @param {*} raw - Raw header value.
+ * @returns {{ok: boolean, provided: boolean, value: boolean}}
+ */
+function parseBooleanHeader(raw) {
+  if (raw === undefined) {
+    return { ok: true, provided: false, value: false };
+  }
+  if (typeof raw !== 'string') {
+    return { ok: false, provided: true, value: false };
+  }
+  const normalized = raw.trim().toLowerCase();
+  if (normalized === 'true') return { ok: true, provided: true, value: true };
+  if (normalized === 'false') return { ok: true, provided: true, value: false };
+  return { ok: false, provided: true, value: false };
+}
+
+/**
+ * Parses the operational `X-Scraped-Anlas` telemetry canary header without failing
+ * or penalizing the request on missing or malformed UI scrapes.
+ *
+ * @param {*} raw - Raw header value.
+ * @returns {number|null} Parsed integer canary or null.
+ */
+function parseScrapedCanaryHeader(raw) {
+  if (typeof raw !== 'string') return null;
+  const trimmed = raw.trim();
+  if (!/^\d+$/.test(trimmed)) return null;
+  const parsed = Number(trimmed);
+  return Number.isSafeInteger(parsed) ? parsed : null;
 }
 
 router.all('/:subdomain/{*splat}', async (req, res) => {
@@ -119,7 +185,12 @@ router.all('/:subdomain/{*splat}', async (req, res) => {
   const isImageGen = pathPart === 'ai/generate-image' || pathPart === 'ai/generate-image-stream';
   const isTextGen = pathPart === 'ai/generate-stream' || pathPart === 'oa/v1/completions';
   const isVibeEncode = pathPart === 'ai/encode-vibe';
-  const genModelHeader = req.headers['x-gen-model'];
+
+  const rawGenModelHeader = req.headers['x-gen-model'];
+  const normalizedHeaderModel = typeof rawGenModelHeader === 'string' ? rawGenModelHeader.trim().toLowerCase() : '';
+  const isV5Header = normalizedHeaderModel === 'v5' || normalizedHeaderModel === 'v5-medium';
+  const isV5MediumHeader = normalizedHeaderModel === 'v5-medium';
+  let effectiveIsV5 = isV5Header;
 
   const isConnectionAborted = () => cleanupExecuted || res.destroyed || res.writableEnded;
 
@@ -143,7 +214,7 @@ router.all('/:subdomain/{*splat}', async (req, res) => {
       console.log(`[GuildWeave Telemetry] Stream cleaned up. Slot released for request: "${activeTask.req_id}"`);
     }
 
-    if (isImageGen && genModelHeader === 'V5' && req.telemetry) {
+    if (isImageGen && effectiveIsV5 && req.telemetry) {
       req.telemetry.triggerSync();
     }
   };
@@ -205,12 +276,18 @@ router.all('/:subdomain/{*splat}', async (req, res) => {
       return sendEarlyError(auth.status, { error: auth.error });
     }
     const device = auth.device;
+    const tierConfig = config.TIER_CONFIGS[device.priority_tier] || config.TIER_CONFIGS['Normal'];
     queueManager.ping(browserId);
 
-    // Ingress Validation for Image Generation
+    const requestId = req.headers['x-request-id'];
+    let isBasePaidHeader = false;
+    let declaredAnlas = 0;
+    let scrapedAnlas = null;
+
+    // Stage 1: Ingress Validation for Image Generation
     if (isImageGen) {
       // Reject missing model headers to prevent accidental bans on outdated clients
-      if (!genModelHeader) {
+      if (!rawGenModelHeader) {
         console.warn(`[GuildWeave Gatekeeper] Rejected image gen request from browser "${browserId}" due to missing model validation header (outdated script).`);
         return sendEarlyError(426, {
           statusCode: 426,
@@ -219,24 +296,81 @@ router.all('/:subdomain/{*splat}', async (req, res) => {
         });
       }
 
-      // Resolve any Channel A task owned by this authenticated client prior to gated exits so early drops never strand locks
-      const requestId = req.headers['x-request-id'];
-      activeTask = requestId ? queueManager.getProcessingTask(requestId, browserId) : null;
-
-      // Reject unverified X-Base-Paid=true bypass claims prior to Commit 8 Anlas ledger integration
-      if (req.headers['x-base-paid'] === 'true') {
-        console.warn(`[GuildWeave Gatekeeper] Rejected premature X-Base-Paid=true claim from browser "${browserId}".`);
+      if (normalizedHeaderModel !== 'v5' && normalizedHeaderModel !== 'v5-medium' && normalizedHeaderModel !== 'legacy') {
         return sendEarlyError(400, {
           statusCode: 400,
-          error: 'BASE_PAID_UNSUPPORTED',
-          message: 'Anlas base-paid parametric bypasses are not active on this gateway version.'
+          error: 'INVALID_HEADERS',
+          message: 'Invalid X-Gen-Model routing header.'
         });
       }
 
-      // V5 Capacity Safeguard & Operational Circuit Breaker
-      if (genModelHeader === 'V5') {
+      // Resolve any Channel A task owned by this authenticated client prior to gated exits so early drops never strand locks
+      activeTask = requestId ? queueManager.getProcessingTask(requestId, browserId) : null;
+
+      const basePaidParsed = parseBooleanHeader(req.headers['x-base-paid']);
+      if (!basePaidParsed.ok) {
+        return sendEarlyError(400, {
+          statusCode: 400,
+          error: 'INVALID_HEADERS',
+          message: 'X-Base-Paid header must be "true" or "false".'
+        });
+      }
+      isBasePaidHeader = basePaidParsed.value;
+
+      const declaredAnlasParsed = parseStrictNonNegativeIntHeader(req.headers['x-declared-anlas'], 0);
+      if (!declaredAnlasParsed.ok) {
+        return sendEarlyError(400, {
+          statusCode: 400,
+          error: 'INVALID_HEADERS',
+          message: 'X-Declared-Anlas header must be a non-negative integer.'
+        });
+      }
+      declaredAnlas = declaredAnlasParsed.value;
+      scrapedAnlas = parseScrapedCanaryHeader(req.headers['x-scraped-anlas']);
+
+      const widthHeader = parseStrictNonNegativeIntHeader(req.headers['x-gen-width'], 0);
+      const heightHeader = parseStrictNonNegativeIntHeader(req.headers['x-gen-height'], 0);
+      const stepsHeader = parseStrictNonNegativeIntHeader(req.headers['x-gen-steps'], 0);
+      const samplesHeader = parseStrictNonNegativeIntHeader(req.headers['x-gen-samples'], 1);
+      const refsHeader = parseStrictNonNegativeIntHeader(req.headers['x-precise-refs'], 0);
+
+      if (!widthHeader.ok || !heightHeader.ok || !stepsHeader.ok || !samplesHeader.ok || !refsHeader.ok) {
+        return sendEarlyError(400, {
+          statusCode: 400,
+          error: 'INVALID_HEADERS',
+          message: 'Generation parameter routing headers must be non-negative integers.'
+        });
+      }
+
+      const width = widthHeader.value;
+      const height = heightHeader.value;
+      const steps = stepsHeader.value;
+      const samples = samplesHeader.value;
+      const preciseRefs = refsHeader.value;
+      const totalPixels = width * height;
+
+      // Reject forged X-Base-Paid=true on explicitly declared free Opus geometry pre-buffer
+      const hasExplicitHeaderGeometry = widthHeader.provided && width > 0 && heightHeader.provided && height > 0;
+      if (
+        isBasePaidHeader &&
+        hasExplicitHeaderGeometry &&
+        totalPixels <= config.FIREWALL_MAX_PIXELS &&
+        samples === config.FIREWALL_MAX_SAMPLES &&
+        (isV5MediumHeader || !stepsHeader.provided || steps <= config.FIREWALL_MAX_STEPS)
+      ) {
+        return sendEarlyError(400, {
+          statusCode: 400,
+          error: 'PARAMETRIC_LIMIT_EXCEEDED',
+          message: 'Baseline <=1MP, 1-sample parameters are not eligible for X-Base-Paid exemption.'
+        });
+      }
+
+      const requestsAnlasBypass = isBasePaidHeader || declaredAnlas > 0;
+
+      // Ensure fresh subscription telemetry for V5 or Anlas-consuming requests
+      if (isV5Header || requestsAnlasBypass) {
         if (!req.telemetry) {
-          console.error(`[GuildWeave Gatekeeper] Critical: Telemetry context missing on V5 execution. Failing closed.`);
+          console.error(`[GuildWeave Gatekeeper] Critical: Telemetry context missing on gated execution. Failing closed.`);
           return sendEarlyError(503, {
             statusCode: 503,
             error: 'TELEMETRY_UNAVAILABLE',
@@ -249,7 +383,6 @@ router.all('/:subdomain/{*splat}', async (req, res) => {
         } catch (telemetryErr) {
           if (isConnectionAborted()) return;
           console.error(`[GuildWeave Gatekeeper] On-demand telemetry sync failed:`, telemetryErr.message);
-          // If telemetry has never been fetched and fails, fail closed
           if (req.telemetry.lastFetched === 0) {
             activeTask = requestId ? queueManager.getProcessingTask(requestId, browserId) : null;
             return sendEarlyError(503, {
@@ -265,29 +398,32 @@ router.all('/:subdomain/{*splat}', async (req, res) => {
         // Re-verify Channel A lock ownership after async telemetry I/O so an evicted task cannot race upstream
         activeTask = requestId ? queueManager.getProcessingTask(requestId, browserId) : null;
 
-        if (req.telemetry.lastFetched > 0 && req.telemetry.subscriptionActive === false) {
-          console.warn(`[GuildWeave Gatekeeper] V5 generation blocked for browser "${browserId}": Master Opus subscription is inactive.`);
+        if (req.telemetry.lastFetched === 0) {
           return sendEarlyError(503, {
             statusCode: 503,
-            error: 'MASTER_SUBSCRIPTION_INACTIVE',
-            message: 'Master NovelAI Opus subscription is inactive or expired. Generation temporarily unavailable.'
+            error: 'TELEMETRY_UNAVAILABLE',
+            message: 'Master subscription telemetry has not been initialized.'
           });
         }
+      }
 
-        if (req.telemetry.isHardLocked) {
-          console.warn(`[GuildWeave Gatekeeper] V5 generation blocked by circuit breaker for browser "${browserId}". Projected V5 Capacity: ${req.telemetry.percent.toFixed(2)}%`);
-          return sendEarlyError(503, {
-            statusCode: 503,
-            error: 'V5_BATTERY_CRITICAL',
-            message: `V5 generation is temporarily locked by the cluster circuit breaker (${req.telemetry.percent.toFixed(2)}% <= ${config.V5_CIRCUIT_BREAKER_PERCENT}%). Try again after battery recharge, or switch to a non-V5 model.`
-          });
-        }
-      } else if (req.telemetry && req.telemetry.lastFetched > 0 && req.telemetry.subscriptionActive === false) {
-        console.warn(`[GuildWeave Gatekeeper] Legacy generation blocked for browser "${browserId}": Master Opus subscription is inactive.`);
+      // Master Opus Subscription Active Gate (applies to all image generations once telemetry is initialized)
+      if (req.telemetry && req.telemetry.lastFetched > 0 && req.telemetry.subscriptionActive === false) {
+        console.warn(`[GuildWeave Gatekeeper] Generation blocked for browser "${browserId}": Master Opus subscription is inactive.`);
         return sendEarlyError(503, {
           statusCode: 503,
           error: 'MASTER_SUBSCRIPTION_INACTIVE',
           message: 'Master NovelAI Opus subscription is inactive or expired. Generation temporarily unavailable.'
+        });
+      }
+
+      // V5 Operational Circuit Breaker (non-base-paid V5 blocked at <=5.5%)
+      if (isV5Header && !isBasePaidHeader && req.telemetry && req.telemetry.isHardLocked) {
+        console.warn(`[GuildWeave Gatekeeper] V5 generation blocked by circuit breaker for browser "${browserId}". Projected V5 Capacity: ${req.telemetry.percent.toFixed(2)}%`);
+        return sendEarlyError(503, {
+          statusCode: 503,
+          error: 'V5_BATTERY_CRITICAL',
+          message: `V5 generation is temporarily locked by the cluster circuit breaker (${req.telemetry.percent.toFixed(2)}% <= ${config.V5_CIRCUIT_BREAKER_PERCENT}%). Try again after battery recharge, or switch to a non-V5 model.`
         });
       }
 
@@ -302,24 +438,18 @@ router.all('/:subdomain/{*splat}', async (req, res) => {
       }
 
       // Soft Header Parametric Firewall verification (Fast ingress drop without persistent ban)
-      const width = parseInt(req.headers['x-gen-width'], 10) || 0;
-      const height = parseInt(req.headers['x-gen-height'], 10) || 0;
-      const steps = parseInt(req.headers['x-gen-steps'], 10) || 0;
-      const samples = parseInt(req.headers['x-gen-samples'], 10) || 1;
-      const preciseRefs = parseInt(req.headers['x-precise-refs'], 10) || 0;
-      
-      const tierConfig = config.TIER_CONFIGS[device.priority_tier] || config.TIER_CONFIGS['Normal'];
-      const totalPixels = width * height;
       const violations = [];
 
-      if (totalPixels > config.FIREWALL_MAX_PIXELS) {
-        violations.push(`Resolution of ${width}x${height} (${totalPixels}px) exceeds the maximum limit of ${config.FIREWALL_MAX_PIXELS.toLocaleString('en-US')}px (1MP)`);
-      }
-      if (steps > config.FIREWALL_MAX_STEPS) {
-        violations.push(`Steps count of ${steps} exceeds the maximum limit of ${config.FIREWALL_MAX_STEPS} steps`);
-      }
-      if (samples !== config.FIREWALL_MAX_SAMPLES) {
-        violations.push(`Samples count of ${samples} exceeds the maximum limit of ${config.FIREWALL_MAX_SAMPLES} sample (single-image generation only)`);
+      if (!isBasePaidHeader) {
+        if (totalPixels > config.FIREWALL_MAX_PIXELS) {
+          violations.push(`Resolution of ${width}x${height} (${totalPixels}px) exceeds the maximum limit of ${config.FIREWALL_MAX_PIXELS.toLocaleString('en-US')}px (1MP)`);
+        }
+        if (!isV5Header && steps > config.FIREWALL_MAX_STEPS) {
+          violations.push(`Steps count of ${steps} exceeds the maximum limit of ${config.FIREWALL_MAX_STEPS} steps`);
+        }
+        if (samples !== config.FIREWALL_MAX_SAMPLES) {
+          violations.push(`Samples count of ${samples} exceeds the maximum limit of ${config.FIREWALL_MAX_SAMPLES} sample (single-image generation only)`);
+        }
       }
       if (preciseRefs > tierConfig.preciseLimit) {
         violations.push(`Precise references count of ${preciseRefs} exceeds your max limit of ${tierConfig.preciseLimit}`);
@@ -328,6 +458,64 @@ router.all('/:subdomain/{*splat}', async (req, res) => {
       if (violations.length > 0) {
         const combinedMessage = `\n\nAnlas Protection Limit Violations:\n` + violations.map(v => `• ${v}`).join('\n');
         return sendEarlyError(400, { statusCode: 400, message: combinedMessage, violations });
+      }
+
+      // Pre-Buffer Anlas Master Solvency, Billing-Cycle Reset & Spend Fast-Fail Gate
+      if (requestsAnlasBypass) {
+        const requiredFloor = isBasePaidHeader ? Math.max(declaredAnlas, BASE_PAID_MIN_ANLAS) : declaredAnlas;
+        if (
+          req.telemetry.masterAnlas !== null &&
+          req.telemetry.masterAnlas !== undefined &&
+          req.telemetry.masterAnlas < requiredFloor
+        ) {
+          console.warn(
+            `[GuildWeave Gatekeeper] Anlas bypass blocked for browser "${browserId}": Master Anlas (${req.telemetry.masterAnlas}) < required (${requiredFloor}).`
+          );
+          return sendEarlyError(503, {
+            statusCode: 503,
+            error: 'MASTER_ANLAS_DEPLETED',
+            message: `Master account Anlas balance (${req.telemetry.masterAnlas}) is insufficient for this generation (${requiredFloor} Anlas required).`
+          });
+        }
+
+        const skipColdBootReset = Boolean(
+          req.telemetry.lastFetched === 0 &&
+          req.telemetry.activeCycleEpoch === null
+        );
+        if (!skipColdBootReset) {
+          await auditEngine.evaluateAnlasReset(device.user_id, {
+            now: Date.now(),
+            activeCycleEpoch: req.telemetry?.activeCycleEpoch ?? null,
+            isGracePeriod: req.telemetry?.isGracePeriod ?? false,
+            subscriptionActive: req.telemetry?.subscriptionActive ?? true
+          });
+          if (isConnectionAborted()) return;
+        }
+
+        const netHeldAnlas = Math.max(0, queueManager.getHeldAnlasForUser(device.user_id) - (activeTask.held_cost || 0));
+        const preBufferAuth = await auditEngine.authorizeAnlasSpend(device.user_id, {
+          declaredAnlas,
+          isBasePaid: isBasePaidHeader,
+          heldAnlas: netHeldAnlas
+        });
+        if (isConnectionAborted()) return;
+
+        // Re-verify Channel A lock after async DB calls
+        activeTask = queueManager.getProcessingTask(requestId, browserId);
+        if (!activeTask) {
+          return sendEarlyError(403, {
+            statusCode: 403,
+            message: 'Anlas Protection: Transaction queue verification lock lost.'
+          });
+        }
+
+        if (!preBufferAuth.ok) {
+          return sendEarlyError(preBufferAuth.status, {
+            statusCode: preBufferAuth.status,
+            error: preBufferAuth.error,
+            message: preBufferAuth.message
+          });
+        }
       }
     } else if (isVibeEncode) {
       // Channel B Vibe Encoding Gate: Master Solvency + Billing-Cycle Reset + Debt/Balance Check
@@ -417,7 +605,7 @@ router.all('/:subdomain/{*splat}', async (req, res) => {
     if (isVibeEncode) {
       let earlyRejection = null;
 
-      await withUserVibeAuthLock(device.user_id, async () => {
+      await withUserAnlasAuthLock(device.user_id, async () => {
         if (isConnectionAborted()) return;
 
         const heldAnlas = queueManager.getHeldAnlasForUser(device.user_id);
@@ -487,7 +675,7 @@ router.all('/:subdomain/{*splat}', async (req, res) => {
       isTextGenClaimed = true;
     }
 
-    // 2. INGRESS STAGING SEMAPHORE & UPLOAD DEADLINES (excludes bodyless GET/HEAD reads)
+    // Stage 2 & 3: Ingress Staging Semaphore & Upload Deadlines (excludes bodyless GET/HEAD reads)
     const contentLengthHeader = req.headers['content-length'];
     const isBodylessMethod = (req.method === 'GET' || req.method === 'HEAD') &&
       (contentLengthHeader === undefined || contentLengthHeader === '0') &&
@@ -589,7 +777,7 @@ router.all('/:subdomain/{*splat}', async (req, res) => {
       }
     });
 
-    req.on('end', () => {
+    req.on('end', async () => {
       requestEnded = true;
       clearUploadTimers();
       releaseBufferingSlot();
@@ -602,217 +790,743 @@ router.all('/:subdomain/{*splat}', async (req, res) => {
       const payloadBuffer = Buffer.concat(bodyChunks, accumulatedBytes);
       bodyChunks.length = 0;
 
-      // Re-verify lock ownership post-buffering and re-anchor Channel A GPU TTL clock
-      if (isImageGen && activeTask) {
-        const currentTask = queueManager.getProcessingTask(activeTask.req_id, browserId);
-        if (!currentTask) {
-          activeTask = null;
-          executeCleanup();
-          if (!res.headersSent) {
-            return res.status(403).json({
-              statusCode: 403,
-              message: 'Anlas Protection: Transaction queue verification lock lost during upload.'
-            });
-          }
-          return;
-        }
-        activeTask = currentTask;
-        queueManager.reanchorProcessingTimestamp(activeTask.req_id);
-      } else if (isVibeEncode) {
-        const currentVibeLock = textGenLockId ? queueManager.getTextLock(textGenLockId) : null;
-        if (!currentVibeLock) {
-          isTextGenClaimed = false;
-          executeCleanup();
-          if (!res.headersSent) {
-            return res.status(403).json({
-              statusCode: 403,
-              error: 'CHANNEL_B_LOCK_LOST',
-              message: 'Vibe encoding reservation lock was lost during upload.'
-            });
-          }
-          return;
-        }
+      try {
+        let extractedParams = null;
+        let bodyIsV5 = false;
+        let bodyIsV5Medium = false;
+        let isVerifiedBasePaid = false;
+        let cAuth = 0;
+        let reqNcp = 0;
 
-        // Dedicated image-presence validator (bypasses generation parameter extraction completely)
-        const vibeValidation = auditEngine.validateVibeEncodePayload(payloadBuffer, req.headers['content-type']);
-        if (!vibeValidation.ok) {
-          executeCleanup();
-          if (!res.headersSent) {
-            return res.status(400).json({
-              statusCode: 400,
-              error: 'INVALID_VIBE_PAYLOAD',
-              message: vibeValidation.reason
-            });
+        if (isImageGen && activeTask) {
+          // Re-verify lock ownership post-buffering before Stage 4-7 validation
+          const currentTask = queueManager.getProcessingTask(activeTask.req_id, browserId);
+          if (!currentTask) {
+            activeTask = null;
+            executeCleanup();
+            if (!res.headersSent) {
+              return res.status(403).json({
+                statusCode: 403,
+                message: 'Anlas Protection: Transaction queue verification lock lost during upload.'
+              });
+            }
+            return;
           }
-          return;
-        }
-      }
+          activeTask = currentTask;
 
-      // Extract model identifier synchronously so upstreamRes PoNR dispatch weighting avoids waiting on setImmediate
-      const extractedModel = (isImageGen && genModelHeader === 'V5')
-        ? (auditEngine.extractParametersFromRawBody(payloadBuffer, req.headers['content-type'])?.model || null)
-        : null;
+          // Stage 4: Dual-Mode Zero-Copy Buffer Extraction
+          extractedParams = auditEngine.extractParametersFromRawBody(payloadBuffer, req.headers['content-type']);
+          if (!extractedParams) {
+            executeCleanup();
+            if (!res.headersSent) {
+              return res.status(400).json({
+                statusCode: 400,
+                error: 'MALFORMED_PAYLOAD',
+                message: 'Unable to extract generation parameters from request body.'
+              });
+            }
+            return;
+          }
 
-      // Asynchronous Audit & Session Tracking
-      setImmediate(async () => {
-        try {
-          await run('UPDATE devices SET total_requests = total_requests + 1, last_active_at = ? WHERE browser_id = ?', [Date.now(), browserId]);
-          if (isImageGen && deviceSecret !== config.ADMIN_SECRET_KEY) {
-            const auditResult = await auditEngine.runBackgroundAudit(browserId, payloadBuffer, genModelHeader === 'V5', req.headers['content-type']);
-            if (auditResult && auditResult.banned) {
-              queueManager.evict({ user_id: auditResult.userId });
+          if (
+            extractedParams.width === null || extractedParams.height === null ||
+            extractedParams.width <= 0 || extractedParams.height <= 0 ||
+            (extractedParams.steps !== null && extractedParams.steps <= 0) ||
+            (extractedParams.n_samples !== null && extractedParams.n_samples <= 0)
+          ) {
+            executeCleanup();
+            if (!res.headersSent) {
+              return res.status(400).json({
+                statusCode: 400,
+                error: 'INVALID_PARAMETERS',
+                message: 'Generation parameters contain missing or non-positive dimensions, steps, or sample counts.'
+              });
+            }
+            return;
+          }
+
+          bodyIsV5 = auditEngine.isV5ModelFamily(extractedParams.model);
+          bodyIsV5Medium = auditEngine.isV5MediumModel(extractedParams.model);
+          effectiveIsV5 = bodyIsV5 || isV5Header;
+
+          const bodySteps = extractedParams.steps !== null
+            ? extractedParams.steps
+            : (bodyIsV5Medium ? 14 : 28);
+          const bodySamples = extractedParams.n_samples !== null ? extractedParams.n_samples : 1;
+          const bodyRefs = extractedParams.precise_ref_count || 0;
+          const actualPixels = extractedParams.width * extractedParams.height;
+
+          // Stage 5: Synchronous Anti-Spoofing Parameter Forgery Reconciliation
+          let forgeryReason = null;
+
+          if (normalizedHeaderModel === 'legacy' && bodyIsV5) {
+            forgeryReason = `Firewall Bypass Violation: Client generated with V5 model ("${extractedParams.model}") but suppressed X-Gen-Model header.`;
+          } else if (normalizedHeaderModel === 'v5-medium' && !bodyIsV5Medium) {
+            forgeryReason = `Firewall Bypass Violation: Client declared X-Gen-Model: V5-medium but embedded non-Medium model ("${extractedParams.model}").`;
+          } else if (normalizedHeaderModel === 'v5' && !bodyIsV5) {
+            forgeryReason = `Firewall Bypass Violation: Client declared X-Gen-Model: V5 but embedded missing or non-V5 model ("${extractedParams.model}").`;
+          } else {
+            const headerChecks = [
+              { name: 'x-gen-width', actual: extractedParams.width },
+              { name: 'x-gen-height', actual: extractedParams.height },
+              { name: 'x-gen-steps', actual: bodySteps },
+              { name: 'x-gen-samples', actual: bodySamples },
+              { name: 'x-precise-refs', actual: bodyRefs }
+            ];
+
+            for (const chk of headerChecks) {
+              const rawHeaderVal = req.headers[chk.name];
+              if (rawHeaderVal !== undefined) {
+                const parsedHeader = parseStrictNonNegativeIntHeader(rawHeaderVal, 0);
+                if (!parsedHeader.ok || parsedHeader.value !== chk.actual) {
+                  forgeryReason = `Firewall Bypass Violation: Header ${chk.name} (${rawHeaderVal}) mismatched extracted body parameter (${chk.actual}).`;
+                  break;
+                }
+              }
             }
           }
-        } catch (err) {
-          console.error('[GuildWeave Audit] Background async process exception:', err);
+
+          if (forgeryReason) {
+            console.warn(`\x1b[31m[GuildWeave SECURITY AUDIT] !!! HOSTILE PARAMETER FORGERY DETECTED !!!\x1b[0m`);
+            console.warn(`[GuildWeave Security Audit] Device: "${browserId}", User: "${device.user_id}", Reason: ${forgeryReason}`);
+
+            if (deviceSecret !== config.ADMIN_SECRET_KEY) {
+              await auditEngine.commitSecurityBan({
+                browserId,
+                userId: device.user_id,
+                discordId: device.discord_id || null,
+                reason: forgeryReason
+              });
+            }
+
+            queueManager.evict({
+              user_id: device.user_id,
+              discord_id: device.discord_id || null,
+              browser_id: browserId
+            });
+            executeCleanup();
+
+            if (!res.headersSent && !res.destroyed) {
+              return res.status(403).json({
+                statusCode: 403,
+                error: 'PARAMETER_FORGERY',
+                message: 'Access Denied: Hostile parameter spoofing detected. Account permanently banned.'
+              });
+            }
+            return;
+          }
+
+          // Stage 6: Model-Aware Deadband Firewall & Real Base-Paid Verification
+          const exceedsBaseLimits =
+            (actualPixels > config.FIREWALL_MAX_PIXELS) ||
+            (bodySamples !== config.FIREWALL_MAX_SAMPLES) ||
+            (!bodyIsV5Medium && bodySteps > config.FIREWALL_MAX_STEPS);
+
+          if (isBasePaidHeader && !exceedsBaseLimits) {
+            executeCleanup();
+            if (!res.headersSent) {
+              return res.status(400).json({
+                statusCode: 400,
+                error: 'PARAMETRIC_LIMIT_EXCEEDED',
+                message: 'Baseline <=1MP, 1-sample parameters are not eligible for X-Base-Paid exemption.'
+              });
+            }
+            return;
+          }
+
+          isVerifiedBasePaid = isBasePaidHeader && exceedsBaseLimits;
+
+          if (!isVerifiedBasePaid) {
+            if (actualPixels > config.FIREWALL_MAX_PIXELS) {
+              executeCleanup();
+              if (!res.headersSent) {
+                return res.status(400).json({
+                  statusCode: 400,
+                  error: 'PARAMETRIC_LIMIT_EXCEEDED',
+                  message: `Resolution of ${extractedParams.width}x${extractedParams.height} (${actualPixels}px) exceeds the free-tier limit of ${config.FIREWALL_MAX_PIXELS.toLocaleString('en-US')}px (1MP).`
+                });
+              }
+              return;
+            }
+            if (bodySamples !== config.FIREWALL_MAX_SAMPLES) {
+              executeCleanup();
+              if (!res.headersSent) {
+                return res.status(400).json({
+                  statusCode: 400,
+                  error: 'PARAMETRIC_LIMIT_EXCEEDED',
+                  message: `Samples count of ${bodySamples} exceeds the free-tier limit of ${config.FIREWALL_MAX_SAMPLES} sample.`
+                });
+              }
+              return;
+            }
+            if (!bodyIsV5Medium) {
+              if (bodyIsV5 && bodySteps >= 24 && bodySteps <= 28) {
+                executeCleanup();
+                if (!res.headersSent) {
+                  return res.status(400).json({
+                    statusCode: 400,
+                    error: 'PARAMETRIC_LIMIT_EXCEEDED',
+                    message: 'Steps 24-28 on V5 Full (High) are prohibited on the free tier (battery deadband). Use <=23 steps, switch to Medium effort, or enable Anlas bypass.'
+                  });
+                }
+                return;
+              }
+              if (bodySteps > config.FIREWALL_MAX_STEPS) {
+                executeCleanup();
+                if (!res.headersSent) {
+                  return res.status(400).json({
+                    statusCode: 400,
+                    error: 'PARAMETRIC_LIMIT_EXCEEDED',
+                    message: `Steps count of ${bodySteps} exceeds the maximum limit of ${config.FIREWALL_MAX_STEPS} steps without Anlas bypass.`
+                  });
+                }
+                return;
+              }
+            }
+          }
+
+          if (bodyRefs > tierConfig.preciseLimit) {
+            executeCleanup();
+            if (!res.headersSent) {
+              return res.status(400).json({
+                statusCode: 400,
+                error: 'PARAMETRIC_LIMIT_EXCEEDED',
+                message: `Precise references count of ${bodyRefs} exceeds your max limit of ${tierConfig.preciseLimit}.`
+              });
+            }
+            return;
+          }
+
+          // Stage 7: Authoritative Cost Calculation (C_auth), Canary Drift, Hold Placement & V5 NCP Check
+          let costDetails;
+          try {
+            costDetails = auditEngine.calculateAnlasCostDetails(extractedParams, { isOpus: true });
+          } catch (costErr) {
+            executeCleanup();
+            if (!res.headersSent) {
+              return res.status(400).json({
+                statusCode: 400,
+                error: 'PARAMETRIC_LIMIT_EXCEEDED',
+                message: costErr.message
+              });
+            }
+            return;
+          }
+          cAuth = costDetails.total;
+
+          if (scrapedAnlas !== null && Math.abs(cAuth - scrapedAnlas) > 0) {
+            console.warn(
+              `[GuildWeave Telemetry Canary] Formula drift detected: Upstream UI reported ${scrapedAnlas}, server calculated ${cAuth}. Check upstream specification.`
+            );
+          }
+
+          // Ensure telemetry initialized if body turned out to require V5 or Anlas despite omitted headers
+          if ((bodyIsV5 || cAuth > 0) && req.telemetry && req.telemetry.lastFetched === 0) {
+            try {
+              await req.telemetry.ensureFresh();
+            } catch (telemetryErr) {
+              if (isConnectionAborted()) return;
+              if (req.telemetry.lastFetched === 0) {
+                executeCleanup();
+                if (!res.headersSent) {
+                  return res.status(503).json({
+                    statusCode: 503,
+                    error: 'TELEMETRY_FETCH_FAILED',
+                    message: 'Unable to verify master account capacity with upstream.'
+                  });
+                }
+                return;
+              }
+            }
+            if (isConnectionAborted()) return;
+            if (req.telemetry.lastFetched === 0) {
+              executeCleanup();
+              if (!res.headersSent) {
+                return res.status(503).json({
+                  statusCode: 503,
+                  error: 'TELEMETRY_UNAVAILABLE',
+                  message: 'Master subscription telemetry has not been initialized.'
+                });
+              }
+              return;
+            }
+          }
+
+          if (req.telemetry && req.telemetry.lastFetched > 0 && req.telemetry.subscriptionActive === false) {
+            executeCleanup();
+            if (!res.headersSent) {
+              return res.status(503).json({
+                statusCode: 503,
+                error: 'MASTER_SUBSCRIPTION_INACTIVE',
+                message: 'Master NovelAI Opus subscription is inactive or expired. Generation temporarily unavailable.'
+              });
+            }
+            return;
+          }
+
+          if (bodyIsV5 && !isVerifiedBasePaid && req.telemetry && req.telemetry.isHardLocked) {
+            executeCleanup();
+            if (!res.headersSent) {
+              return res.status(503).json({
+                statusCode: 503,
+                error: 'V5_BATTERY_CRITICAL',
+                message: `V5 generation is temporarily locked by the cluster circuit breaker (${req.telemetry.percent.toFixed(2)}% <= ${config.V5_CIRCUIT_BREAKER_PERCENT}%).`
+              });
+            }
+            return;
+          }
+
+          // Authoritative Anlas Authorization & Cross-Channel Hold Placement
+          if (cAuth > 0 || isVerifiedBasePaid || declaredAnlas > 0) {
+            if (
+              req.telemetry &&
+              req.telemetry.masterAnlas !== null &&
+              req.telemetry.masterAnlas !== undefined &&
+              req.telemetry.masterAnlas < cAuth
+            ) {
+              executeCleanup();
+              if (!res.headersSent) {
+                return res.status(503).json({
+                  statusCode: 503,
+                  error: 'MASTER_ANLAS_DEPLETED',
+                  message: `Master account Anlas balance (${req.telemetry.masterAnlas}) is insufficient for this generation (${cAuth} Anlas required).`
+                });
+              }
+              return;
+            }
+
+            const skipColdBootReset = Boolean(
+              req.telemetry &&
+              req.telemetry.lastFetched === 0 &&
+              req.telemetry.activeCycleEpoch === null
+            );
+            if (!skipColdBootReset) {
+              await auditEngine.evaluateAnlasReset(device.user_id, {
+                now: Date.now(),
+                activeCycleEpoch: req.telemetry?.activeCycleEpoch ?? null,
+                isGracePeriod: req.telemetry?.isGracePeriod ?? false,
+                subscriptionActive: req.telemetry?.subscriptionActive ?? true
+              });
+              if (isConnectionAborted()) return;
+            }
+
+            let anlasRejection = null;
+            await withUserAnlasAuthLock(device.user_id, async () => {
+              if (isConnectionAborted()) return;
+
+              const verifiedTask = queueManager.getProcessingTask(activeTask.req_id, browserId);
+              if (!verifiedTask) {
+                activeTask = null;
+                anlasRejection = {
+                  status: 403,
+                  payload: { statusCode: 403, message: 'Anlas Protection: Transaction queue verification lock lost.' }
+                };
+                return;
+              }
+              activeTask = verifiedTask;
+
+              const heldOtherAnlas = Math.max(0, queueManager.getHeldAnlasForUser(device.user_id) - (activeTask.held_cost || 0));
+              const spendAuth = await auditEngine.authorizeAnlasSpend(device.user_id, {
+                declaredAnlas,
+                requiredAnlas: cAuth,
+                isBasePaid: isVerifiedBasePaid,
+                heldAnlas: heldOtherAnlas
+              });
+              if (isConnectionAborted()) return;
+
+              const postAuthTask = queueManager.getProcessingTask(activeTask.req_id, browserId);
+              if (!postAuthTask) {
+                activeTask = null;
+                anlasRejection = {
+                  status: 403,
+                  payload: { statusCode: 403, message: 'Anlas Protection: Transaction queue verification lock lost.' }
+                };
+                return;
+              }
+              activeTask = postAuthTask;
+
+              if (!spendAuth.ok) {
+                anlasRejection = {
+                  status: spendAuth.status,
+                  payload: {
+                    statusCode: spendAuth.status,
+                    error: spendAuth.error,
+                    message: spendAuth.message
+                  }
+                };
+                return;
+              }
+
+              // Synchronous TOCTOU re-check before placing Channel A hold
+              if (spendAuth.virtual_balance !== Infinity) {
+                const latestOtherHeld = Math.max(0, queueManager.getHeldAnlasForUser(device.user_id) - (activeTask.held_cost || 0));
+                if ((spendAuth.virtual_balance - latestOtherHeld) < cAuth) {
+                  anlasRejection = {
+                    status: 403,
+                    payload: {
+                      statusCode: 403,
+                      error: 'INSUFFICIENT_ANLAS',
+                      message: `Insufficient virtual Anlas balance (${spendAuth.virtual_balance - latestOtherHeld} available after concurrent holds, ${cAuth} required).`
+                    }
+                  };
+                  return;
+                }
+              }
+
+              queueManager.setTaskHold(activeTask.req_id, browserId, { held_cost: cAuth });
+            });
+
+            if (isConnectionAborted()) return;
+            if (anlasRejection) {
+              executeCleanup();
+              if (!res.headersSent) {
+                return res.status(anlasRejection.status).json(anlasRejection.payload);
+              }
+              return;
+            }
+          }
+
+          // Authoritative V5 NCP Verification & Fallback Hold Upgrade (prevents /queue/join effort spoofing
+          // and closes personal NCP commit-boundary races via evaluateV5Accrual userMutationLocks serialization)
+          if (bodyIsV5 && !isVerifiedBasePaid) {
+            reqNcp = bodyIsV5Medium ? V5_MEDIUM_NCP_COST : V5_HIGH_NCP_COST;
+
+            if (device.user_id !== 'admin') {
+              // Surplus holds are authoritative in RAM via synchronous deductSurplusPool() at PoNR.
+              // Personal holds MUST always re-verify against SQLite via evaluateV5Accrual() so a
+              // tab-refresh replacing an in-flight PoNR task mid-commit cannot spend stale NCP.
+              const hasSufficientSurplusPreHold =
+                activeTask.held_ncp >= reqNcp &&
+                activeTask.held_ncp_source === 'surplus';
+
+              if (!hasSufficientSurplusPreHold) {
+                const accrual = await auditEngine.evaluateV5Accrual(device.user_id, {
+                  now: Date.now(),
+                  nominalDailyCompute: req.telemetry?.nominalDailyCompute ?? null
+                });
+                if (isConnectionAborted()) return;
+
+                const postAccrualTask = queueManager.getProcessingTask(activeTask.req_id, browserId);
+                if (!postAccrualTask) {
+                  activeTask = null;
+                  executeCleanup();
+                  if (!res.headersSent) {
+                    return res.status(403).json({
+                      statusCode: 403,
+                      message: 'Anlas Protection: Transaction queue verification lock lost.'
+                    });
+                  }
+                  return;
+                }
+                activeTask = postAccrualTask;
+
+                const personalBanked = accrual ? accrual.v5_banked_balance : 0;
+                if (personalBanked !== Infinity) {
+                  const existingPersonalHold = activeTask.held_ncp_source === 'personal' ? (activeTask.held_ncp || 0) : 0;
+                  const existingSurplusHold = activeTask.held_ncp_source === 'surplus' ? (activeTask.held_ncp || 0) : 0;
+
+                  const otherPersonalHeld = Math.max(0, queueManager.getHeldNcpForUser(device.user_id, 'personal') - existingPersonalHold);
+                  const availablePersonal = Math.max(0, personalBanked - otherPersonalHeld);
+
+                  if (availablePersonal >= reqNcp) {
+                    queueManager.setTaskHold(activeTask.req_id, browserId, {
+                      held_ncp: reqNcp,
+                      held_ncp_source: 'personal'
+                    });
+                  } else {
+                    const isSurplusEligible = Boolean(tierConfig && tierConfig.v5SurplusEligible);
+                    const otherSurplusHeld = Math.max(0, queueManager.getHeldSurplusNcp() - existingSurplusHold);
+                    const availableSurplus = Math.max(0, queueManager.getSurplusPool().pool - otherSurplusHeld);
+
+                    if (isSurplusEligible && availableSurplus >= reqNcp) {
+                      queueManager.setTaskHold(activeTask.req_id, browserId, {
+                        held_ncp: reqNcp,
+                        held_ncp_source: 'surplus'
+                      });
+                    } else {
+                      executeCleanup();
+                      if (!res.headersSent) {
+                        return res.status(429).json({
+                          statusCode: 429,
+                          error: 'V5_CAPACITY_DEPLETED',
+                          message: `Insufficient V5 compute capacity (${availablePersonal} personal NCP, ${isSurplusEligible ? availableSurplus : 0} eligible surplus NCP available; ${reqNcp} NCP required).`
+                        });
+                      }
+                      return;
+                    }
+                  }
+                }
+              }
+            }
+          }
+
+          // Final synchronous lock ownership verification and GPU TTL clock re-anchoring
+          const finalTaskCheck = queueManager.getProcessingTask(activeTask.req_id, browserId);
+          if (!finalTaskCheck) {
+            activeTask = null;
+            executeCleanup();
+            if (!res.headersSent) {
+              return res.status(403).json({
+                statusCode: 403,
+                message: 'Anlas Protection: Transaction queue verification lock lost prior to dispatch.'
+              });
+            }
+            return;
+          }
+          activeTask = finalTaskCheck;
+          queueManager.reanchorProcessingTimestamp(activeTask.req_id);
+        } else if (isVibeEncode) {
+          const currentVibeLock = textGenLockId ? queueManager.getTextLock(textGenLockId) : null;
+          if (!currentVibeLock) {
+            isTextGenClaimed = false;
+            executeCleanup();
+            if (!res.headersSent) {
+              return res.status(403).json({
+                statusCode: 403,
+                error: 'CHANNEL_B_LOCK_LOST',
+                message: 'Vibe encoding reservation lock was lost during upload.'
+              });
+            }
+            return;
+          }
+
+          // Dedicated image-presence validator (bypasses generation parameter extraction completely)
+          const vibeValidation = auditEngine.validateVibeEncodePayload(payloadBuffer, req.headers['content-type']);
+          if (!vibeValidation.ok) {
+            executeCleanup();
+            if (!res.headersSent) {
+              return res.status(400).json({
+                statusCode: 400,
+                error: 'INVALID_VIBE_PAYLOAD',
+                message: vibeValidation.reason
+              });
+            }
+            return;
+          }
         }
-      });
 
-      // Bilateral Mutual-Consent Diagnostic Telemetry Logging Gate
-      // Strictly enforces simultaneous dual-key condition: Client Active Consent AND Administrator Active Authorization.
-      const isClientConsenting = req.headers['x-debug-mode'] === 'true';
-      const isAdminAuthorized = (device.priority_tier === 'Admin') || queueManager.isDebugEnabled(browserId);
+        // Asynchronous Session Request Count Update (PoNR handles Anlas/NCP/ban governance synchronously)
+        setImmediate(async () => {
+          try {
+            await run('UPDATE devices SET total_requests = total_requests + 1, last_active_at = ? WHERE browser_id = ?', [Date.now(), browserId]);
+          } catch (err) {
+            console.error('[GuildWeave Audit] Background device telemetry update exception:', err);
+          }
+        });
 
-      if (isClientConsenting && isAdminAuthorized) {
-        console.log(`\n--- [GuildWeave Debug Telemetry] Untruncated Structured Payload (Client: "${browserId}") ---`);
-        console.log(auditEngine.formatPayloadForLogging(payloadBuffer, req.headers['content-type']));
-        console.log("------------------------------------------------------------------------------------\n");
-      }
+        // Bilateral Mutual-Consent Diagnostic Telemetry Logging Gate
+        // Strictly enforces simultaneous dual-key condition: Client Active Consent AND Administrator Active Authorization.
+        const isClientConsenting = req.headers['x-debug-mode'] === 'true';
+        const isAdminAuthorized = (device.priority_tier === 'Admin') || queueManager.isDebugEnabled(browserId);
 
-      const queryString = req.url.split('?')[1] || '';
-      const baseUrl = config.UPSTREAM_BASE_URL_TEMPLATE.replace('{subdomain}', subdomain);
-      const cleanPath = pathPart.replace(/^\/+/, '');
-      const upstreamUrl = `${baseUrl}/${cleanPath}${queryString ? '?' + queryString : ''}`;
+        if (isClientConsenting && isAdminAuthorized) {
+          console.log(`\n--- [GuildWeave Debug Telemetry] Untruncated Structured Payload (Client: "${browserId}") ---`);
+          console.log(auditEngine.formatPayloadForLogging(payloadBuffer, req.headers['content-type']));
+          console.log("------------------------------------------------------------------------------------\n");
+        }
 
-      const headers = { ...req.headers };
-      const parsedUpstream = new URL(upstreamUrl);
-      headers['host'] = parsedUpstream.host;
-      headers['authorization'] = `Bearer ${masterToken}`;
+        const queryString = req.url.split('?')[1] || '';
+        const baseUrl = config.UPSTREAM_BASE_URL_TEMPLATE.replace('{subdomain}', subdomain);
+        const cleanPath = pathPart.replace(/^\/+/, '');
+        const upstreamUrl = `${baseUrl}/${cleanPath}${queryString ? '?' + queryString : ''}`;
 
-      // WAF Shield: Strip length and metadata markers to recalculate Content-Length cleanly
-      const stripHeaders = [
-        'x-browser-id', 'x-request-id', 'x-gen-width', 'x-gen-height', 'x-gen-steps', 'x-gen-samples', 'x-debug-mode', 'x-script-version',
-        'x-gen-model', 'x-precise-refs', 'x-base-paid', 'x-declared-anlas', 'x-scraped-anlas', 'connection', 'content-length', 'transfer-encoding'
-      ];
-      stripHeaders.forEach(h => delete headers[h]);
+        const headers = { ...req.headers };
+        const parsedUpstream = new URL(upstreamUrl);
+        headers['host'] = parsedUpstream.host;
+        headers['authorization'] = `Bearer ${masterToken}`;
 
-      headers['content-length'] = payloadBuffer.length;
+        // WAF Shield: Strip length and metadata markers to recalculate Content-Length cleanly
+        const stripHeaders = [
+          'x-browser-id', 'x-request-id', 'x-gen-width', 'x-gen-height', 'x-gen-steps', 'x-gen-samples', 'x-debug-mode', 'x-script-version',
+          'x-gen-model', 'x-precise-refs', 'x-base-paid', 'x-declared-anlas', 'x-scraped-anlas', 'connection', 'content-length', 'transfer-encoding'
+        ];
+        stripHeaders.forEach(h => delete headers[h]);
 
-      console.log(`[GuildWeave Telemetry] Forwarding piped request upstream to NovelAI: ${upstreamUrl} (Body: ${payloadBuffer.length} bytes)`);
+        headers['content-length'] = payloadBuffer.length;
 
-      const transport = upstreamUrl.startsWith('https:') ? https : http;
+        console.log(`[GuildWeave Telemetry] Forwarding piped request upstream to NovelAI: ${upstreamUrl} (Body: ${payloadBuffer.length} bytes)`);
 
-      upstreamReq = transport.request(upstreamUrl, { method: req.method, headers }, async (upstreamRes) => {
-        console.log(`[GuildWeave Telemetry] Received upstream headers. Status: ${upstreamRes.statusCode}`);
+        const transport = upstreamUrl.startsWith('https:') ? https : http;
 
-        // Active Cleanup Invariant: Attach error/aborted/close listeners immediately before any async await
-        upstreamRes.on('error', (err) => {
-          console.error('[GuildWeave Telemetry] Upstream response stream error occurred:', err);
+        upstreamReq = transport.request(upstreamUrl, { method: req.method, headers }, async (upstreamRes) => {
+          console.log(`[GuildWeave Telemetry] Received upstream headers. Status: ${upstreamRes.statusCode}`);
+
+          // Active Cleanup Invariant: Attach error/aborted/close listeners immediately before any async await
+          upstreamRes.on('error', (err) => {
+            console.error('[GuildWeave Telemetry] Upstream response stream error occurred:', err);
+            executeCleanup();
+            if (!res.headersSent) {
+              res.status(502).json({
+                error: 'Upstream dynamic pipe disconnected',
+                reason: err.message,
+                code: err.code
+              });
+            } else {
+              res.destroy(err);
+            }
+          });
+
+          upstreamRes.on('aborted', () => {
+            console.warn('[GuildWeave Telemetry] Upstream response stream aborted by server');
+            executeCleanup();
+            res.destroy();
+          });
+
+          upstreamRes.on('close', () => {
+            if (!upstreamRes.complete) {
+              console.warn('[GuildWeave Telemetry] Upstream response socket closed prematurely before completion');
+              executeCleanup();
+              res.destroy();
+            }
+          });
+
+          // Stage 9: Point of No Return (PoNR) Settlement
+          // All Anlas SQLite debits + hold-clear execute under withUserAnlasAuthLock so
+          // post-200 client socket aborts cannot drop RAM holds while SQLite is mid-commit.
+          if (isVibeEncode) {
+            const vibeLock = textGenLockId ? queueManager.getTextLock(textGenLockId) : null;
+            if (upstreamRes.statusCode === 200) {
+              upstreamRes.pause();
+              await withUserAnlasAuthLock(device.user_id, async () => {
+                try {
+                  await auditEngine.commitAnlasDebit(device.user_id, VIBE_ENCODE_ANLAS_COST, browserId);
+                  console.log(`[GuildWeave Audit Ledger] Committed PoNR ${VIBE_ENCODE_ANLAS_COST} Anlas debit for vibe encode (User: "${device.user_id}").`);
+                } catch (debitErr) {
+                  console.error('[GuildWeave Audit] Failed to commit vibe encode Anlas debit:', debitErr);
+                } finally {
+                  if (vibeLock) {
+                    vibeLock.held_cost = 0;
+                  }
+                }
+              });
+
+              if (isConnectionAborted() || res.headersSent) {
+                try { upstreamRes.destroy(); } catch (_) {}
+                executeCleanup();
+                return;
+              }
+            } else if (vibeLock) {
+              // Pre-PoNR failure: release 2-Anlas hold immediately with zero charge
+              vibeLock.held_cost = 0;
+            }
+          } else if (isImageGen) {
+            if (upstreamRes.statusCode === 200) {
+              const settledAnlas = cAuth;
+              const settledNcp = (bodyIsV5 && !isVerifiedBasePaid && device.user_id !== 'admin') ? reqNcp : 0;
+              const settledNcpSource = (settledNcp > 0 && activeTask) ? activeTask.held_ncp_source : null;
+              const shouldDeductAllowance = Boolean(tierConfig && tierConfig.maxAllowance !== Infinity);
+
+              // Synchronous RAM settlement at PoNR:
+              // Clear surplus NCP hold in the same tick as deductSurplusPool() to avoid double-deduction,
+              // while retaining held_cost and personal held_ncp until SQLite commits finish under lock.
+              if (settledNcp > 0 && settledNcpSource === 'surplus') {
+                queueManager.deductSurplusPool(settledNcp);
+                if (activeTask) {
+                  queueManager.setTaskHold(activeTask.req_id, browserId, { held_ncp: 0 });
+                }
+              }
+              if (bodyIsV5 && req.telemetry && typeof req.telemetry.recordDispatch === 'function') {
+                req.telemetry.recordDispatch(extractedParams ? extractedParams.model : null, isVerifiedBasePaid);
+              }
+
+              if (settledAnlas > 0 || settledNcp > 0 || shouldDeductAllowance) {
+                upstreamRes.pause();
+
+                const runPoNRCommits = async () => {
+                  try {
+                    if (settledAnlas > 0) {
+                      await auditEngine.commitAnlasDebit(device.user_id, settledAnlas, browserId);
+                      console.log(`[GuildWeave Audit Ledger] Committed PoNR ${settledAnlas} Anlas debit (User: "${device.user_id}").`);
+                    }
+                    if (settledNcp > 0) {
+                      if (settledNcpSource === 'personal') {
+                        await auditEngine.commitV5Debit(device.user_id, settledNcp);
+                        console.log(`[GuildWeave Audit Ledger] Committed PoNR ${settledNcp} personal V5 NCP debit (User: "${device.user_id}").`);
+                      } else if (settledNcpSource === 'surplus') {
+                        await auditEngine.recordSurplusV5Usage(device.user_id);
+                        await run(
+                          "INSERT OR REPLACE INTO config (key, value) VALUES ('v5_surplus_pool', ?)",
+                          [String(queueManager.getSurplusPool().pool)]
+                        );
+                        console.log(`[GuildWeave Audit Ledger] Committed PoNR ${settledNcp} surplus V5 NCP deduction (User: "${device.user_id}", Pool Remaining: ${queueManager.getSurplusPool().pool}).`);
+                      }
+                    }
+                    if (shouldDeductAllowance) {
+                      const remaining = await auditEngine.getOrUpdateAllowance(device.user_id, device.priority_tier, true);
+                      console.log(`[GuildWeave Audit Ledger] Deducted 1 token for User "${device.user_id}" (${device.priority_tier}). Remaining balance: ${remaining}`);
+                    }
+                  } catch (commitErr) {
+                    console.error('[GuildWeave Audit] Failed to commit PoNR settlement:', commitErr);
+                  } finally {
+                    if (activeTask) {
+                      queueManager.clearTaskHold(activeTask.req_id, browserId);
+                    }
+                  }
+                };
+
+                if (settledAnlas > 0) {
+                  await withUserAnlasAuthLock(device.user_id, runPoNRCommits);
+                } else {
+                  await runPoNRCommits();
+                }
+
+                if (isConnectionAborted() || res.headersSent) {
+                  try { upstreamRes.destroy(); } catch (_) {}
+                  executeCleanup();
+                  return;
+                }
+              } else if (activeTask) {
+                queueManager.clearTaskHold(activeTask.req_id, browserId);
+              }
+            } else if (activeTask) {
+              // Pre-PoNR failure (non-200): release holds immediately with 0 debit
+              queueManager.clearTaskHold(activeTask.req_id, browserId);
+            }
+          }
+
+          req.socket.setNoDelay(true);
+
+          if (cleanPath === 'ai/generate-image-stream' || cleanPath === 'ai/generate-stream' || cleanPath === 'oa/v1/completions') {
+            upstreamRes.headers['x-accel-buffering'] = 'no';
+            upstreamRes.headers['cache-control'] = 'no-cache, no-transform';
+          }
+
+          res.writeHead(upstreamRes.statusCode, upstreamRes.headers);
+          upstreamRes.pipe(res);
+        });
+
+        upstreamReq.on('error', (err) => {
+          console.error('[GuildWeave Telemetry] Upstream connection socket exception occurred:', err);
+          if (isImageGen && activeTask) {
+            queueManager.clearTaskHold(activeTask.req_id, browserId);
+          }
           executeCleanup();
           if (!res.headersSent) {
-            res.status(502).json({
+            res.status(502).json({ 
               error: 'Upstream dynamic pipe disconnected',
               reason: err.message,
               code: err.code
             });
           } else {
+            // Mid-Stream Invariant: Violently destroy response stream so client socket is never left hanging
             res.destroy(err);
           }
         });
 
-        upstreamRes.on('aborted', () => {
-          console.warn('[GuildWeave Telemetry] Upstream response stream aborted by server');
-          executeCleanup();
-          res.destroy();
-        });
-
-        upstreamRes.on('close', () => {
-          if (!upstreamRes.complete) {
-            console.warn('[GuildWeave Telemetry] Upstream response socket closed prematurely before completion');
-            executeCleanup();
-            res.destroy();
-          }
-        });
-
-        // Channel B `/ai/encode-vibe` Point of No Return (PoNR) Settlement
-        if (isVibeEncode) {
-          const vibeLock = textGenLockId ? queueManager.getTextLock(textGenLockId) : null;
-          if (upstreamRes.statusCode === 200) {
-            upstreamRes.pause();
-            try {
-              await auditEngine.commitAnlasDebit(device.user_id, VIBE_ENCODE_ANLAS_COST, browserId);
-              console.log(`[GuildWeave Audit Ledger] Committed PoNR ${VIBE_ENCODE_ANLAS_COST} Anlas debit for vibe encode (User: "${device.user_id}").`);
-            } catch (debitErr) {
-              console.error('[GuildWeave Audit] Failed to commit vibe encode Anlas debit:', debitErr);
-            } finally {
-              if (vibeLock) {
-                vibeLock.held_cost = 0;
-              }
-            }
-
-            if (res.destroyed || res.writableEnded || res.headersSent) {
-              try { upstreamRes.destroy(); } catch (_) {}
-              executeCleanup();
-              return;
-            }
-          } else if (vibeLock) {
-            // Pre-PoNR failure: release 2-Anlas hold immediately with zero charge
-            vibeLock.held_cost = 0;
-          }
+        upstreamReq.setNoDelay(true);
+        if (activeTask) {
+          queueManager.attachUpstreamRequest(activeTask.req_id, upstreamReq);
         }
 
-        const tierConfig = config.TIER_CONFIGS[device.priority_tier];
-        if (upstreamRes.statusCode === 200 && isImageGen) {
-          if (genModelHeader === 'V5' && req.telemetry && typeof req.telemetry.recordDispatch === 'function') {
-            req.telemetry.recordDispatch(extractedModel, false);
-          }
-
-          if (tierConfig && tierConfig.maxAllowance !== Infinity) {
-            setImmediate(async () => {
-              try {
-                // Deduct allowance from canonical user_id (affects all user devices synchronously)
-                const remaining = await auditEngine.getOrUpdateAllowance(device.user_id, device.priority_tier, true);
-                console.log(`[GuildWeave Audit Ledger] Deducted 1 token for User "${device.user_id}" (${device.priority_tier}). Remaining balance: ${remaining}`);
-              } catch (err) {
-                console.error('[GuildWeave Audit] Failed to deduct metered token:', err);
-              }
-            });
-          }
-        }
-
-        req.socket.setNoDelay(true);
-
-        if (cleanPath === 'ai/generate-image-stream' || cleanPath === 'ai/generate-stream' || cleanPath === 'oa/v1/completions') {
-          upstreamRes.headers['x-accel-buffering'] = 'no';
-          upstreamRes.headers['cache-control'] = 'no-cache, no-transform';
-        }
-
-        res.writeHead(upstreamRes.statusCode, upstreamRes.headers);
-        upstreamRes.pipe(res);
-      });
-
-      upstreamReq.on('error', (err) => {
-        console.error('[GuildWeave Telemetry] Upstream connection socket exception occurred:', err);
+        upstreamReq.write(payloadBuffer);
+        upstreamReq.end();
+      } catch (endErr) {
+        console.error('[GuildWeave Telemetry] Fatal exception inside req.end settlement pipeline:', endErr);
         executeCleanup();
-        if (!res.headersSent) {
-          res.status(502).json({ 
-            error: 'Upstream dynamic pipe disconnected',
-            reason: err.message,
-            code: err.code
-          });
-        } else {
-          // Mid-Stream Invariant: Violently destroy response stream so client socket is never left hanging
-          res.destroy(err);
+        if (!res.headersSent && !res.destroyed) {
+          res.status(500).json({ error: 'Proxy processing failure.' });
         }
-      });
-
-      upstreamReq.setNoDelay(true);
-      if (activeTask) {
-        queueManager.attachUpstreamRequest(activeTask.req_id, upstreamReq);
       }
-
-      upstreamReq.write(payloadBuffer);
-      upstreamReq.end();
     });
 
   } catch (err) {

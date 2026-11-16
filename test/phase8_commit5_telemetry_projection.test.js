@@ -18,12 +18,12 @@
  *    - Verifies `{ percent: 4.5, isNegative: true }` resolves to rawProjected = -4.5% and trips circuit breaker.
  *    - Verifies `queueManager.getProjectedBatteryPercent()` receives clamped 0 (never negative/null),
  *      clearing stale Bucket 2 `v5SurplusPool` to 0 on 24h sweep instead of freezing stale compute.
- * 4. Hell Path: Edge Circuit Breaker Lockdown (`HTTP 503 V5_BATTERY_CRITICAL`) & Premature Bypass Rejection:
+ * 4. Hell Path: Edge Circuit Breaker Lockdown (`HTTP 503 V5_BATTERY_CRITICAL`) & Forged Bypass Rejection:
  *    - Drives projected capacity down to <= 5.5% via weighted local V5 dispatches across HTTP `/proxy/image/*`.
  *    - Asserts subsequent V5 requests immediately return `HTTP 503 V5_BATTERY_CRITICAL`
  *      with zero bytes hitting upstream NovelAI.
- *    - Asserts forged `X-Base-Paid: true` headers on free-limit payloads are rejected (`400 BASE_PAID_UNSUPPORTED`)
- *      until Commit 8 Anlas billing lands, never bypassing the circuit breaker.
+ *    - Asserts forged `X-Base-Paid: true` headers on free-limit payloads are rejected (`400 PARAMETRIC_LIMIT_EXCEEDED`)
+ *      without bypassing the circuit breaker or reaching upstream.
  *    - Asserts legacy/V4 requests (`X-Gen-Model: legacy`) pass through untouched (`200 OK`).
  *    - Asserts `recordV5Dispatch(model, true)` unit contract exempts verified base-paid dispatches.
  * 5. Hell Path: Cloudflare 429 Cooldown Protection & Atomic Bucket 2 SQLite Persistence Resilience:
@@ -312,7 +312,7 @@ test('Phase 8 Commit 5: Dynamic Telemetry Harvester, Projection & Circuit Breake
   // ---------------------------------------------------------------------------
   // 4. HELL PATH: CIRCUIT BREAKER LOCKDOWN AT 5.5% & BYPASS SPOOFING DENIAL
   // ---------------------------------------------------------------------------
-  await t.test('Hell Path: Weighted dispatches trip 5.5% circuit breaker, reject premature X-Base-Paid=true spoofs, and spare legacy', async () => {
+  await t.test('Hell Path: Weighted dispatches trip 5.5% circuit breaker, reject forged X-Base-Paid=true spoofs, and spare legacy', async () => {
     generationHits = 0;
 
     // Seed upstream at 5.60% (just above 5.5% breaker) and sync via HTTP mock
@@ -409,7 +409,7 @@ test('Phase 8 Commit 5: Dynamic Telemetry Harvester, Projection & Circuit Breake
     assert.strictEqual(resExact55.data.error, 'V5_BATTERY_CRITICAL');
     queueManager.complete('req_exact_55', 'dev_c5');
 
-    // 6. Security Invariant: Forged X-Base-Paid=true header must NOT bypass circuit breaker prior to Commit 8 Anlas billing
+    // 6. Security Invariant: Forged X-Base-Paid=true header on free geometry must NEVER bypass circuit breaker
     queueManager.join({ browser_id: 'dev_c5', req_id: 'req_forged_base_paid', user_id: 'u_commit5', priority_tier: 'Normal' });
     const resForgedBasePaid = await queryGateway('/proxy/image/ai/generate-image', 'POST', {
       'Authorization': 'Bearer sec_c5',
@@ -422,8 +422,8 @@ test('Phase 8 Commit 5: Dynamic Telemetry Harvester, Projection & Circuit Breake
       'X-Gen-Model': 'V5',
       'X-Base-Paid': 'true'
     }, { model: 'nai-diffusion-5-full', parameters: { width: 1024, height: 1024, steps: 23, n_samples: 1 } });
-    assert.strictEqual(resForgedBasePaid.status, 400, 'Premature X-Base-Paid=true bypass must be rejected fail-closed');
-    assert.strictEqual(resForgedBasePaid.data.error, 'BASE_PAID_UNSUPPORTED');
+    assert.strictEqual(resForgedBasePaid.status, 400, 'Forged X-Base-Paid=true bypass on free geometry must be rejected fail-closed');
+    assert.strictEqual(resForgedBasePaid.data.error, 'PARAMETRIC_LIMIT_EXCEEDED');
     assert.strictEqual(generationHits, hitsBeforeBlocked, 'Forged X-Base-Paid=true must never reach upstream');
     queueManager.complete('req_forged_base_paid', 'dev_c5');
 
