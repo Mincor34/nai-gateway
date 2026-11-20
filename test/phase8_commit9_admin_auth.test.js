@@ -36,9 +36,12 @@
  *    - Partial paydown (`credit_amount: 50` on `-120` debt -> `-70`), `cap_at_zero: true` clamping excess
  *      credit at `0`, full forgiveness (`0`), clearing `DEBT_LOCKED` state, unlimited-tier immunity,
  *      and refusal to wipe/lower an already positive Anlas balance.
- * 6. Hell Path: Security Hardening, Input Validation, Auth Guards, Query Arrays & Unban Cleanup:
+ * 6. Hell Path: Security Hardening, Input Validation, Token Normalization & Immediate Telemetry Refresh, Auth Guards, Query Arrays & Unban Cleanup:
  *    - Rejects `POST /auth/register` claiming reserved `browser_id: 'admin'` (`400`) or hijacking
  *      an existing non-browser canonical principal (`409`), and trims whitespace-padded `b_` IDs cleanly.
+ *    - Strips leading `Bearer ` prefix from `POST /admin/update-token`, rejects `"Bearer   "` (`400`),
+ *      immediately clears an inactive/non-Opus lockout in RAM without waiting 30m or restarting PM2,
+ *      and verifies `syncTelemetry()` strips legacy `Bearer ` prefixes already persisted in SQLite.
  *    - Rejects non-boolean `enabled` (`"false"`) on `POST /auth/debug-intent` (`400`) and whitespace
  *      `browser_id` on `POST /admin/debug-target` (`400`).
  *    - Ensures invalid `device_secret` on `GET /auth/status` returns `401` without marking device online.
@@ -83,10 +86,12 @@ function cleanupFiles() {
 cleanupFiles();
 
 const DEFAULT_SUB_EXPIRES = Math.floor(Date.now() / 1000) + (25 * 86400);
+let lastSubAuthHeader = null;
 
 const mockUpstream = http.createServer((req, res) => {
   const parsedUrl = new URL(req.url, `http://${req.headers.host}`);
   if (parsedUrl.pathname === '/user/subscription') {
+    lastSubAuthHeader = req.headers['authorization'];
     res.writeHead(200, { 'Content-Type': 'application/json' });
     return res.end(JSON.stringify({
       tier: 3,
@@ -662,10 +667,9 @@ test('Phase 8 Commit 9: Administrative Telemetry, Governance & Dual-Ledger Statu
   });
 
   // ---------------------------------------------------------------------------
-  // 6. HELL PATH: SECURITY, VALIDATION, AUTH GUARDS, QUERY ARRAYS & UNBAN CLEANUP
+  // 6. HELL PATH: SECURITY, TOKEN NORMALIZATION, VALIDATION, AUTH GUARDS & UNBAN CLEANUP
   // ---------------------------------------------------------------------------
-  await t.test('Hell Path: Enforces reserved IDs, hijack guards, presence auth, validation, query-array safety & unban cleanup', async () => {
-    // 1. Reserved principal 'admin' cannot be claimed via /auth/register
+  await t.test('Hell Path: Enforces reserved IDs, token Bearer normalization & immediate telemetry refresh, hijack guards, validation & unban cleanup', async () => {
     for (const reservedId of ['admin', 'ADMIN', '  admin  ']) {
       const regAdminRes = await queryGateway('/auth/register', 'POST', {}, {
         browser_id: reservedId,
@@ -709,7 +713,43 @@ test('Phase 8 Commit 9: Administrative Telemetry, Governance & Dual-Ledger Statu
     });
     assert.strictEqual(reRegRes.status, 200, 'Pruned unlinked b_ device must be able to re-register');
 
-    // 2. Unauthenticated /auth/status must NOT mark an offline device online
+    // Token normalization: POST /admin/update-token strips leading "Bearer " prefix, rejects empty prefix,
+    // and immediately clears an inactive non-Opus subscription lockout without waiting 30m or restarting PM2
+    serverModule.applyUsageTelemetry({
+      tier: 0,
+      active: false,
+      expiresAt: 0,
+      trainingStepsLeft: { fixedTrainingStepsLeft: 0, purchasedTrainingSteps: 2995 },
+      isGracePeriod: false,
+      usage: null
+    }, undefined, Date.now());
+    assert.strictEqual(serverModule.getTelemetrySnapshot().subscriptionActive, false);
+
+    assert.strictEqual(
+      (await queryGateway('/admin/update-token', 'POST', adminHeaders, { master_token: 'Bearer   ' })).status,
+      400
+    );
+    const bearerUpdateRes = await queryGateway('/admin/update-token', 'POST', adminHeaders, {
+      master_token: '  bearer   normalized_master_jwt  '
+    });
+    assert.strictEqual(bearerUpdateRes.status, 200);
+    const storedTok = await dbModule.get("SELECT value FROM config WHERE key = 'master_token'");
+    assert.strictEqual(storedTok.value, 'normalized_master_jwt', 'Must strip leading Bearer prefix before storing master_token');
+    assert.strictEqual(lastSubAuthHeader, 'Bearer normalized_master_jwt', 'Pushing fresh token must immediately refresh upstream telemetry');
+
+    const postPushStats = await queryGateway('/admin/global-stats', 'GET', adminHeaders);
+    assert.strictEqual(postPushStats.status, 200);
+    assert.strictEqual(postPushStats.data.telemetry.subscription_active, true, 'Inactive subscription state must clear immediately on token push');
+    assert.ok(
+      postPushStats.data.telemetry.master_v5_percent >= 80 && postPushStats.data.telemetry.master_v5_percent < 80.01,
+      `Expected continuous projection ~80%, got ${postPushStats.data.telemetry.master_v5_percent}`
+    );
+
+    // Legacy DB value with embedded Bearer prefix is also stripped defensively by syncTelemetry()
+    await dbModule.run("INSERT OR REPLACE INTO config (key, value) VALUES ('master_token', 'Bearer legacy_prefixed_jwt')");
+    await serverModule.syncTelemetry({ rescheduleHeartbeat: false });
+    assert.strictEqual(lastSubAuthHeader, 'Bearer legacy_prefixed_jwt', 'Must never transmit Bearer Bearer upstream');
+
     queueManager.reset();
     assert.strictEqual(queueManager.isDeviceOnline('dev_alice_2'), false);
     const badAuthStatus = await queryGateway('/auth/status?browser_id=dev_alice_2', 'GET', {

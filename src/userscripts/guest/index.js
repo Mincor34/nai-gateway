@@ -1,27 +1,18 @@
 /**
  * GUILDWEAVE GATEWAY COORDINATOR (GUEST CLIENT)
- * Architecture Level 4: Client State Coordinator, Telemetry HUD, & Settings Portal
+ * Architecture Level 4: Client State Coordinator, Dual-Ledger Telemetry HUD, & Settings Portal
  *
- * Implements client-side metadata spoofing (Opus subscription mapping) and 
- * redirects generation operations to the GuildWeave gateway.
+ * Implements client-side metadata spoofing (Opus subscription mapping), dual-ledger HUD rendering
+ * (Virtual Anlas balance + debt lockouts + V5 NCP personal bank + cluster surplus + battery ETA),
+ * Anlas Bypass toggle governance, and redirects generation operations to the GuildWeave gateway.
  *
  * PROCESS FLOW:
  * 1. Generates unique identities and stores them in sandbox memory (GM_setValue).
  * 2. Authenticates queries using bearer token parameters.
  * 3. Hijacks unsafeWindow.fetch calls to mock tier-specific capabilities.
- * 4. Extends image request lifecycles to complete validation queue phases 
- *    before passing raw data streams up to the secure GuildWeave server.
+ * 4. Polls `/auth/status` to keep Rolling Allowance, V5 NCP bank, cluster surplus, battery ETA,
+ *    and Anlas debt lockouts synchronized across HUD and settings modal.
  * 5. Manages in-band diagnostic intent signaling over the bilateral consent gate.
- *
- * DESIGN PRINCIPLES:
- * 1. Dedicated Single Presentation Portal: Eliminates redundant user settings sidebar tabs, centralizing
- *    all guest configurations into the modal invoked strictly by #gw-nav-badge and styled using NovelAI CSS variables.
- * 2. Complete HUD Self-Service: Preserves full visibility of Anlas balances, generation limits,
- *    refill countdowns, hardware footprint links, and gateway destination settings.
- * 3. Strict Input Defense: Client-side regex sanitization prevents malformed nicknames from hitting SQLite.
- * 4. High-Frequency UI Enforcement: Fights React SPA DOM purges by holding a 50ms verification
- *    loop during zero-state onboarding.
- * 5. Dynamic Design-Token Harmonization: Automatically applies NovelAI CSS custom properties.
  */
 
 'use strict';
@@ -32,6 +23,11 @@ import {
   injectWarningBadge,
   removeWarningBadge,
   updateAllowanceBar,
+  updateDualLedgerHud,
+  refreshDualLedgerHud,
+  syncUIControlConstraints,
+  getClientPolicyState,
+  setClientPolicyState,
   initDOMObserver
 } from '../shared/ui.js';
 import { initInterceptor } from '../shared/interceptor.js';
@@ -42,6 +38,8 @@ let browserId = GM_getValue("browser_id");
 let deviceSecret = GM_getValue("device_secret");
 let approved = GM_getValue("approved", false);
 let VPS_HOST = GM_getValue("vps_host", "");
+
+const DEFAULT_BYPASS_HINT = 'Allows >1MP, >1 sample, or >28 steps using Virtual Anlas. V5 High steps 24-28 remain locked on free tier.';
 
 try {
     if (!browserId || !deviceSecret) {
@@ -58,16 +56,13 @@ try {
     console.error("GuildWeave (Guest): Storage initialization crash:", err);
 }
 
-// High-frequency UI enforcement loop (forces UI overlay to stay mounted and visible)
-// React's virtual DOM reconciliation frequently cleans unmanaged nodes during SPA boot;
-// this 50ms polling loop forces the setup wizard back into the DOM until registration completes.
 let enforcementInterval = null;
 
 function startUIEnforcement() {
     if (enforcementInterval) return;
     console.log("GuildWeave (Guest): Starting high-frequency UI enforcement loop...");
     enforcementInterval = setInterval(() => {
-        if (!document.body) return; // Wait for body to be constructed
+        if (!document.body) return;
 
         let overlay = document.getElementById("vps-approval-overlay");
         if (!overlay) {
@@ -153,7 +148,6 @@ function renderSetupWizard(container) {
         step1Status.innerHTML = "Connecting to server...";
 
         try {
-            // Connection evaluation ping targeting the gateway authorization endpoint
             const res = await backgroundRequest({
                 method: "GET",
                 url: `${val}/auth/status?browser_id=ping`
@@ -230,7 +224,6 @@ function renderSetupWizard(container) {
             <style>@keyframes vpsFader { 0% { opacity: 0.3; } 100% { opacity: 1; } }</style>
         `;
 
-        // Verification short-polling loop
         const checkAuth = async () => {
             try {
                 const res = await backgroundRequest({
@@ -245,7 +238,6 @@ function renderSetupWizard(container) {
                         window.location.reload();
                     }
                 } else if (res.status === 401) {
-                    // Server deleted this device. Silently re-register to re-appear in the admin panel.
                     console.warn("GuildWeave (Guest): Server returned 401 during poll. Re-registering silently...");
                     const nickname = GM_getValue("device_nickname", "Guest");
                     backgroundRequest({
@@ -291,6 +283,28 @@ function renderSetupWizard(container) {
 if (!approved || !VPS_HOST) {
     startUIEnforcement();
 } else {
+    async function pollTelemetryState() {
+        if (!document.getElementById("gw-allowance-bar")) return;
+        try {
+            const res = await backgroundRequest({
+                method: "GET",
+                url: `${VPS_HOST}/auth/status?browser_id=${browserId}`,
+                headers: { "Authorization": `Bearer ${deviceSecret}` }
+            });
+            if (res.status === 200) {
+                const data = JSON.parse(res.responseText);
+                if (data.session) {
+                    updateAllowanceBar(data.session.allowance, data.session.max, data.session.next_refill_in);
+                } else {
+                    updateAllowanceBar(null, Infinity, 0);
+                }
+                updateDualLedgerHud(data);
+            }
+        } catch (e) {
+            console.error("GuildWeave (Guest): Failed to poll session state", e);
+        }
+    }
+
     initInterceptor({ 
         browserId, 
         deviceSecret, 
@@ -308,34 +322,13 @@ if (!approved || !VPS_HOST) {
                     window.location.reload();
                 }
             });
-        }
+        },
+        onTelemetryRefresh: pollTelemetryState
     });
 
-    // Background Telemetry Poller: updates the allowance bar when mounted
     function startStatePolling() {
-        const poll = async () => {
-            // Defensively exit if the allowance bar is not mounted in the current viewport
-            if (!document.getElementById("gw-allowance-bar")) return;
-            try {
-                const res = await backgroundRequest({
-                    method: "GET",
-                    url: `${VPS_HOST}/auth/status?browser_id=${browserId}`,
-                    headers: { "Authorization": `Bearer ${deviceSecret}` }
-                });
-                if (res.status === 200) {
-                    const data = JSON.parse(res.responseText);
-                    if (data.session) {
-                        updateAllowanceBar(data.session.allowance, data.session.max, data.session.next_refill_in);
-                    } else {
-                        updateAllowanceBar(null, Infinity, 0);
-                    }
-                }
-            } catch (e) {
-                console.error("GuildWeave (Guest): Failed to poll session state", e);
-            }
-        };
         // Schedule interval cleanly without an unprompted top-level synchronous execution
-        setInterval(poll, 10000);
+        setInterval(pollTelemetryState, 10000);
     }
 
     /**
@@ -387,8 +380,8 @@ if (!approved || !VPS_HOST) {
     }
 
     /**
-     * Renders the complete guest settings dashboard matching NovelAI design system tokens.
-     * Mounts DOM elements synchronously and hydrates telemetry asynchronously.
+     * Renders the complete guest settings dashboard matching NovelAI design system tokens
+     * and exposing dual-ledger telemetry, debt lockout status, and Anlas Bypass toggle.
      *
      * @param {HTMLElement} container - Mount destination.
      * @param {Function} [onClose] - Close callback.
@@ -399,6 +392,8 @@ if (!approved || !VPS_HOST) {
         const debugActive = GM_getValue("debug_mode", false);
         const imageCount = GM_getValue("count_image_gens", 0);
         const textCount = GM_getValue("count_text_gens", 0);
+        const policyState = getClientPolicyState();
+        const bypassChecked = Boolean(policyState.bypassEnabled) && !policyState.isInDebt;
 
         container.innerHTML = `
             <div style="display:flex; justify-content:space-between; align-items:center; border-bottom:1px solid var(--theme-bg2, #333); padding-bottom:10px; margin-bottom:12px;">
@@ -407,14 +402,30 @@ if (!approved || !VPS_HOST) {
             </div>
 
             <div style="background:var(--theme-bg1, #111); padding:12px; border-radius:6px; margin-bottom:12px; border:1px solid var(--theme-bg2, #333); font-size:11px; line-height:1.6;">
-                <label style="display:block; font-size:9px; color:var(--theme-textSecondary, #888); font-weight:bold; margin-bottom:6px; text-transform:uppercase;">Guest Telemetry & Profile</label>
+                <label style="display:block; font-size:9px; color:var(--theme-textSecondary, #888); font-weight:bold; margin-bottom:6px; text-transform:uppercase;">Guest Telemetry & Dual-Ledger Profile</label>
                 <div style="display:grid; grid-template-columns:1fr 1fr; gap:8px;">
                     <div>Assigned Tier: <span id="guest-assigned-tier" style="color:var(--theme-accent, #00bc8c); font-weight:bold;">Loading...</span></div>
                     <div>Precise Ref Limit: <span id="guest-precise-limit" style="color:var(--theme-warning, #f39c12); font-weight:bold;">Loading...</span></div>
-                    <div>Anlas Consumed: <span id="guest-anlas-consumed" style="color:var(--theme-error, #e74c3c); font-weight:bold;">0 Anlas</span></div>
+                    <div>Virtual Anlas: <span id="guest-virtual-anlas" style="color:var(--theme-accent, #00bc8c); font-weight:bold;">Loading...</span></div>
+                    <div>V5 Bank (NCP): <span id="guest-v5-bank" style="color:var(--theme-accent, #00bc8c); font-weight:bold;">Loading...</span></div>
+                    <div>Cluster Surplus: <span id="guest-v5-surplus" style="font-weight:bold;">Loading...</span></div>
+                    <div>Master V5 Battery: <span id="guest-v5-battery" style="font-weight:bold;">Loading...</span></div>
+                    <div>Cycle Consumed: <span id="guest-period-usage" style="font-weight:bold;">0A / 0 V5</span></div>
+                    <div>Lifetime Anlas: <span id="guest-anlas-consumed" style="color:var(--theme-error, #e74c3c); font-weight:bold;">0 Anlas</span></div>
                     <div>Rolling Allowance: <span id="guest-rolling-allowance" style="font-weight:bold;">Loading...</span></div>
-                    <div>Image Gens: <span style="font-weight:bold;">${imageCount}</span></div>
-                    <div>Text Gens: <span style="font-weight:bold;">${textCount}</span></div>
+                    <div>Local Gens (I / T): <span style="font-weight:bold;">${imageCount} / ${textCount}</span></div>
+                </div>
+            </div>
+
+            <div style="background:var(--theme-bg1, #111); padding:10px; border-radius:6px; margin-bottom:12px; border:1px solid var(--theme-bg2, #333); font-size:11px;">
+                <label style="display:flex; align-items:center; gap:8px; cursor:pointer; font-weight:bold; color:var(--theme-warning, #f39c12);">
+                    <input type="checkbox" id="settings-anlas-bypass" ${bypassChecked ? 'checked' : ''} ${policyState.isInDebt ? 'disabled' : ''} style="cursor:pointer;">
+                    Enable Anlas Bypass (High-Res / Steps / Samples)
+                </label>
+                <div id="settings-bypass-status" style="font-size:10px; color:var(--theme-textSecondary, #999); margin-top:4px; line-height:1.4;">
+                    ${policyState.isInDebt
+                        ? `<span style="color:var(--theme-error, #e74c3c); font-weight:bold;">Anlas Balance: ${policyState.virtualBalance} (Bypass Locked)</span>`
+                        : DEFAULT_BYPASS_HINT}
                 </div>
             </div>
 
@@ -460,6 +471,23 @@ if (!approved || !VPS_HOST) {
             if (closeBtn) closeBtn.onclick = onClose;
         }
 
+        const bypassToggle = container.querySelector("#settings-anlas-bypass");
+        const bypassStatusEl = container.querySelector("#settings-bypass-status");
+        if (bypassToggle) {
+            bypassToggle.onchange = () => {
+                const latest = getClientPolicyState();
+                if (latest.isInDebt) {
+                    bypassToggle.checked = false;
+                    bypassToggle.disabled = true;
+                    return;
+                }
+                const checked = Boolean(bypassToggle.checked);
+                GM_setValue("anlas_bypass_enabled", checked);
+                setClientPolicyState({ bypassEnabled: checked });
+                refreshDualLedgerHud();
+            };
+        }
+
         // Asynchronous Telemetry Hydration
         if (domain && deviceSecret) {
             backgroundRequest({
@@ -469,13 +497,68 @@ if (!approved || !VPS_HOST) {
             }).then(res => {
                 if (res.status === 200) {
                     const data = JSON.parse(res.responseText);
+                    updateDualLedgerHud(data);
+
                     const tierEl = container.querySelector("#guest-assigned-tier");
                     if (tierEl) tierEl.textContent = data.tier || "Normal";
                     const refEl = container.querySelector("#guest-precise-limit");
                     if (refEl) refEl.textContent = data.precise_limit === "Unlimited" ? "Unlimited" : `${data.precise_limit} Refs`;
                     const anlasEl = container.querySelector("#guest-anlas-consumed");
                     if (anlasEl) anlasEl.textContent = `${data.anlas_consumed || 0} Anlas`;
-                    
+
+                    const virtualEl = container.querySelector("#guest-virtual-anlas");
+                    if (virtualEl && data.anlas) {
+                        if (data.anlas.is_unlimited) {
+                            virtualEl.textContent = "Unlimited";
+                        } else if (data.anlas.is_in_debt) {
+                            virtualEl.innerHTML = `<span style="color:var(--theme-error, #e74c3c);">${data.anlas.virtual_balance} (DEBT LOCKED)</span>`;
+                        } else {
+                            virtualEl.textContent = `${data.anlas.available_balance}/${data.anlas.monthly_quota} (No Rollover)`;
+                        }
+                    }
+
+                    const v5BankEl = container.querySelector("#guest-v5-bank");
+                    if (v5BankEl && data.v5) {
+                        v5BankEl.textContent = data.v5.is_unlimited
+                            ? "Unlimited"
+                            : `${data.v5.available_ncp}/${data.v5.max_bank_ncp ?? data.v5.banked_ncp} NCP`;
+                    }
+
+                    const surplusEl = container.querySelector("#guest-v5-surplus");
+                    if (surplusEl && data.v5) {
+                        surplusEl.textContent = data.v5.surplus_eligible
+                            ? `${data.v5.surplus_available_ncp ?? 0} NCP`
+                            : "Ineligible";
+                    }
+
+                    const batteryEl = container.querySelector("#guest-v5-battery");
+                    if (batteryEl && data.telemetry) {
+                        const pct = typeof data.telemetry.master_v5_percent === 'number'
+                            ? `${data.telemetry.master_v5_percent.toFixed(1)}%`
+                            : '--%';
+                        const eta = typeof data.telemetry.next_percent_eta_ms === 'number' && data.telemetry.next_percent_eta_ms > 0
+                            ? ` (+1% in ${(data.telemetry.next_percent_eta_ms / 60000).toFixed(1)}m)`
+                            : '';
+                        batteryEl.textContent = `${pct} [${data.telemetry.cluster_state || 'ok'}]${eta}`;
+                    }
+
+                    const periodEl = container.querySelector("#guest-period-usage");
+                    if (periodEl && data.subscription_period) {
+                        periodEl.textContent = `${data.subscription_period.anlas_consumed || 0}A / ${data.subscription_period.v5_consumed || 0} V5`;
+                    }
+
+                    if (bypassToggle && bypassStatusEl && data.anlas) {
+                        if (data.anlas.is_in_debt) {
+                            bypassToggle.checked = false;
+                            bypassToggle.disabled = true;
+                            bypassStatusEl.innerHTML = `<span style="color:var(--theme-error, #e74c3c); font-weight:bold;">Anlas Balance: ${data.anlas.virtual_balance} (Bypass Locked)</span>`;
+                        } else {
+                            bypassToggle.disabled = false;
+                            bypassToggle.checked = Boolean(GM_getValue("anlas_bypass_enabled", false));
+                            bypassStatusEl.innerHTML = DEFAULT_BYPASS_HINT;
+                        }
+                    }
+
                     const sessionEl = container.querySelector("#guest-rolling-allowance");
                     if (sessionEl) {
                         if (data.session) {
@@ -606,5 +689,6 @@ if (!approved || !VPS_HOST) {
         onOpenSettings: openSettingsModal
     });
 
+    syncUIControlConstraints(getClientPolicyState());
     startStatePolling();
 }

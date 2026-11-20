@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         GuildWeave
 // @namespace    http://tampermonkey.net/
-// @version      5.0.0
+// @version      6.0.0
 // @description  FIFO queue coordination, rolling allowance telemetry visualization, and background stream proxy pipeline
 // @author       Minco
 // @match        https://novelai.net/*
@@ -119,8 +119,476 @@
   // src/userscripts/shared/assets/guild_badge.svg
   var guild_badge_default = '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024"><path fill="#fff" fill-rule="evenodd" stroke="#fff" stroke-linejoin="round" stroke-width=".3" d="M589 267a313 313 0 0 1 200 158l7 14c10-8 16-24 24-34 17-25 42-64 67-82 18-13 37-29 61-20 24 10 29 41 32 63 6 37-2 82-19 115q-12 19-26 37c37 8 40 36 35 70-9 54-39 83-86 106 7 8 16 12 20 22 20 51-31 79-72 85-16 3-59-7-74-14q-10-6-21-9a319 319 0 0 1-454-1c-10 1-20 9-29 12-35 10-68 17-104 4-37-14-61-75-18-98-3-5-12-6-16-9l-27-19c-27-22-48-70-43-104 2-14 2-29 16-39q10-5 20-6c-5-12-17-21-22-33l-10-23c-13-25-15-80-10-107 6-29 21-60 56-54 19 4 34 19 47 32 32 32 52 73 80 107 10-9 14-27 23-39 17-24 37-52 62-70 26-19 51-39 82-51 9-4 36-9 42-14a95 95 0 0 1-10-63c15-78 123-94 164-28 10 15 18 41 13 59-2 11-9 22-10 33Zm-17-5c8-10 11-26 11-38 0-64-76-102-123-55q-12 10-17 24-8 16-6 35 2 18 11 34c5 1 14-2 19-3l33-3c24-3 48 6 72 6Zm-78 47-41 5-46 15a272 272 0 0 0-157 189 268 268 0 0 0 365 302c58-22 116-82 138-139l6-13q10-35 16-71c4-22 0-48-4-68l-10-42c-4-13-11-30-19-41q-5-8-10-18l-15-19c-28-38-71-66-114-83-29-11-78-23-109-17ZM216 459q-13-18-25-37-30-45-68-85c-12-12-38-32-54-13-14 18-15 44-15 66 0 68 33 121 87 160 13 10 39 32 55 33 4-20 0-41 3-61l9-40zm608 110c15-1 32-12 44-20 57-36 94-79 96-149 1-21 2-72-23-82-25-9-54 27-68 43l-50 68c-5 8-15 18-19 27-1 5 9 30 11 37q6 26 9 54zM512 324q7-2 10 7 2 22 0 46c0 6 1 14-6 15-16 2-10-42-10-53 0-5 0-13 6-15Zm-125 34c6-1 9 6 12 10l22 38q6 8-1 15-7 2-11-4c-5-8-26-42-28-49q-1-8 6-10Zm266 13q11-1 11 10c-2 6-28 42-33 48-2 2-9 2-11 0-5-3-2-10 1-14l24-33q3-8 8-11Zm-156 53q20-3 37 2c69 12 111 62 122 129q3 14 1 30c-12 75-60 122-135 134q-29 3-57-7c-73-25-114-100-99-175 9-46 46-82 86-102 14-7 31-8 45-11Zm6 17q-19 1-39 7c-40 16-74 53-83 96a134 134 0 0 0 138 159q106-16 122-121 1-12-1-23l-2-19c-11-51-59-90-108-98q-14-3-27-1Zm-215 23c8-3 46 18 54 23q7 4 4 12c-2 6-10 4-14 2q-23-10-44-23c-5-3-8-12 0-14Zm450 17c7-1 12 7 8 12-5 7-38 20-47 23q-9 5-14-3-2-8 7-12c13-5 33-18 46-20Zm58 211q19 3 38-1c53-8 105-38 118-95q7-22 3-45c-3-15-23-21-36-17-6 2-24 18-30 22-17 13-43 26-65 30-7 36-8 74-28 106Zm-572 1c-7-20-17-40-21-61-1-5-3-27-5-30-5-4-15-6-21-9q-24-14-47-31c-17-12-27-32-50-27q-6 1-11 5c-13 13-6 45-2 61 13 52 65 82 114 90 12 2 31 6 43 2Zm80-106c7-1 34 3 18 15-6 4-40 3-48 3-5 0-13 1-15-4-5-17 35-12 45-14Zm395 0c8-1 49 1 58 3 3 1 5 7 4 10-1 7-10 5-15 5q-24 2-47-3c-6-2-6-13 0-15Zm-36 86c7-3 39 20 46 26 3 3 12 8 9 14q-4 6-9 5-6-2-11-8c-8-5-33-18-38-25-2-3-2-11 3-12Zm-311 4c6-2 13 5 10 11-3 8-33 27-41 33-3 3-9 7-13 3q-7-5-1-12c4-5 40-33 45-35Zm-120 32c-18 4-40 1-58-2-5-1-13-5-19-4-22 4-33 24-29 44 4 16 21 28 35 32 27 9 88 3 110-15q-15-15-26-34-6-10-13-21Zm518 56c7 8 25 11 35 13 32 8 80 13 100-21q5-7 7-14c4-20-12-37-30-40-8-1-39 6-51 7-6 0-17 2-22-1zm-153-34c8-2 10 6 13 11l20 36c3 4 5 13-1 15q-9 2-13-7c-6-12-22-35-25-47q-1-7 6-8Zm-174 3q11 0 10 11c-2 8-17 35-23 42-4 6-5 13-13 10q-7-4-3-12 9-20 20-38c2-4 5-12 9-13Zm89 22q7 1 9 7 2 23 0 47c0 6 1 14-7 15s-8-7-8-13v-41c0-4-1-15 6-15Z"/></svg>';
 
+  // src/userscripts/shared/pricing.js
+  var ANLAS_ALPHA = 2951823174884865e-21;
+  var ANLAS_BETA = 5753298233447344e-22;
+  var V5_MEDIUM_REF_STEPS = 23;
+  var V5_MEDIUM_DIVISOR = 1.75;
+  var V5_COST_MULTIPLIER = 1.5;
+  var ANLAS_MAX_PER_IMAGE_CAP = 140;
+  var ANLAS_MIN_PER_IMAGE_FLOOR = 2;
+  var V5_HIGH_NCP_COST = 18;
+  var V5_MEDIUM_NCP_COST = 10;
+  var FIREWALL_MAX_PIXELS = 1048576;
+  var FIREWALL_MAX_STEPS = 28;
+  var FIREWALL_MAX_SAMPLES = 1;
+  function isV5ModelFamily(model) {
+    if (typeof model !== "string") return false;
+    const trimmed = model.trim();
+    if (/4[-_.]5/i.test(trimmed)) return false;
+    return /(?:^|[-_])v?5(?:[-_]|$)/i.test(trimmed);
+  }
+  function isV5MediumModel(model) {
+    if (!isV5ModelFamily(model)) return false;
+    return /medium/i.test(model.trim());
+  }
+  function parseStrictInt(val, fallback = null) {
+    if (typeof val === "number") {
+      if (!Number.isFinite(val)) return fallback;
+      const truncated = Math.trunc(val);
+      if (truncated > Number.MAX_SAFE_INTEGER) return Number.MAX_SAFE_INTEGER;
+      if (truncated < -Number.MAX_SAFE_INTEGER) return -Number.MAX_SAFE_INTEGER;
+      return truncated;
+    }
+    if (typeof val === "string") {
+      const trimmed = val.trim();
+      if (/^-?\d+(?:\.\d+)?$/.test(trimmed)) {
+        const parsed = parseInt(trimmed, 10);
+        if (!Number.isFinite(parsed)) return fallback;
+        if (parsed > Number.MAX_SAFE_INTEGER) return Number.MAX_SAFE_INTEGER;
+        if (parsed < -Number.MAX_SAFE_INTEGER) return -Number.MAX_SAFE_INTEGER;
+        return parsed;
+      }
+    }
+    return fallback;
+  }
+  function parseStrictFloat(val, fallback = null) {
+    if (typeof val === "number") {
+      return Number.isFinite(val) ? val : fallback;
+    }
+    if (typeof val === "string") {
+      const trimmed = val.trim();
+      if (/^-?(?:\d+|\d*\.\d+)(?:[eE][+-]?\d+)?$/.test(trimmed)) {
+        const num = Number(trimmed);
+        return Number.isFinite(num) ? num : fallback;
+      }
+    }
+    return fallback;
+  }
+  function calculateAnlasCostDetails(params, { isOpus = true, usageNegative = false } = {}) {
+    if (!params || typeof params !== "object") {
+      return {
+        total: 0,
+        base: 0,
+        per_image: 0,
+        billable_samples: 0,
+        character_reference_anlas: 0,
+        vibe_encoding_anlas: 0,
+        vibe_reference_anlas: 0,
+        exceeds_cap: false
+      };
+    }
+    const parsedWidth = parseStrictInt(params.width, 1024);
+    const width = parsedWidth > 0 ? parsedWidth : 1024;
+    const parsedHeight = parseStrictInt(params.height, 1024);
+    const height = parsedHeight > 0 ? parsedHeight : 1024;
+    const area = width * height;
+    const model = typeof params.model === "string" ? params.model.trim() : "";
+    const isV5Medium = isV5MediumModel(model);
+    const isV5 = isV5ModelFamily(model);
+    const parsedSteps = parseStrictInt(params.steps, 28);
+    const rawSteps = parsedSteps > 0 ? parsedSteps : 28;
+    const baseCalculated = isV5Medium ? (ANLAS_ALPHA * area + ANLAS_BETA * area * V5_MEDIUM_REF_STEPS) / V5_MEDIUM_DIVISOR : Math.ceil(ANLAS_ALPHA * area + ANLAS_BETA * area * rawSteps);
+    let multiplier = 1;
+    const sm = params.sm === true || params.sm === "true" || params.sm === 1;
+    const smDyn = params.sm_dyn === true || params.sm_dyn === "true" || params.sm_dyn === 1;
+    if (sm && smDyn) {
+      multiplier = 1.4;
+    } else if (sm) {
+      multiplier = 1.2;
+    }
+    let w = baseCalculated * multiplier;
+    if (isV5) {
+      w *= V5_COST_MULTIPLIER;
+    }
+    let strengthFactor = 1;
+    const hasMask = Boolean(params.has_mask || params.mask);
+    const hasImage = Boolean(params.has_image || params.image);
+    if (hasMask) {
+      if (params.inpaintImg2ImgStrength !== void 0 && params.inpaintImg2ImgStrength !== null) {
+        const s = parseStrictFloat(params.inpaintImg2ImgStrength);
+        if (s !== null) strengthFactor = Math.max(0, Math.min(1, s));
+      }
+    } else if (hasImage) {
+      if (params.strength !== void 0 && params.strength !== null) {
+        const s = parseStrictFloat(params.strength);
+        if (s !== null) strengthFactor = Math.max(0, Math.min(1, s));
+      }
+    }
+    const perImageAnlas = Math.max(Math.ceil(w * strengthFactor), ANLAS_MIN_PER_IMAGE_FLOOR);
+    const exceedsCap = perImageAnlas > ANLAS_MAX_PER_IMAGE_CAP;
+    const parsedSamples = parseStrictInt(params.n_samples, 1);
+    const nSamples = parsedSamples > 0 ? parsedSamples : 1;
+    let billableSamples = nSamples;
+    const withinOpusSteps = isV5Medium || rawSteps <= FIREWALL_MAX_STEPS;
+    const opusUsageExhausted = isV5 && Boolean(usageNegative);
+    if (isOpus && !opusUsageExhausted && area <= FIREWALL_MAX_PIXELS && withinOpusSteps) {
+      billableSamples = Math.max(0, nSamples - 1);
+    }
+    const baseAnlas = perImageAnlas * billableSamples;
+    let rawRefs = params.precise_refs ?? params.precise_ref_count ?? params.character_reference_count ?? params.reference_count;
+    if (rawRefs === void 0 || rawRefs === null) {
+      const cachedCount = Array.isArray(params.director_reference_images_cached) ? params.director_reference_images_cached.length : 0;
+      const directCount = Array.isArray(params.director_reference_images) ? params.director_reference_images.length : 0;
+      const multiCount = Array.isArray(params.reference_image_multiple) ? params.reference_image_multiple.length : 0;
+      const totalArr = cachedCount + directCount + multiCount;
+      if (totalArr > 0) rawRefs = totalArr;
+    }
+    const parsedRefs = parseStrictInt(rawRefs, 0);
+    const preciseRefs = parsedRefs > 0 ? parsedRefs : 0;
+    const characterReferenceAnlas = 5 * preciseRefs * nSamples;
+    let vibeEncodingAnlas = 0;
+    let vibeReferenceAnlas = 0;
+    if (!isV5) {
+      let rawUncached = params.uncached_vibe_count;
+      let rawVibeRefs = params.vibe_reference_count;
+      if (rawVibeRefs === void 0 || rawVibeRefs === null) {
+        if (Array.isArray(params.vibe_images)) rawVibeRefs = params.vibe_images.length;
+        else if (Array.isArray(params.vibes)) rawVibeRefs = params.vibes.length;
+      }
+      const uncachedVibes = Math.max(0, parseStrictInt(rawUncached, 0));
+      const vibeRefs = Math.max(0, parseStrictInt(rawVibeRefs, 0));
+      vibeEncodingAnlas = uncachedVibes * 2;
+      vibeReferenceAnlas = Math.max(0, vibeRefs - 4) * 2;
+    }
+    const totalAnlas = baseAnlas + characterReferenceAnlas + vibeEncodingAnlas + vibeReferenceAnlas;
+    return {
+      total: totalAnlas,
+      base: baseAnlas,
+      per_image: perImageAnlas,
+      billable_samples: billableSamples,
+      character_reference_anlas: characterReferenceAnlas,
+      vibe_encoding_anlas: vibeEncodingAnlas,
+      vibe_reference_anlas: vibeReferenceAnlas,
+      exceeds_cap: exceedsCap
+    };
+  }
+  function evaluateGenerationPolicy(imgParams, state = {}) {
+    const safeParams = imgParams && typeof imgParams === "object" ? imgParams : {};
+    const width = parseStrictInt(safeParams.width, 1024) || 1024;
+    const height = parseStrictInt(safeParams.height, 1024) || 1024;
+    const area = width * height;
+    const nSamples = parseStrictInt(safeParams.n_samples, 1) || 1;
+    const model = typeof safeParams.model === "string" ? safeParams.model.trim() : "";
+    const isV5 = isV5ModelFamily(model);
+    const isV5Medium = isV5MediumModel(model);
+    const steps = parseStrictInt(safeParams.steps, isV5Medium ? 14 : 28) || (isV5Medium ? 14 : 28);
+    const costDetails = calculateAnlasCostDetails(safeParams, {
+      isOpus: true,
+      usageNegative: isV5 && Boolean(state.masterV5IsNegative)
+    });
+    const exceedsBaseLimits = area > FIREWALL_MAX_PIXELS || nSamples !== FIREWALL_MAX_SAMPLES || !isV5Medium && steps > FIREWALL_MAX_STEPS;
+    const isBasePaid = exceedsBaseLimits;
+    const reqNcp = isV5 && !isBasePaid ? isV5Medium ? V5_MEDIUM_NCP_COST : V5_HIGH_NCP_COST : 0;
+    if (costDetails.exceeds_cap) {
+      return {
+        ok: false,
+        status: 400,
+        error: "PARAMETRIC_LIMIT_EXCEEDED",
+        message: `Per-image cost of ${costDetails.per_image} Anlas exceeds maximum cap of ${ANLAS_MAX_PER_IMAGE_CAP} Anlas.`,
+        isV5,
+        isV5Medium,
+        isBasePaid,
+        reqNcp,
+        costDetails
+      };
+    }
+    if (isV5 && !isV5Medium && area <= FIREWALL_MAX_PIXELS && nSamples === FIREWALL_MAX_SAMPLES && steps >= 24 && steps <= 28) {
+      return {
+        ok: false,
+        status: 400,
+        error: "PARAMETRIC_LIMIT_EXCEEDED",
+        message: "Steps 24-28 on V5 Full (High) are prohibited (battery deadband). Use \u226423 for free tier, switch to Medium effort, or enable Anlas bypass with >28 steps.",
+        isV5,
+        isV5Medium,
+        isBasePaid: false,
+        reqNcp,
+        costDetails
+      };
+    }
+    const totalAnlas = costDetails.total;
+    const requiresAnlas = isBasePaid || totalAnlas > 0;
+    const isInDebt = Boolean(state.isInDebt);
+    const bypassEnabled = Boolean(state.bypassEnabled) && !isInDebt;
+    if (isInDebt && requiresAnlas) {
+      return {
+        ok: false,
+        status: 403,
+        error: "DEBT_LOCKED",
+        message: `Anlas Balance: ${state.virtualBalance} (Bypass Locked). Anlas-consuming generations are locked until balance restoration. Free Opus generations remain operational.`,
+        isV5,
+        isV5Medium,
+        isBasePaid,
+        reqNcp,
+        costDetails
+      };
+    }
+    if (exceedsBaseLimits && !bypassEnabled) {
+      return {
+        ok: false,
+        status: 400,
+        error: "BYPASS_DISABLED",
+        message: `Anlas Bypass is disabled. Enable 'Anlas Bypass' in GuildWeave HUD/Settings to generate above 1MP, >1 sample, or >28 steps (Estimated cost: ${totalAnlas} Anlas).`,
+        isV5,
+        isV5Medium,
+        isBasePaid,
+        reqNcp,
+        costDetails
+      };
+    }
+    if (requiresAnlas && typeof state.availableAnlas === "number" && Number.isFinite(state.availableAnlas) && totalAnlas > state.availableAnlas) {
+      return {
+        ok: false,
+        status: 403,
+        error: "INSUFFICIENT_ANLAS",
+        message: `Insufficient virtual Anlas balance (${state.availableAnlas} available, ${totalAnlas} required).`,
+        isV5,
+        isV5Medium,
+        isBasePaid,
+        reqNcp,
+        costDetails
+      };
+    }
+    if (state.subscriptionActive === false && typeof state.lastFetchedAt === "number" && state.lastFetchedAt > 0) {
+      return {
+        ok: false,
+        status: 503,
+        error: "MASTER_SUBSCRIPTION_INACTIVE",
+        message: "Master NovelAI Opus subscription is inactive or expired. Generation temporarily unavailable.",
+        isV5,
+        isV5Medium,
+        isBasePaid,
+        reqNcp,
+        costDetails
+      };
+    }
+    if (isV5 && !isBasePaid) {
+      if (state.isHardLocked) {
+        return {
+          ok: false,
+          status: 503,
+          error: "V5_BATTERY_CRITICAL",
+          message: "Battery Recharging: Master V5 capacity is at or below the 5.5% safety floor. Switch to a non-V5 model or use Anlas Bypass (>1MP / >1 sample / >28 steps).",
+          isV5,
+          isV5Medium,
+          isBasePaid,
+          reqNcp,
+          costDetails
+        };
+      }
+      if (typeof state.v5AvailableNcp === "number" && Number.isFinite(state.v5AvailableNcp)) {
+        const personalOk = state.v5AvailableNcp >= reqNcp;
+        const surplusAvailable = typeof state.v5SurplusAvailableNcp === "number" ? state.v5SurplusAvailableNcp : 0;
+        const surplusOk = Boolean(state.v5SurplusEligible) && surplusAvailable >= reqNcp;
+        if (!personalOk && !surplusOk) {
+          return {
+            ok: false,
+            status: 429,
+            error: "V5_CAPACITY_DEPLETED",
+            message: `V5 Quota Depleted: Insufficient V5 compute capacity (${state.v5AvailableNcp} personal NCP, ${state.v5SurplusEligible ? surplusAvailable : 0} surplus NCP available; ${reqNcp} NCP required).`,
+            isV5,
+            isV5Medium,
+            isBasePaid,
+            reqNcp,
+            costDetails
+          };
+        }
+      }
+    }
+    return {
+      ok: true,
+      isV5,
+      isV5Medium,
+      isBasePaid,
+      reqNcp,
+      costDetails
+    };
+  }
+
   // src/userscripts/shared/domEngine.js
   var classCache = /* @__PURE__ */ new Map();
+  var cachedPolicyState = {
+    virtualBalance: null,
+    availableAnlas: null,
+    heldAnlas: 0,
+    monthlyQuota: null,
+    isUnlimitedAnlas: false,
+    isInDebt: false,
+    v5BankedNcp: null,
+    v5AvailableNcp: null,
+    v5MaxBankNcp: null,
+    v5DailyShareNcp: null,
+    v5SurplusAvailableNcp: null,
+    v5SurplusEligible: true,
+    isUnlimitedV5: false,
+    masterV5Percent: null,
+    masterV5RawPercent: null,
+    masterV5IsNegative: false,
+    clusterState: null,
+    nextPercentEtaMs: null,
+    isHardLocked: false,
+    subscriptionActive: true,
+    isGracePeriod: false,
+    lastFetchedAt: 0,
+    activeModel: "",
+    bypassEnabled: false
+  };
+  var queueShieldLockActive = false;
+  var lastHudAlertText = "";
+  var lastHudAlertSeverity = "info";
+  function safeGetGm(key, fallback) {
+    try {
+      if (typeof GM_getValue === "function") {
+        return GM_getValue(key, fallback);
+      }
+    } catch (_) {
+    }
+    return fallback;
+  }
+  function safeSetGm(key, value) {
+    try {
+      if (typeof GM_setValue === "function") {
+        GM_setValue(key, value);
+      }
+    } catch (_) {
+    }
+  }
+  function getClientPolicyState() {
+    const merged = { ...cachedPolicyState };
+    merged.bypassEnabled = Boolean(safeGetGm("anlas_bypass_enabled", merged.bypassEnabled)) && !merged.isInDebt;
+    return merged;
+  }
+  function setClientPolicyState(partial = {}) {
+    const current = getClientPolicyState();
+    const next = { ...current, ...partial };
+    if (next.isInDebt) {
+      next.bypassEnabled = false;
+      safeSetGm("anlas_bypass_enabled", false);
+    }
+    cachedPolicyState = next;
+    return { ...next };
+  }
+  function parseRgbaColor(cssColor) {
+    if (typeof cssColor !== "string") return null;
+    const trimmed = cssColor.trim().toLowerCase();
+    if (!trimmed || trimmed === "transparent") {
+      return { r: 0, g: 0, b: 0, a: 0 };
+    }
+    const match = trimmed.match(/^rgba?\(\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)(?:\s*,\s*([0-9.]+))?\s*\)$/);
+    if (!match) return null;
+    return {
+      r: parseInt(match[1], 10),
+      g: parseInt(match[2], 10),
+      b: parseInt(match[3], 10),
+      a: match[4] !== void 0 ? parseFloat(match[4]) : 1
+    };
+  }
+  function detectActiveEffortButton(medBtn, highBtn) {
+    if (!medBtn || !highBtn) return null;
+    const isMarkedActive = (btn) => btn.getAttribute("aria-pressed") === "true" || btn.getAttribute("aria-selected") === "true" || btn.getAttribute("data-active") === "true";
+    const medAttr = isMarkedActive(medBtn);
+    const highAttr = isMarkedActive(highBtn);
+    if (medAttr !== highAttr) {
+      return medAttr ? "medium" : "high";
+    }
+    const getBg = (btn) => {
+      if (typeof window !== "undefined" && typeof window.getComputedStyle === "function") {
+        try {
+          return window.getComputedStyle(btn).backgroundColor || "";
+        } catch (_) {
+        }
+      }
+      return btn.style ? btn.style.backgroundColor || "" : "";
+    };
+    const medBgRaw = getBg(medBtn);
+    const highBgRaw = getBg(highBtn);
+    const medRgba = parseRgbaColor(medBgRaw);
+    const highRgba = parseRgbaColor(highBgRaw);
+    if (medRgba && highRgba) {
+      if (medRgba.a > 0 && highRgba.a === 0) return "medium";
+      if (highRgba.a > 0 && medRgba.a === 0) return "high";
+      if (medBgRaw !== highBgRaw) {
+        const parent = medBtn.parentElement;
+        const parentBg = parent ? getBg(parent) : "";
+        if (parentBg) {
+          if (medBgRaw !== parentBg && highBgRaw === parentBg) return "medium";
+          if (highBgRaw !== parentBg && medBgRaw === parentBg) return "high";
+        }
+        const medLuma = medRgba.r + medRgba.g + medRgba.b;
+        const highLuma = highRgba.r + highRgba.g + highRgba.b;
+        if (medLuma !== highLuma) {
+          return medLuma > highLuma ? "medium" : "high";
+        }
+      }
+    } else if (medBgRaw !== highBgRaw) {
+      if (medBgRaw && !highBgRaw) return "medium";
+      if (highBgRaw && !medBgRaw) return "high";
+    }
+    return null;
+  }
+  function readNativeModelAndEffortFromDOM() {
+    if (typeof document === "undefined" || typeof document.querySelector !== "function") return null;
+    const modelRow = document.querySelector(".image-gen-model-mode-row");
+    if (!modelRow) return null;
+    let modelText = "";
+    const modelInput = modelRow.querySelector('input[aria-label="Select the Model"]') || document.querySelector('input[aria-label="Select the Model"]');
+    if (modelInput && modelInput.parentElement) {
+      const prev = modelInput.previousElementSibling;
+      const parentPrev = modelInput.parentElement.previousElementSibling;
+      if (prev && prev.textContent && prev.textContent.trim()) {
+        modelText = prev.textContent.trim();
+      } else if (parentPrev && parentPrev.textContent && parentPrev.textContent.trim()) {
+        modelText = parentPrev.textContent.trim();
+      } else if (modelInput.parentElement.textContent && modelInput.parentElement.textContent.trim()) {
+        modelText = modelInput.parentElement.textContent.trim();
+      }
+    }
+    if (!modelText) {
+      const allDivs = modelRow.querySelectorAll("div");
+      for (const d of allDivs) {
+        const cls = d.getAttribute("class") || "";
+        if (cls.includes("singleValue") && d.textContent) {
+          modelText = d.textContent.trim();
+          break;
+        }
+      }
+    }
+    const trimmedModel = modelText.trim();
+    if (!trimmedModel) {
+      return null;
+    }
+    const isNativeV5 = !/4[-_.]5/i.test(trimmedModel) && /(?:^|[\s\-_])v?5(?:[\s\-_]|$)/i.test(trimmedModel);
+    if (!isNativeV5) {
+      return "legacy";
+    }
+    const buttons = modelRow.querySelectorAll("button");
+    let medBtn = null;
+    let highBtn = null;
+    for (const btn of buttons) {
+      const label = (btn.textContent || "").trim().toLowerCase();
+      if (label === "medium") medBtn = btn;
+      else if (label === "high") highBtn = btn;
+    }
+    const activeEffort = detectActiveEffortButton(medBtn, highBtn);
+    if (activeEffort === "medium") {
+      return "nai-diffusion-5-full-medium";
+    }
+    if (activeEffort === "high") {
+      return "nai-diffusion-5-full";
+    }
+    const current = getClientPolicyState().activeModel || "";
+    return isV5ModelFamily(current) ? current : "nai-diffusion-5-full";
+  }
   function getElementClasses(el, cacheKey) {
     if (el && el.className && typeof el.className === "string") {
       const trimmed = el.className.trim();
@@ -230,8 +698,411 @@
     genBtn.parentElement.insertBefore(barRoot, genBtn);
     return true;
   }
+  function refreshDualLedgerHud() {
+    injectDualLedgerBar();
+    const nativeModel = readNativeModelAndEffortFromDOM();
+    if (nativeModel) {
+      setClientPolicyState({ activeModel: nativeModel });
+    }
+    const latest = getClientPolicyState();
+    renderDualLedgerHudFromState(latest);
+    syncUIControlConstraints(latest);
+    return latest;
+  }
+  function injectDualLedgerBar() {
+    injectAllowanceBar();
+    if (document.getElementById("gw-v5-bar")) return true;
+    const allowanceBar = document.getElementById("gw-allowance-bar");
+    if (!allowanceBar || !allowanceBar.parentElement) return false;
+    const v5Root = document.createElement("div");
+    v5Root.id = "gw-v5-bar";
+    v5Root.style.cssText = `
+    display: flex;
+    flex-direction: column;
+    gap: 5px;
+    padding: 6px 8px 7px;
+    border-radius: 8px;
+    border: 1px solid var(--theme-bg2, rgb(34, 37, 63));
+    background-color: var(--theme-bg0, rgb(14, 15, 33));
+    font-size: 0.75rem;
+    font-weight: 600;
+    margin-bottom: 4px;
+    box-sizing: border-box;
+  `.replace(/\s+/g, " ").trim();
+    const v5HeaderRow = document.createElement("div");
+    v5HeaderRow.style.cssText = "display: flex; flex-direction: row; align-items: center; justify-content: space-between; gap: 6px;";
+    const v5Label = document.createElement("span");
+    v5Label.id = "gw-v5-label";
+    v5Label.style.cssText = "color: var(--theme-text, rgb(245, 243, 194)); font-size: 0.72rem; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;";
+    v5Label.textContent = "V5 Bank: --/-- NCP | Tank: --%";
+    const v5Eta = document.createElement("span");
+    v5Eta.id = "gw-v5-eta";
+    v5Eta.style.cssText = "color: var(--theme-textSecondary, #aaa); font-size: 0.68rem; white-space: nowrap;";
+    v5Eta.textContent = "";
+    v5HeaderRow.appendChild(v5Label);
+    v5HeaderRow.appendChild(v5Eta);
+    const v5Track = document.createElement("div");
+    v5Track.style.cssText = "height: 4px; width: 100%; background: var(--theme-bg2, rgba(255, 255, 255, 0.1)); border-radius: 2px; overflow: hidden; position: relative;";
+    const v5Fill = document.createElement("div");
+    v5Fill.id = "gw-v5-fill";
+    v5Fill.style.cssText = "height: 100%; width: 100%; background-color: var(--theme-success, #2ecc71); border-radius: 2px; transition: width 0.35s ease-in-out, background-color 0.35s ease-in-out;";
+    v5Track.appendChild(v5Fill);
+    const controlsRow = document.createElement("div");
+    controlsRow.style.cssText = "display: flex; flex-direction: row; align-items: center; justify-content: space-between; gap: 6px; flex-wrap: wrap;";
+    const anlasLabel = document.createElement("span");
+    anlasLabel.id = "gw-anlas-label";
+    anlasLabel.style.cssText = "color: var(--theme-textSecondary, #ccc); font-size: 0.68rem; white-space: nowrap;";
+    anlasLabel.textContent = "Anlas: -- (No Rollover)";
+    const rightControls = document.createElement("div");
+    rightControls.style.cssText = "display: flex; align-items: center; gap: 8px;";
+    const costBadge = document.createElement("span");
+    costBadge.id = "gw-v5-cost";
+    costBadge.style.cssText = "color: var(--theme-textSecondary, #aaa); font-size: 0.68rem; white-space: nowrap;";
+    costBadge.textContent = "";
+    const state = getClientPolicyState();
+    const bypassLabel = document.createElement("label");
+    bypassLabel.id = "gw-bypass-label";
+    bypassLabel.style.cssText = "display: flex; align-items: center; gap: 4px; font-size: 0.68rem; cursor: pointer; color: var(--theme-warning, #f39c12); white-space: nowrap;";
+    const bypassCheckbox = document.createElement("input");
+    bypassCheckbox.type = "checkbox";
+    bypassCheckbox.id = "gw-bypass-toggle";
+    bypassCheckbox.checked = Boolean(state.bypassEnabled) && !state.isInDebt;
+    bypassCheckbox.disabled = Boolean(state.isInDebt);
+    bypassCheckbox.style.cursor = "pointer";
+    bypassCheckbox.onchange = () => {
+      const latest = getClientPolicyState();
+      if (latest.isInDebt) {
+        bypassCheckbox.checked = false;
+        bypassCheckbox.disabled = true;
+        return;
+      }
+      const nextVal = Boolean(bypassCheckbox.checked);
+      safeSetGm("anlas_bypass_enabled", nextVal);
+      setClientPolicyState({ bypassEnabled: nextVal });
+      const modalBypass = document.getElementById("settings-anlas-bypass");
+      if (modalBypass) modalBypass.checked = nextVal;
+      refreshDualLedgerHud();
+    };
+    const bypassText = document.createElement("span");
+    bypassText.id = "gw-bypass-text";
+    bypassText.textContent = state.isInDebt ? "Bypass Locked" : "Anlas Bypass";
+    bypassLabel.appendChild(bypassCheckbox);
+    bypassLabel.appendChild(bypassText);
+    rightControls.appendChild(costBadge);
+    rightControls.appendChild(bypassLabel);
+    controlsRow.appendChild(anlasLabel);
+    controlsRow.appendChild(rightControls);
+    const alertDiv = document.createElement("div");
+    alertDiv.id = "gw-hud-alert";
+    alertDiv.style.cssText = "display: none; font-size: 0.68rem; line-height: 1.3; padding: 3px 6px; border-radius: 4px; background: var(--theme-bg1, #222); color: var(--theme-warning, #f39c12);";
+    v5Root.appendChild(v5HeaderRow);
+    v5Root.appendChild(v5Track);
+    v5Root.appendChild(controlsRow);
+    v5Root.appendChild(alertDiv);
+    allowanceBar.parentElement.insertBefore(v5Root, allowanceBar);
+    if (lastHudAlertText) {
+      setHudAlert(lastHudAlertText, lastHudAlertSeverity);
+    }
+    renderDualLedgerHudFromState(getClientPolicyState());
+    return true;
+  }
+  function setHudAlert(message, severity = "warning") {
+    lastHudAlertText = message || "";
+    lastHudAlertSeverity = severity;
+    const alertEl = document.getElementById("gw-hud-alert");
+    if (!alertEl) return;
+    if (!message) {
+      alertEl.style.display = "none";
+      alertEl.textContent = "";
+      return;
+    }
+    alertEl.style.display = "block";
+    alertEl.textContent = message;
+    if (severity === "error") {
+      alertEl.style.color = "var(--theme-error, #e74c3c)";
+    } else if (severity === "info") {
+      alertEl.style.color = "var(--theme-accent, #00bc8c)";
+    } else {
+      alertEl.style.color = "var(--theme-warning, #f39c12)";
+    }
+  }
+  function formatNextPercentEta(etaMs) {
+    if (typeof etaMs !== "number" || !Number.isFinite(etaMs)) return "";
+    if (etaMs <= 0) return "Full";
+    const mins = Math.max(0.1, etaMs / 6e4);
+    if (mins >= 60) {
+      return `+1% in ${(mins / 60).toFixed(1)}h`;
+    }
+    return `+1% in ${mins.toFixed(1)}m`;
+  }
+  function resolveClusterStateColor(clusterState) {
+    if (clusterState === "frozen") return "var(--theme-error, #e74c3c)";
+    if (clusterState === "throttled") return "var(--theme-warning, #e67e22)";
+    if (clusterState === "reserve_mode") return "var(--theme-warning, #f1c40f)";
+    return "var(--theme-success, #2ecc71)";
+  }
+  function renderDualLedgerHudFromState(state) {
+    const v5Label = document.getElementById("gw-v5-label");
+    const v5Eta = document.getElementById("gw-v5-eta");
+    const v5Fill = document.getElementById("gw-v5-fill");
+    const anlasLabel = document.getElementById("gw-anlas-label");
+    const costBadge = document.getElementById("gw-v5-cost");
+    const bypassCheckbox = document.getElementById("gw-bypass-toggle");
+    const bypassText = document.getElementById("gw-bypass-text");
+    const modalBypass = document.getElementById("settings-anlas-bypass");
+    const activeModel = state.activeModel || "";
+    const isV5 = isV5ModelFamily(activeModel);
+    const isMed = isV5MediumModel(activeModel);
+    if (v5Label && v5Fill) {
+      const pctText = typeof state.masterV5Percent === "number" && Number.isFinite(state.masterV5Percent) ? `${state.masterV5Percent.toFixed(1)}%` : "--%";
+      if (state.subscriptionActive === false && state.lastFetchedAt > 0) {
+        v5Label.textContent = "Master Subscription Inactive";
+        v5Fill.style.width = "0%";
+        v5Fill.style.backgroundColor = "var(--theme-error, #e74c3c)";
+      } else if (state.isHardLocked) {
+        v5Label.textContent = `Battery Recharging (${pctText} <= 5.5%)`;
+        const widthPct = typeof state.masterV5Percent === "number" ? Math.max(0, Math.min(100, state.masterV5Percent)) : 0;
+        v5Fill.style.width = `${widthPct}%`;
+        v5Fill.style.backgroundColor = "var(--theme-error, #e74c3c)";
+      } else if (state.isUnlimitedV5) {
+        v5Label.textContent = `V5 Bank: Exempt (Unlimited) | Tank: ${pctText}`;
+        v5Fill.style.width = "100%";
+        v5Fill.style.backgroundColor = "var(--theme-accent, #00bc8c)";
+      } else if (typeof state.v5AvailableNcp === "number") {
+        const maxNcp = typeof state.v5MaxBankNcp === "number" && state.v5MaxBankNcp > 0 ? state.v5MaxBankNcp : state.v5AvailableNcp;
+        const surplusSuffix = state.v5SurplusEligible && typeof state.v5SurplusAvailableNcp === "number" && state.v5SurplusAvailableNcp > 0 ? ` (+${state.v5SurplusAvailableNcp} Surplus)` : "";
+        const depleted = state.v5AvailableNcp < 10 && (!state.v5SurplusEligible || (state.v5SurplusAvailableNcp || 0) < 10);
+        v5Label.textContent = depleted ? `V5 Quota Depleted (0/${maxNcp} NCP) | Tank: ${pctText}` : `V5 Bank: ${state.v5AvailableNcp}/${maxNcp} NCP${surplusSuffix} | Tank: ${pctText}`;
+        const barPct = maxNcp > 0 ? Math.min(100, Math.max(0, state.v5AvailableNcp / maxNcp * 100)) : 0;
+        v5Fill.style.width = `${barPct}%`;
+        v5Fill.style.backgroundColor = resolveClusterStateColor(state.clusterState);
+      } else {
+        v5Label.textContent = `V5 Bank: --/-- NCP | Tank: ${pctText}`;
+      }
+    }
+    if (v5Eta) {
+      const etaStr = formatNextPercentEta(state.nextPercentEtaMs);
+      const stateTag = state.clusterState ? state.clusterState.replace(/_/g, " ").toUpperCase() : "";
+      v5Eta.textContent = [stateTag, etaStr].filter(Boolean).join(" \xB7 ");
+    }
+    if (costBadge) {
+      if (!activeModel) {
+        costBadge.textContent = "";
+      } else if (isMed) {
+        costBadge.textContent = `Cost: ${V5_MEDIUM_NCP_COST} NCP (Med)`;
+        costBadge.style.color = "var(--theme-accent, #00bc8c)";
+      } else if (isV5) {
+        costBadge.textContent = `Cost: ${V5_HIGH_NCP_COST} NCP (High)`;
+        costBadge.style.color = "var(--theme-accent, #00bc8c)";
+      } else {
+        costBadge.textContent = "Legacy (0 NCP)";
+        costBadge.style.color = "var(--theme-textSecondary, #aaa)";
+      }
+    }
+    if (anlasLabel) {
+      if (state.isUnlimitedAnlas) {
+        anlasLabel.textContent = "Anlas: Unlimited";
+        anlasLabel.style.color = "var(--theme-accent, #00bc8c)";
+      } else if (state.isInDebt) {
+        anlasLabel.textContent = `Anlas Balance: ${state.virtualBalance} (Bypass Locked)`;
+        anlasLabel.style.color = "var(--theme-error, #e74c3c)";
+      } else if (typeof state.availableAnlas === "number") {
+        const quotaSuffix = typeof state.monthlyQuota === "number" ? `/${state.monthlyQuota}` : "";
+        anlasLabel.textContent = `Anlas: ${state.availableAnlas}${quotaSuffix} (No Rollover)`;
+        anlasLabel.style.color = "var(--theme-textSecondary, #ccc)";
+      } else {
+        anlasLabel.textContent = "Anlas: -- (No Rollover)";
+        anlasLabel.style.color = "var(--theme-textSecondary, #ccc)";
+      }
+    }
+    if (bypassCheckbox && bypassText) {
+      if (state.isInDebt) {
+        bypassCheckbox.checked = false;
+        bypassCheckbox.disabled = true;
+        bypassText.textContent = "Bypass Locked";
+        bypassText.style.color = "var(--theme-error, #e74c3c)";
+      } else {
+        bypassCheckbox.disabled = false;
+        bypassCheckbox.checked = Boolean(state.bypassEnabled);
+        bypassText.textContent = "Anlas Bypass";
+        bypassText.style.color = "var(--theme-warning, #f39c12)";
+      }
+    }
+    if (modalBypass) {
+      if (state.isInDebt) {
+        modalBypass.checked = false;
+        modalBypass.disabled = true;
+      } else {
+        modalBypass.disabled = false;
+        modalBypass.checked = Boolean(state.bypassEnabled);
+      }
+    }
+    if (!queueShieldLockActive) {
+      if (state.subscriptionActive === false && state.lastFetchedAt > 0) {
+        setGenerateLockoutState(true, "Subscription Inactive");
+      } else if (isV5 && !state.bypassEnabled) {
+        if (state.isHardLocked) {
+          setGenerateLockoutState(true, "Battery Recharging");
+        } else if (typeof state.v5AvailableNcp === "number" && !state.isUnlimitedV5 && state.lastFetchedAt > 0) {
+          const reqNcp = isMed ? V5_MEDIUM_NCP_COST : V5_HIGH_NCP_COST;
+          const surplusAvail = state.v5SurplusEligible ? state.v5SurplusAvailableNcp || 0 : 0;
+          if (state.v5AvailableNcp < reqNcp && surplusAvail < reqNcp) {
+            setGenerateLockoutState(true, "V5 Quota Depleted");
+          } else {
+            setGenerateLockoutState(false, "");
+          }
+        } else {
+          setGenerateLockoutState(false, "");
+        }
+      } else {
+        setGenerateLockoutState(false, "");
+      }
+    }
+  }
+  function updateDualLedgerHud(statusData) {
+    if (!statusData || typeof statusData !== "object") {
+      return getClientPolicyState();
+    }
+    const patch = {};
+    if (statusData.anlas && typeof statusData.anlas === "object") {
+      const anlas = statusData.anlas;
+      const isInDebt = Boolean(anlas.is_in_debt);
+      const currentBypass = Boolean(safeGetGm("anlas_bypass_enabled", false)) && !isInDebt;
+      if (isInDebt) {
+        safeSetGm("anlas_bypass_enabled", false);
+      }
+      patch.virtualBalance = anlas.virtual_balance;
+      patch.availableAnlas = anlas.available_balance;
+      patch.heldAnlas = anlas.held || 0;
+      patch.monthlyQuota = anlas.monthly_quota;
+      patch.isUnlimitedAnlas = Boolean(anlas.is_unlimited);
+      patch.isInDebt = isInDebt;
+      patch.bypassEnabled = currentBypass;
+    }
+    if (statusData.v5 && typeof statusData.v5 === "object") {
+      const v5 = statusData.v5;
+      patch.v5BankedNcp = v5.banked_ncp;
+      patch.v5AvailableNcp = v5.available_ncp;
+      patch.v5MaxBankNcp = v5.max_bank_ncp;
+      patch.v5DailyShareNcp = v5.daily_share_ncp;
+      patch.v5SurplusAvailableNcp = v5.surplus_available_ncp;
+      patch.v5SurplusEligible = Boolean(v5.surplus_eligible);
+      patch.isUnlimitedV5 = Boolean(v5.is_unlimited);
+    }
+    if (statusData.telemetry && typeof statusData.telemetry === "object") {
+      const telemetry = statusData.telemetry;
+      patch.masterV5Percent = telemetry.master_v5_percent;
+      patch.masterV5RawPercent = telemetry.master_v5_raw_percent;
+      patch.masterV5IsNegative = Boolean(telemetry.master_v5_is_negative);
+      patch.clusterState = telemetry.cluster_state;
+      patch.nextPercentEtaMs = telemetry.next_percent_eta_ms;
+      patch.isHardLocked = Boolean(telemetry.is_hard_locked);
+      patch.subscriptionActive = telemetry.subscription_active !== false;
+      patch.isGracePeriod = Boolean(telemetry.is_grace_period);
+      patch.lastFetchedAt = telemetry.last_fetched_at || 0;
+    } else if (statusData.master_v5_percent !== void 0) {
+      patch.masterV5Percent = statusData.master_v5_percent;
+    }
+    setClientPolicyState(patch);
+    return refreshDualLedgerHud();
+  }
+  function isStepControlInput(input) {
+    if (!input || input.tagName !== "INPUT") return false;
+    if (input.id === "gw-bypass-toggle" || input.id === "settings-anlas-bypass") return false;
+    const aria = (input.getAttribute("aria-label") || "").toLowerCase();
+    const name = (input.getAttribute("name") || "").toLowerCase();
+    const id = (input.id || "").toLowerCase();
+    const dataCtrl = (input.getAttribute("data-gw-control") || "").toLowerCase();
+    return dataCtrl === "steps" || aria.includes("step") || name.includes("step") || id.includes("step");
+  }
+  function syncUIControlConstraints(state = getClientPolicyState()) {
+    if (typeof document === "undefined" || typeof document.querySelectorAll !== "function") return;
+    const activeModel = state.activeModel || "";
+    const isMed = isV5MediumModel(activeModel);
+    const isV5High = isV5ModelFamily(activeModel) && !isMed;
+    let deadbandTriggered = false;
+    let foundStepInput = false;
+    let hasStepInDeadband = false;
+    const inputs = document.querySelectorAll("input");
+    for (const input of inputs) {
+      if (!isStepControlInput(input)) continue;
+      foundStepInput = true;
+      const numVal = parseInt(input.value, 10);
+      if (Number.isFinite(numVal) && numVal >= 24 && numVal <= 28) {
+        hasStepInDeadband = true;
+      }
+      if (isMed) {
+        input.setAttribute("min", "1");
+        input.setAttribute("max", "28");
+      } else if (isV5High && !state.bypassEnabled) {
+        input.setAttribute("min", "1");
+        input.setAttribute("max", "23");
+        if (Number.isFinite(numVal) && numVal >= 24 && numVal <= 28) {
+          deadbandTriggered = true;
+          setHudAlert(
+            "Steps 24-28 on V5 Full (High) are prohibited (battery deadband). Use \u226423 for free tier, switch to Medium effort, or enable Anlas bypass with >28 steps.",
+            "warning"
+          );
+        }
+      } else {
+        input.setAttribute("min", "1");
+        input.setAttribute("max", state.bypassEnabled ? "50" : "28");
+      }
+    }
+    if (!deadbandTriggered && lastHudAlertText && lastHudAlertText.includes("deadband") && (!isV5High || foundStepInput && !hasStepInDeadband)) {
+      setHudAlert("", "info");
+    }
+  }
+  function scrapeDisplayedAnlasCost() {
+    if (typeof document === "undefined" || typeof document.querySelector !== "function") return null;
+    const genBtn = document.querySelector(".image-gen-generate-button");
+    if (!genBtn) return null;
+    const isInsideShield = (node) => {
+      let cur = node;
+      while (cur && cur !== genBtn) {
+        if (cur.id === "gw-button-shield" || cur.id === "gw-shield-text") return true;
+        cur = cur.parentElement;
+      }
+      return false;
+    };
+    const isInsideGenerateLabel = (node) => {
+      let cur = node;
+      while (cur && cur !== genBtn) {
+        const text = (cur.textContent || "").trim();
+        if (/generate/i.test(text) || /image/i.test(text)) return true;
+        cur = cur.parentElement;
+      }
+      return false;
+    };
+    const badgeNode = genBtn.querySelector(".native-anlas-container");
+    if (badgeNode && !isInsideShield(badgeNode)) {
+      const badgeText = (badgeNode.textContent || "").trim();
+      const match = badgeText.match(/(\d+)\s*anlas/i) || badgeText.match(/^(\d+)$/);
+      if (match) return parseInt(match[1], 10);
+    }
+    const candidates = genBtn.querySelectorAll("span");
+    for (const node of candidates) {
+      if (!node || isInsideShield(node)) continue;
+      const text = (node.textContent || "").trim();
+      if (!text || /generate/i.test(text) || /image/i.test(text)) continue;
+      const anlasMatch = text.match(/^(\d+)\s*anlas$/i);
+      if (anlasMatch) {
+        return parseInt(anlasMatch[1], 10);
+      }
+    }
+    for (const node of candidates) {
+      if (!node || isInsideShield(node) || isInsideGenerateLabel(node)) continue;
+      const text = (node.textContent || "").trim();
+      const pureNumMatch = text.match(/^(\d+)$/);
+      if (pureNumMatch) {
+        return parseInt(pureNumMatch[1], 10);
+      }
+    }
+    return null;
+  }
   function updateAllowanceBar(allowance, maxAllowance, nextRefillMs = 0) {
     injectAllowanceBar();
+    injectDualLedgerBar();
     const labelSpan = document.getElementById("gw-allowance-label");
     const fillDiv = document.getElementById("gw-allowance-fill");
     if (!labelSpan || !fillDiv) return;
@@ -298,7 +1169,7 @@
     genBtn.appendChild(shield);
     return true;
   }
-  function setQueueShieldState(active, text = "") {
+  function applyButtonShieldVisual(active, text, cursor = "wait") {
     injectQueueShield();
     const shield = document.getElementById("gw-button-shield");
     const labelText = document.getElementById("gw-shield-text");
@@ -315,26 +1186,51 @@
       labelText.textContent = text || "Processing Queue...";
       shield.style.display = "flex";
       shield.style.pointerEvents = "all";
+      shield.style.cursor = cursor;
     } else {
       shield.style.display = "none";
       shield.style.pointerEvents = "none";
     }
   }
+  function setQueueShieldState(active, text = "") {
+    queueShieldLockActive = Boolean(active);
+    if (active) {
+      applyButtonShieldVisual(true, text || "Processing Queue...", "wait");
+    } else {
+      applyButtonShieldVisual(false, "", "wait");
+      renderDualLedgerHudFromState(getClientPolicyState());
+    }
+  }
+  function setGenerateLockoutState(locked, reasonText = "") {
+    if (queueShieldLockActive) return;
+    applyButtonShieldVisual(Boolean(locked), reasonText || "V5 Quota Depleted", "not-allowed");
+  }
   var observerInstance = null;
   var rafScheduled = false;
+  var observedInputRoot = null;
+  var inputConstraintHandler = null;
   function initDOMObserver(options = {}) {
-    if (observerInstance) observerInstance.disconnect();
+    stopDOMObserver();
     const runSync = () => {
       rafScheduled = false;
       injectNavBadge(options.onOpenSettings);
       injectAllowanceBar();
+      injectDualLedgerBar();
       injectQueueShield();
+      refreshDualLedgerHud();
     };
     observerInstance = new MutationObserver((mutations) => {
       let relevant = false;
       for (const m of mutations) {
-        if (m.target && m.target.id && m.target.id.startsWith("gw-")) continue;
-        if (m.addedNodes.length > 0 || m.removedNodes.length > 0) {
+        if (m.target) {
+          if (m.target.id && m.target.id.startsWith("gw-")) continue;
+          if (typeof m.target.closest === "function" && m.target.closest('[id^="gw-"]')) continue;
+        }
+        if (m.type === "attributes") {
+          relevant = true;
+          break;
+        }
+        if (m.addedNodes && m.addedNodes.length > 0 || m.removedNodes && m.removedNodes.length > 0) {
           relevant = true;
           break;
         }
@@ -350,9 +1246,36 @@
     });
     const root = document.body || document.documentElement;
     if (root) {
-      observerInstance.observe(root, { childList: true, subtree: true });
+      observerInstance.observe(root, {
+        childList: true,
+        subtree: true,
+        attributes: true,
+        attributeFilter: ["class", "aria-pressed", "aria-selected"]
+      });
+      if (typeof root.addEventListener === "function") {
+        observedInputRoot = root;
+        inputConstraintHandler = (ev) => {
+          if (ev && isStepControlInput(ev.target)) {
+            syncUIControlConstraints(getClientPolicyState());
+          }
+        };
+        root.addEventListener("input", inputConstraintHandler, true);
+        root.addEventListener("change", inputConstraintHandler, true);
+      }
     }
     runSync();
+  }
+  function stopDOMObserver() {
+    if (observerInstance) {
+      observerInstance.disconnect();
+      observerInstance = null;
+    }
+    if (observedInputRoot && inputConstraintHandler && typeof observedInputRoot.removeEventListener === "function") {
+      observedInputRoot.removeEventListener("input", inputConstraintHandler, true);
+      observedInputRoot.removeEventListener("change", inputConstraintHandler, true);
+    }
+    observedInputRoot = null;
+    inputConstraintHandler = null;
   }
 
   // src/userscripts/shared/ui.js
@@ -379,9 +1302,46 @@
   // src/userscripts/shared/params.js
   async function extractImageParams(body) {
     if (!body) return null;
+    const parseOptionalIntLocal = (val, fallback = null) => {
+      if (typeof val === "number") {
+        if (!Number.isFinite(val)) return fallback;
+        const t = Math.trunc(val);
+        if (t > Number.MAX_SAFE_INTEGER) return Number.MAX_SAFE_INTEGER;
+        if (t < -Number.MAX_SAFE_INTEGER) return -Number.MAX_SAFE_INTEGER;
+        return t;
+      }
+      if (typeof val === "string") {
+        const trimmed = val.trim();
+        if (/^-?\d+(?:\.\d+)?$/.test(trimmed)) {
+          const parsed = parseInt(trimmed, 10);
+          if (!Number.isFinite(parsed)) return fallback;
+          if (parsed > Number.MAX_SAFE_INTEGER) return Number.MAX_SAFE_INTEGER;
+          if (parsed < -Number.MAX_SAFE_INTEGER) return -Number.MAX_SAFE_INTEGER;
+          return parsed;
+        }
+      }
+      return fallback;
+    };
+    const parseOptionalFloatLocal = (val) => {
+      if (typeof val === "number") {
+        return Number.isFinite(val) ? val : null;
+      }
+      if (typeof val === "string") {
+        const trimmed = val.trim();
+        if (/^-?(?:\d+|\d*\.\d+)(?:[eE][+-]?\d+)?$/.test(trimmed)) {
+          const num = Number(trimmed);
+          return Number.isFinite(num) ? num : null;
+        }
+      }
+      return null;
+    };
     try {
       let payload = null;
+      let formHasImage = false;
+      let formHasMask = false;
       if (typeof FormData !== "undefined" && body instanceof FormData) {
+        formHasImage = typeof body.has === "function" ? body.has("image") : Boolean(body.get("image"));
+        formHasMask = typeof body.has === "function" ? body.has("mask") : Boolean(body.get("mask"));
         const requestBlob = body.get("request");
         if (!requestBlob) return null;
         const text = typeof requestBlob.text === "function" ? await requestBlob.text() : String(requestBlob);
@@ -400,16 +1360,45 @@
           payload = body;
         }
       }
-      if (payload && typeof payload === "object") {
-        const params = payload.parameters && typeof payload.parameters === "object" ? payload.parameters : payload;
+      if (payload && typeof payload === "object" && !Array.isArray(payload)) {
+        const params = payload.parameters && typeof payload.parameters === "object" && !Array.isArray(payload.parameters) ? payload.parameters : payload;
+        const rawModel = typeof payload.model === "string" ? payload.model.trim() : typeof params.model === "string" ? params.model.trim() : "";
+        const isV5Medium = !/4[-_.]5/i.test(rawModel) && /(?:^|[-_])v?5(?:[-_]|$)/i.test(rawModel) && /medium/i.test(rawModel);
         const preciseRefs = (Array.isArray(params.director_reference_images_cached) ? params.director_reference_images_cached.length : 0) + (Array.isArray(params.director_reference_images) ? params.director_reference_images.length : 0) + (Array.isArray(params.reference_image_multiple) ? params.reference_image_multiple.length : 0);
+        const parsedWidth = parseOptionalIntLocal(params.width ?? payload.width);
+        const parsedHeight = parseOptionalIntLocal(params.height ?? payload.height);
+        const parsedSteps = parseOptionalIntLocal(params.steps ?? payload.steps);
+        const parsedSamples = parseOptionalIntLocal(params.n_samples ?? payload.n_samples);
+        const parsedStrength = parseOptionalFloatLocal(params.strength ?? payload.strength);
+        const parsedInpaintStrength = parseOptionalFloatLocal(params.inpaintImg2ImgStrength ?? payload.inpaintImg2ImgStrength);
+        const hasImage = formHasImage || Boolean(params.image || payload.image);
+        const hasMask = formHasMask || Boolean(params.mask || payload.mask);
+        const parsedUncached = parseOptionalIntLocal(params.uncached_vibe_count ?? payload.uncached_vibe_count, 0);
+        let rawVibeRefs = params.vibe_reference_count ?? payload.vibe_reference_count;
+        if (rawVibeRefs === void 0 || rawVibeRefs === null) {
+          if (Array.isArray(params.vibe_images)) rawVibeRefs = params.vibe_images.length;
+          else if (Array.isArray(params.vibes)) rawVibeRefs = params.vibes.length;
+        }
+        const parsedVibeRefs = parseOptionalIntLocal(rawVibeRefs, 0);
+        const rawSm = params.sm ?? payload.sm;
+        const rawSmDyn = params.sm_dyn ?? payload.sm_dyn;
+        const resolvedSteps = parsedSteps !== null && parsedSteps > 0 ? parsedSteps : isV5Medium ? 14 : 28;
         return {
-          width: parseInt(params.width || payload.width, 10) || 1024,
-          height: parseInt(params.height || payload.height, 10) || 1024,
-          steps: parseInt(params.steps || payload.steps, 10) || 28,
-          n_samples: parseInt(params.n_samples || payload.n_samples, 10) || 1,
+          width: parsedWidth !== null && parsedWidth > 0 ? parsedWidth : 1024,
+          height: parsedHeight !== null && parsedHeight > 0 ? parsedHeight : 1024,
+          steps: resolvedSteps,
+          has_explicit_steps: parsedSteps !== null && parsedSteps > 0,
+          n_samples: parsedSamples !== null && parsedSamples > 0 ? parsedSamples : 1,
           precise_refs: preciseRefs,
-          model: payload.model || params.model || ""
+          model: rawModel,
+          sm: rawSm === true || rawSm === "true" || rawSm === 1,
+          sm_dyn: rawSmDyn === true || rawSmDyn === "true" || rawSmDyn === 1,
+          strength: parsedStrength !== null ? Math.max(0, Math.min(1, parsedStrength)) : null,
+          inpaintImg2ImgStrength: parsedInpaintStrength !== null ? Math.max(0, Math.min(1, parsedInpaintStrength)) : null,
+          has_image: hasImage,
+          has_mask: hasMask,
+          uncached_vibe_count: parsedUncached > 0 ? parsedUncached : 0,
+          vibe_reference_count: parsedVibeRefs > 0 ? parsedVibeRefs : 0
         };
       }
     } catch (e) {
@@ -425,6 +1414,8 @@
     VPS_HOST: "",
     logPrefix: "GuildWeave",
     onRevoked: () => {
+    },
+    onTelemetryRefresh: () => {
     }
   };
   function initInterceptor(config) {
@@ -446,6 +1437,14 @@
         GM_setValue("count_image_gens", GM_getValue("count_image_gens", 0) + 1);
       } else if (isTextGen) {
         GM_setValue("count_text_gens", GM_getValue("count_text_gens", 0) + 1);
+      }
+      if (typeof envConfig.onTelemetryRefresh === "function") {
+        setTimeout(() => {
+          try {
+            envConfig.onTelemetryRefresh();
+          } catch (_) {
+          }
+        }, 0);
       }
       resolveObj(new Response(responseDetails.response, {
         status,
@@ -486,8 +1485,25 @@
         if (errorText) parsedError = JSON.parse(errorText);
       } catch (e) {
       }
+      if (parsedError && parsedError.error === "DEBT_LOCKED") {
+        GM_setValue("anlas_bypass_enabled", false);
+        setClientPolicyState({ isInDebt: true, bypassEnabled: false });
+        refreshDualLedgerHud();
+        setHudAlert(parsedError.message || "Account is in Anlas debt. Bypass locked.", "error");
+      } else if (parsedError && (parsedError.message || parsedError.error) && (status === 400 || status === 403 || status === 429 || status === 503)) {
+        setHudAlert(parsedError.message || parsedError.error, status === 403 || status === 503 ? "error" : "warning");
+      }
+      if (typeof envConfig.onTelemetryRefresh === "function" && (status === 403 || status === 429 || status === 503)) {
+        setTimeout(() => {
+          try {
+            envConfig.onTelemetryRefresh();
+          } catch (_) {
+          }
+        }, 0);
+      }
       const responseBody = parsedError && (parsedError.statusCode || parsedError.message || parsedError.error) ? JSON.stringify({
         statusCode: parsedError.statusCode || status,
+        error: parsedError.error,
         message: parsedError.message || parsedError.error || errorText || "GuildWeave processing error"
       }) : JSON.stringify({
         statusCode: status,
@@ -510,11 +1526,65 @@
       return tid;
     })();
     const originalBody = config.body;
-    let imgParams = { width: 1024, height: 1024, steps: 28, n_samples: 1, precise_refs: 0, model: "" };
+    let imgParams = {
+      width: 1024,
+      height: 1024,
+      steps: 28,
+      has_explicit_steps: false,
+      n_samples: 1,
+      precise_refs: 0,
+      model: "",
+      sm: false,
+      sm_dyn: false,
+      strength: null,
+      inpaintImg2ImgStrength: null,
+      has_image: false,
+      has_mask: false,
+      uncached_vibe_count: 0,
+      vibe_reference_count: 0
+    };
     const extracted = await extractImageParams(originalBody);
     if (extracted) imgParams = extracted;
+    let currentState = getClientPolicyState();
+    if (imgParams.model) {
+      currentState = setClientPolicyState({ activeModel: imgParams.model });
+      refreshDualLedgerHud();
+    }
+    const policy = evaluateGenerationPolicy(imgParams, currentState);
+    const scrapedAnlas = scrapeDisplayedAnlasCost();
+    if (scrapedAnlas !== null && scrapedAnlas !== policy.costDetails.total) {
+      console.warn(`[GuildWeave Canary] Displayed UI cost (${scrapedAnlas}) differs from local estimate (${policy.costDetails.total}).`);
+      setHudAlert("Displayed cost may differ from estimate.", "warning");
+    } else if (policy.ok) {
+      setHudAlert("", "info");
+    }
+    if (!policy.ok) {
+      hideQueueStatusBanner();
+      setHudAlert(policy.message, policy.status === 403 ? "error" : "warning");
+      return new Response(JSON.stringify({
+        statusCode: policy.status,
+        error: policy.error,
+        message: policy.message
+      }), {
+        status: policy.status,
+        headers: { "Content-Type": "application/json" }
+      });
+    }
     const executeQueueJoin = async () => {
       try {
+        const joinPayload = {
+          browser_id: envConfig.browserId,
+          tab_id,
+          req_id,
+          ...imgParams.model ? { model: imgParams.model } : {},
+          steps: imgParams.steps,
+          width: imgParams.width,
+          height: imgParams.height,
+          n_samples: imgParams.n_samples,
+          is_base_paid: policy.isBasePaid,
+          is_v5: policy.isV5,
+          declared_anlas: policy.costDetails.total
+        };
         const joinRes = await backgroundRequest({
           method: "POST",
           url: `${envConfig.VPS_HOST}/queue/join`,
@@ -522,7 +1592,7 @@
             "Content-Type": "application/json",
             "Authorization": `Bearer ${envConfig.deviceSecret}`
           },
-          data: JSON.stringify({ browser_id: envConfig.browserId, tab_id, req_id })
+          data: JSON.stringify(joinPayload)
         });
         if (joinRes.status === 401) {
           console.warn(`[${envConfig.logPrefix}] Server returned 401 on queue join. Restoring setup lock.`);
@@ -532,22 +1602,50 @@
           }
           return new Response(JSON.stringify({ statusCode: 401, message: "Device revoked." }), { status: 401 });
         }
-        if (joinRes.status === 403) {
+        if (joinRes.status !== 200) {
           let errorDetails = {};
           try {
-            errorDetails = JSON.parse(joinRes.responseText);
+            errorDetails = JSON.parse(joinRes.responseText || "{}");
           } catch (e) {
             console.error(`[${envConfig.logPrefix}]: Failed to parse error response text safely`, e);
           }
+          hideQueueStatusBanner();
           if (errorDetails.error === "ALLOWANCE_EXHAUSTED") {
-            hideQueueStatusBanner();
+            const msg = "Allowance Exhausted: You have run out of image tokens. Allowance refills at a rate of 1 image per 30 minutes (max 100).";
+            setHudAlert(msg, "error");
             return new Response(JSON.stringify({
               statusCode: 403,
-              message: "Allowance Exhausted: You have run out of image tokens. Allowance refills at a rate of 1 image per 30 minutes (max 100)."
+              error: "ALLOWANCE_EXHAUSTED",
+              message: msg
             }), { status: 403 });
           }
+          if (errorDetails.error === "DEBT_LOCKED") {
+            GM_setValue("anlas_bypass_enabled", false);
+            setClientPolicyState({ isInDebt: true, bypassEnabled: false });
+            refreshDualLedgerHud();
+          }
+          if (typeof envConfig.onTelemetryRefresh === "function" && (joinRes.status === 403 || joinRes.status === 429 || joinRes.status === 503)) {
+            setTimeout(() => {
+              try {
+                envConfig.onTelemetryRefresh();
+              } catch (_) {
+              }
+            }, 0);
+          }
+          if (joinRes.status === 400 || joinRes.status === 403 || joinRes.status === 429 || joinRes.status === 503) {
+            const msg = errorDetails.message || errorDetails.error || "Queue admission rejected.";
+            setHudAlert(msg, joinRes.status === 403 || joinRes.status === 503 ? "error" : "warning");
+            return new Response(JSON.stringify({
+              statusCode: joinRes.status,
+              error: errorDetails.error,
+              message: msg
+            }), {
+              status: joinRes.status,
+              headers: { "Content-Type": "application/json" }
+            });
+          }
+          throw new Error("Join rejection");
         }
-        if (joinRes.status !== 200) throw new Error("Join rejection");
       } catch (e) {
         return new Response(JSON.stringify({ statusCode: 502, message: "Queue allocation failure" }), { status: 502 });
       }
@@ -601,7 +1699,8 @@
           });
         }
       }
-      const isV5 = typeof imgParams.model === "string" && /[-_]5[-_]/i.test(imgParams.model) && !imgParams.model.includes("4-5");
+      const isV5Medium = isV5MediumModel(imgParams.model);
+      const isV5 = isV5ModelFamily(imgParams.model);
       updatedHeaders.set("x-browser-id", envConfig.browserId);
       updatedHeaders.set("x-request-id", req_id);
       updatedHeaders.set("x-gen-width", imgParams.width.toString());
@@ -609,10 +1708,17 @@
       updatedHeaders.set("x-gen-steps", imgParams.steps.toString());
       updatedHeaders.set("x-gen-samples", imgParams.n_samples.toString());
       updatedHeaders.set("x-precise-refs", imgParams.precise_refs.toString());
-      if (isV5) {
+      if (isV5Medium) {
+        updatedHeaders.set("x-gen-model", "V5-medium");
+      } else if (isV5) {
         updatedHeaders.set("x-gen-model", "V5");
       } else {
         updatedHeaders.set("x-gen-model", "legacy");
+      }
+      updatedHeaders.set("x-base-paid", policy.isBasePaid ? "true" : "false");
+      updatedHeaders.set("x-declared-anlas", policy.costDetails.total.toString());
+      if (scrapedAnlas !== null) {
+        updatedHeaders.set("x-scraped-anlas", scrapedAnlas.toString());
       }
       updatedHeaders.set("authorization", `Bearer ${envConfig.deviceSecret}`);
       updatedHeaders.set("x-script-version", GM_info.script.version);
@@ -841,6 +1947,7 @@
   var deviceSecret = GM_getValue("device_secret");
   var approved = GM_getValue("approved", false);
   var VPS_HOST = GM_getValue("vps_host", "");
+  var DEFAULT_BYPASS_HINT = "Allows >1MP, >1 sample, or >28 steps using Virtual Anlas. V5 High steps 24-28 remain locked on free tier.";
   try {
     if (!browserId || !deviceSecret) {
       browserId = "b_" + generateUUID();
@@ -1057,33 +2164,15 @@
     startUIEnforcement();
   } else {
     let startStatePolling = function() {
-      const poll = async () => {
-        if (!document.getElementById("gw-allowance-bar")) return;
-        try {
-          const res = await backgroundRequest({
-            method: "GET",
-            url: `${VPS_HOST}/auth/status?browser_id=${browserId}`,
-            headers: { "Authorization": `Bearer ${deviceSecret}` }
-          });
-          if (res.status === 200) {
-            const data = JSON.parse(res.responseText);
-            if (data.session) {
-              updateAllowanceBar(data.session.allowance, data.session.max, data.session.next_refill_in);
-            } else {
-              updateAllowanceBar(null, Infinity, 0);
-            }
-          }
-        } catch (e) {
-          console.error("GuildWeave (Guest): Failed to poll session state", e);
-        }
-      };
-      setInterval(poll, 1e4);
+      setInterval(pollTelemetryState, 1e4);
     }, renderSettingsPanelContent = function(container, onClose) {
       const nickname = GM_getValue("device_nickname", "Guest");
       const domain = GM_getValue("vps_host", "");
       const debugActive = GM_getValue("debug_mode", false);
       const imageCount = GM_getValue("count_image_gens", 0);
       const textCount = GM_getValue("count_text_gens", 0);
+      const policyState = getClientPolicyState();
+      const bypassChecked = Boolean(policyState.bypassEnabled) && !policyState.isInDebt;
       container.innerHTML = `
             <div style="display:flex; justify-content:space-between; align-items:center; border-bottom:1px solid var(--theme-bg2, #333); padding-bottom:10px; margin-bottom:12px;">
                 <h4 style="margin:0; color:var(--theme-accent, #00bc8c); font-size:15px; font-weight:bold; letter-spacing:0.5px;">GUILDWEAVE (GUEST)</h4>
@@ -1091,14 +2180,28 @@
             </div>
 
             <div style="background:var(--theme-bg1, #111); padding:12px; border-radius:6px; margin-bottom:12px; border:1px solid var(--theme-bg2, #333); font-size:11px; line-height:1.6;">
-                <label style="display:block; font-size:9px; color:var(--theme-textSecondary, #888); font-weight:bold; margin-bottom:6px; text-transform:uppercase;">Guest Telemetry & Profile</label>
+                <label style="display:block; font-size:9px; color:var(--theme-textSecondary, #888); font-weight:bold; margin-bottom:6px; text-transform:uppercase;">Guest Telemetry & Dual-Ledger Profile</label>
                 <div style="display:grid; grid-template-columns:1fr 1fr; gap:8px;">
                     <div>Assigned Tier: <span id="guest-assigned-tier" style="color:var(--theme-accent, #00bc8c); font-weight:bold;">Loading...</span></div>
                     <div>Precise Ref Limit: <span id="guest-precise-limit" style="color:var(--theme-warning, #f39c12); font-weight:bold;">Loading...</span></div>
-                    <div>Anlas Consumed: <span id="guest-anlas-consumed" style="color:var(--theme-error, #e74c3c); font-weight:bold;">0 Anlas</span></div>
+                    <div>Virtual Anlas: <span id="guest-virtual-anlas" style="color:var(--theme-accent, #00bc8c); font-weight:bold;">Loading...</span></div>
+                    <div>V5 Bank (NCP): <span id="guest-v5-bank" style="color:var(--theme-accent, #00bc8c); font-weight:bold;">Loading...</span></div>
+                    <div>Cluster Surplus: <span id="guest-v5-surplus" style="font-weight:bold;">Loading...</span></div>
+                    <div>Master V5 Battery: <span id="guest-v5-battery" style="font-weight:bold;">Loading...</span></div>
+                    <div>Cycle Consumed: <span id="guest-period-usage" style="font-weight:bold;">0A / 0 V5</span></div>
+                    <div>Lifetime Anlas: <span id="guest-anlas-consumed" style="color:var(--theme-error, #e74c3c); font-weight:bold;">0 Anlas</span></div>
                     <div>Rolling Allowance: <span id="guest-rolling-allowance" style="font-weight:bold;">Loading...</span></div>
-                    <div>Image Gens: <span style="font-weight:bold;">${imageCount}</span></div>
-                    <div>Text Gens: <span style="font-weight:bold;">${textCount}</span></div>
+                    <div>Local Gens (I / T): <span style="font-weight:bold;">${imageCount} / ${textCount}</span></div>
+                </div>
+            </div>
+
+            <div style="background:var(--theme-bg1, #111); padding:10px; border-radius:6px; margin-bottom:12px; border:1px solid var(--theme-bg2, #333); font-size:11px;">
+                <label style="display:flex; align-items:center; gap:8px; cursor:pointer; font-weight:bold; color:var(--theme-warning, #f39c12);">
+                    <input type="checkbox" id="settings-anlas-bypass" ${bypassChecked ? "checked" : ""} ${policyState.isInDebt ? "disabled" : ""} style="cursor:pointer;">
+                    Enable Anlas Bypass (High-Res / Steps / Samples)
+                </label>
+                <div id="settings-bypass-status" style="font-size:10px; color:var(--theme-textSecondary, #999); margin-top:4px; line-height:1.4;">
+                    ${policyState.isInDebt ? `<span style="color:var(--theme-error, #e74c3c); font-weight:bold;">Anlas Balance: ${policyState.virtualBalance} (Bypass Locked)</span>` : DEFAULT_BYPASS_HINT}
                 </div>
             </div>
 
@@ -1142,6 +2245,22 @@
         const closeBtn = container.querySelector("#guest-close-modal-btn");
         if (closeBtn) closeBtn.onclick = onClose;
       }
+      const bypassToggle = container.querySelector("#settings-anlas-bypass");
+      const bypassStatusEl = container.querySelector("#settings-bypass-status");
+      if (bypassToggle) {
+        bypassToggle.onchange = () => {
+          const latest = getClientPolicyState();
+          if (latest.isInDebt) {
+            bypassToggle.checked = false;
+            bypassToggle.disabled = true;
+            return;
+          }
+          const checked = Boolean(bypassToggle.checked);
+          GM_setValue("anlas_bypass_enabled", checked);
+          setClientPolicyState({ bypassEnabled: checked });
+          refreshDualLedgerHud();
+        };
+      }
       if (domain && deviceSecret) {
         backgroundRequest({
           method: "GET",
@@ -1150,12 +2269,52 @@
         }).then((res) => {
           if (res.status === 200) {
             const data = JSON.parse(res.responseText);
+            updateDualLedgerHud(data);
             const tierEl = container.querySelector("#guest-assigned-tier");
             if (tierEl) tierEl.textContent = data.tier || "Normal";
             const refEl = container.querySelector("#guest-precise-limit");
             if (refEl) refEl.textContent = data.precise_limit === "Unlimited" ? "Unlimited" : `${data.precise_limit} Refs`;
             const anlasEl = container.querySelector("#guest-anlas-consumed");
             if (anlasEl) anlasEl.textContent = `${data.anlas_consumed || 0} Anlas`;
+            const virtualEl = container.querySelector("#guest-virtual-anlas");
+            if (virtualEl && data.anlas) {
+              if (data.anlas.is_unlimited) {
+                virtualEl.textContent = "Unlimited";
+              } else if (data.anlas.is_in_debt) {
+                virtualEl.innerHTML = `<span style="color:var(--theme-error, #e74c3c);">${data.anlas.virtual_balance} (DEBT LOCKED)</span>`;
+              } else {
+                virtualEl.textContent = `${data.anlas.available_balance}/${data.anlas.monthly_quota} (No Rollover)`;
+              }
+            }
+            const v5BankEl = container.querySelector("#guest-v5-bank");
+            if (v5BankEl && data.v5) {
+              v5BankEl.textContent = data.v5.is_unlimited ? "Unlimited" : `${data.v5.available_ncp}/${data.v5.max_bank_ncp ?? data.v5.banked_ncp} NCP`;
+            }
+            const surplusEl = container.querySelector("#guest-v5-surplus");
+            if (surplusEl && data.v5) {
+              surplusEl.textContent = data.v5.surplus_eligible ? `${data.v5.surplus_available_ncp ?? 0} NCP` : "Ineligible";
+            }
+            const batteryEl = container.querySelector("#guest-v5-battery");
+            if (batteryEl && data.telemetry) {
+              const pct = typeof data.telemetry.master_v5_percent === "number" ? `${data.telemetry.master_v5_percent.toFixed(1)}%` : "--%";
+              const eta = typeof data.telemetry.next_percent_eta_ms === "number" && data.telemetry.next_percent_eta_ms > 0 ? ` (+1% in ${(data.telemetry.next_percent_eta_ms / 6e4).toFixed(1)}m)` : "";
+              batteryEl.textContent = `${pct} [${data.telemetry.cluster_state || "ok"}]${eta}`;
+            }
+            const periodEl = container.querySelector("#guest-period-usage");
+            if (periodEl && data.subscription_period) {
+              periodEl.textContent = `${data.subscription_period.anlas_consumed || 0}A / ${data.subscription_period.v5_consumed || 0} V5`;
+            }
+            if (bypassToggle && bypassStatusEl && data.anlas) {
+              if (data.anlas.is_in_debt) {
+                bypassToggle.checked = false;
+                bypassToggle.disabled = true;
+                bypassStatusEl.innerHTML = `<span style="color:var(--theme-error, #e74c3c); font-weight:bold;">Anlas Balance: ${data.anlas.virtual_balance} (Bypass Locked)</span>`;
+              } else {
+                bypassToggle.disabled = false;
+                bypassToggle.checked = Boolean(GM_getValue("anlas_bypass_enabled", false));
+                bypassStatusEl.innerHTML = DEFAULT_BYPASS_HINT;
+              }
+            }
             const sessionEl = container.querySelector("#guest-rolling-allowance");
             if (sessionEl) {
               if (data.session) {
@@ -1270,6 +2429,27 @@
         }
       };
     };
+    async function pollTelemetryState() {
+      if (!document.getElementById("gw-allowance-bar")) return;
+      try {
+        const res = await backgroundRequest({
+          method: "GET",
+          url: `${VPS_HOST}/auth/status?browser_id=${browserId}`,
+          headers: { "Authorization": `Bearer ${deviceSecret}` }
+        });
+        if (res.status === 200) {
+          const data = JSON.parse(res.responseText);
+          if (data.session) {
+            updateAllowanceBar(data.session.allowance, data.session.max, data.session.next_refill_in);
+          } else {
+            updateAllowanceBar(null, Infinity, 0);
+          }
+          updateDualLedgerHud(data);
+        }
+      } catch (e) {
+        console.error("GuildWeave (Guest): Failed to poll session state", e);
+      }
+    }
     initInterceptor({
       browserId,
       deviceSecret,
@@ -1287,7 +2467,8 @@
             window.location.reload();
           }
         });
-      }
+      },
+      onTelemetryRefresh: pollTelemetryState
     });
     async function openSettingsModal() {
       let modal = document.getElementById("vps-settings-modal");
@@ -1335,6 +2516,7 @@
     initDOMObserver({
       onOpenSettings: openSettingsModal
     });
+    syncUIControlConstraints(getClientPolicyState());
     startStatePolling();
   }
 })();

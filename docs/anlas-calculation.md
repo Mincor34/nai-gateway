@@ -1,6 +1,7 @@
 # Anlas Calculation
 
 (Imported from `caru-ini/novelai-sdk` - October 31, 2026 - [0d0a8d9])
+[!MAJOR DEVIATION - November 17, 2026 - GuildWeave] Updated to reflect reverse-engineered values and formulas from Module 643656 in NovelAI's Turbopack JavaScript chunk. (https://novelai.net/_next/static/chunks/2gk65nl2bm8-4.js?dpl=adc9438-43846402163-1)
 
 [GuildWeave comments in brackets]
 
@@ -27,7 +28,7 @@ families:
 - `nai-diffusion-5-*`
 - `custom`
 
-Those models all use the same base generation formula in the bundled frontend.
+Those models all enter the same base generation pricing branch in the bundled frontend (with `nai-diffusion-5-*` applying an additional `1.5x` multiplier, and `nai-diffusion-5-full-medium` using a special un-ceiled base expression).
 
 ## Model Grouping
 
@@ -36,9 +37,9 @@ The frontend first normalizes concrete model IDs into coarse groups:
 - `stableDiffusionXL`
 - `stableDiffusionXLFurry`
 - `v4`
+- `v5`
 
-For the SDK's supported model set, all supported models fall into one of those three
-groups, and all three groups share the same base-generation formula.
+For the SDK's supported model set, all supported models fall into one of those four groups, and all four groups share the same base-generation pricing branch (`v5` multiplies the post-SMEA value by `1.5`).
 
 ## Base Formula
 
@@ -49,20 +50,27 @@ Given:
 - `sm`
 - `sm_dyn`
 
-The frontend computes:
+For `nai-diffusion-5-full-medium` (and its inpainting model), the frontend ignores `steps` and computes the un-ceiled base value:
 
 ```text
-base = ceil(2.951823174884865e-6 * area + 5.753298233447344e-7 * area * steps * step_factor)
+base = (2.951823174884865e-6 * area + 5.753298233447344e-7 * area * 23) / 1.75
 ```
 
-`step_factor` is `1 / 1.06521739` for `nai-diffusion-5-full-medium` (and its
-inpainting model) and `1` for every other model. Medium always runs at 14 steps.
+Medium always runs at 14 steps.
 
-Then applies the SMEA multiplier:
+For every other model in this branch, the frontend computes:
+
+```text
+base = ceil(2.951823174884865e-6 * area + 5.753298233447344e-7 * area * steps)
+```
+
+Then applies the SMEA multiplier (and the `v5` multiplier if `group == "v5"`):
 
 ```text
 multiplier = 1.4 if sm and sm_dyn else 1.2 if sm else 1.0
 w = base * multiplier
+if group == "v5":
+    w *= 1.5
 ```
 
 ## Img2Img / Inpaint Strength
@@ -89,6 +97,7 @@ So there is always a minimum cost of `2` Anlas per billable image.
 If all of the following are true:
 
 - the account is Opus
+- the model's Opus usage limit is not exhausted (when applicable, e.g. `v5`)
 - `width * height <= 1_048_576`
 - `steps <= 28`
 
@@ -118,13 +127,11 @@ For Character / Precise Reference, the SDK currently models:
 character_reference_anlas = 5 * reference_count * requested_samples
 ```
 
-This is added on top of the base generation cost. In practice that means Opus can
-reduce the base generation cost to `0` while still leaving Character Reference cost.
+This is added on top of the base generation cost. In practice that means Opus can reduce the base generation cost to `0` while still leaving Character Reference cost.
 
 ## Vibe Surcharges
 
-For V4 and V4.5 models, the SDK also adds the two documented Vibe Transfer
-extras. V5 is excluded because it does not support Vibe Transfer or ControlNet:
+For V4 and V4.5 models, the SDK also adds the two documented Vibe Transfer extras. V5 is excluded because it does not support Vibe Transfer or ControlNet:
 
 - Each uncached Vibe encoding adds `2` Anlas
 - Each Vibe reference after the fourth adds `2` Anlas
@@ -201,15 +208,11 @@ inputs above 3MP are billed at the scaled-down 3MP-equivalent size, matching
 the UI's normalization.
 
 The upscale tool uses a different, bucket-based table
-(`[[1048576, 7], [786432, 5], [524288, 3], [409600, 2], [262144, 1]]`, free on
-Opus up to 409600 px) — not implemented because the SDK does not expose
-upscale yet. [Consider implementing this for GuildWeave.]
+(`[[1048576, 1], [1747627, 2], [2446678, 3], [3145728, 4]]`, returning `-3` for `0` or `> 3145728` px, with no Opus discount in the estimator function) — not implemented because the SDK does not expose upscale yet. [Consider implementing this for GuildWeave.]
 
 ### Price Table
 
-Computed with `calculate_augment_anlas()` at representative boundary sizes.
-"Standard tools" covers every tool except `bg-removal` (the price does not
-depend on the tool type).
+Computed with `calculate_augment_anlas()` at representative boundary sizes. "Standard tools" covers every tool except `bg-removal` (the price does not depend on the tool type).
 
 | Input size | Billed size | Standard tools | Standard tools (Opus) | bg-removal (any tier) |
 | --- | --- | ---: | ---: | ---: |

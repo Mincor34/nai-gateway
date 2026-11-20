@@ -139,6 +139,8 @@ class QueueCoordinator {
    * @param {object} [config] - Validated system configuration manifest.
    */
   constructor(config = null) {
+    this.telemetryProvider = null;     // Optional () => number callback injected by Level 5
+    this.onSurplusAccrual = null;      // Optional (newPoolNcp, accrualEpoch) => void persistence hook
     this.init(config);
     this.reset();
   }
@@ -177,10 +179,14 @@ class QueueCoordinator {
   }
 
   /**
-   * Resets all RAM-bound states to pristine baselines.
+   * Resets all RAM-bound operational states to pristine baselines while preserving
+   * Level 5 dependency-injection bindings unless `clearHooks` is explicitly requested.
    * Essential for deterministic unit and integration test teardowns.
+   *
+   * @param {object} [options={}] - Reset options.
+   * @param {boolean} [options.clearHooks=false] - Whether to also clear injected telemetry/persistence hooks.
    */
-  reset() {
+  reset({ clearHooks = false } = {}) {
     this.queue = [];
     this.deviceBuckets = new Map();    // Stores burst buckets keyed by principal (user_id || browser_id)
     this.activeSessions = new Map();   // browser_id -> last_active_at
@@ -189,8 +195,10 @@ class QueueCoordinator {
     this.debugIntents = new Map();     // browser_id -> timestamp
     this.v5SurplusPool = 0;            // RAM mirror of Cluster Surplus Pool (Bucket 2) in NCP
     this.v5SurplusLastAccrual = null;  // Epoch ms of last 24h Bucket 2 surplus evaluation (null = never accrued)
-    this.telemetryProvider = null;     // Optional () => number callback injected by Level 5
-    this.onSurplusAccrual = null;      // Optional (newPoolNcp, accrualEpoch) => void persistence hook
+    if (clearHooks) {
+      this.telemetryProvider = null;
+      this.onSurplusAccrual = null;
+    }
   }
 
   /**

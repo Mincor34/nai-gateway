@@ -1,25 +1,12 @@
 /**
  * GUILDWEAVE GATEWAY COORDINATOR (ADMIN PANEL)
- * Architecture Level 4: Administrative UI, Device Management, and Token Injector
+ * Architecture Level 4: Administrative UI, Dual-Ledger Governance, & Token Injector
  *
  * Implements a high-security control and telemetry layout on top of the NovelAI Single Page App (SPA).
  * Intercepts outbound generation requests, manages dynamic FIFO queuing, executes secure token swaps,
- * and coordinates the bilateral mutual-consent diagnostic debug authorization gate.
- *
- * SECURITY DESIGN PRINCIPLES:
- * 1. Privileged Background Transport: Outbound requests targeting the GuildWeave `/proxy/`, `/queue/`, and `/admin/`
- *    endpoints are routed using Tampermonkey's privileged background context (`GM_xmlhttpRequest`). This breaks
- *    through local Content Security Policy (CSP) headers served by novelai.net that would otherwise block
- *    connection sockets to your external gateway domain.
- * 2. High-Frequency UI Enforcement: NovelAI's React SPA aggressively cleans unmanaged DOM nodes during
- *    early render passes. Holds a 50ms polling loop during initial onboarding to guarantee the setup wizard
- *    stays mounted until valid administrative passkeys are verified.
- * 3. Authoritative Governance: Exposes immediate approval, revocation, tier assignment, hardware pruning,
- *    and permanent account banishment tools directly within the SPA viewport.
- * 4. Master Credential Injection: Directly pushes the paid account's Bearer session token to SQLite storage.
- * 5. Dedicated Single Presentation Portal: Eliminates redundant user settings sidebar tabs, housing both
- *    Device Governance and Operator Personal Settings (Debug Mode, Domain, and Nickname) in a unified modal
- *    invoked strictly by #gw-nav-badge and styled using NovelAI CSS custom properties.
+ * exposes dual-ledger Anlas/V5 NCP balances, subscription-period metrics, balance adjustment
+ * (`POST /admin/adjust-balance`), debt forgiveness (`POST /admin/reconcile-debt`), and coordinates
+ * the bilateral diagnostic debug authorization gate.
  */
 
 'use strict';
@@ -30,6 +17,9 @@ import {
   injectWarningBadge,
   removeWarningBadge,
   updateAllowanceBar,
+  updateDualLedgerHud,
+  refreshDualLedgerHud,
+  setClientPolicyState,
   initDOMObserver
 } from '../shared/ui.js';
 import { initInterceptor } from '../shared/interceptor.js';
@@ -38,9 +28,24 @@ let browserId = GM_getValue("browser_id");
 let deviceSecret = GM_getValue("admin_token"); // Admin uses system key directly as secret
 let approved = GM_getValue("approved", false);
 let VPS_HOST = GM_getValue("vps_host", "");
-let currentSort = GM_getValue("admin_sort_mode", "anlas"); // Persistence across browser refreshes
+let currentSort = GM_getValue("admin_sort_mode", "anlas");
 let activeSubTab = "governance"; // "governance" | "settings"
-const expandedKeys = new Set(); // Stores collapsible states of client groups (RAM-only)
+const expandedKeys = new Set();
+
+/**
+ * Strictly parses a signed safe integer from admin prompt text.
+ * Rejects floats ("12.5") and trailing junk ("50abc") that loose `parseInt()` accepts.
+ *
+ * @param {string} rawInput - Raw prompt string.
+ * @returns {number|null} Validated safe integer or null.
+ */
+function parseStrictPromptInt(rawInput) {
+    if (typeof rawInput !== 'string') return null;
+    const trimmed = rawInput.trim();
+    if (!/^-?\d+$/.test(trimmed)) return null;
+    const parsed = Number(trimmed);
+    return Number.isSafeInteger(parsed) ? parsed : null;
+}
 
 try {
     if (!browserId) {
@@ -51,16 +56,13 @@ try {
     console.error("GuildWeave (Admin): Storage initialization crash:", err);
 }
 
-// High-frequency UI enforcement loop (forces UI overlay to stay mounted and visible during initial config)
-// React's virtual DOM reconciliation frequently cleans unmanaged nodes during SPA boot;
-// this 50ms polling loop forces the setup wizard back into the DOM until registration completes.
 let enforcementInterval = null;
 
 function startUIEnforcement() {
     if (enforcementInterval) return;
     console.log("GuildWeave (Admin): Starting high-frequency UI enforcement loop...");
     enforcementInterval = setInterval(() => {
-        if (!document.body) return; // Wait for document body to construct
+        if (!document.body) return;
 
         let overlay = document.getElementById("vps-approval-overlay");
         if (!overlay) {
@@ -145,7 +147,6 @@ function renderSetupWizard(container) {
         step1Status.innerHTML = "Connecting to server...";
 
         try {
-            // Verification ping to confirm domain connection path is alive
             const res = await backgroundRequest({
                 method: "GET",
                 url: `${val}/auth/status?browser_id=ping`
@@ -283,6 +284,24 @@ function renderSetupWizard(container) {
 if (!approved || !VPS_HOST || !deviceSecret) {
     startUIEnforcement();
 } else {
+    async function pollAdminTelemetryState() {
+        if (!document.getElementById("gw-allowance-bar")) return;
+        try {
+            const res = await backgroundRequest({
+                method: "GET",
+                url: `${VPS_HOST}/auth/status?browser_id=${browserId}`,
+                headers: { "Authorization": `Bearer ${deviceSecret}` }
+            });
+            if (res.status === 200) {
+                const data = JSON.parse(res.responseText);
+                updateAllowanceBar(null, Infinity, 0);
+                updateDualLedgerHud(data);
+            }
+        } catch (e) {
+            console.error("GuildWeave (Admin): Failed to poll operator telemetry", e);
+        }
+    }
+
     initInterceptor({ 
         browserId, 
         deviceSecret, 
@@ -294,13 +313,10 @@ if (!approved || !VPS_HOST || !deviceSecret) {
                     window.location.reload();
                 }
             }, 500);
-        }
+        },
+        onTelemetryRefresh: pollAdminTelemetryState
     });
 
-    /**
-     * Standalone Themed Modal Portal for Administrator.
-     * Invoked strictly by #gw-nav-badge. Styled using NovelAI CSS custom properties.
-     */
     function openAdminModal() {
         let modal = document.getElementById("vps-admin-panel");
         let backdrop = document.getElementById("vps-admin-backdrop");
@@ -345,13 +361,6 @@ if (!approved || !VPS_HOST || !deviceSecret) {
         });
     }
 
-    /**
-     * Renders the complete, dual-tab unified administration console.
-     * Integrates Device Governance and Operator Personal Settings (Debug Mode, Domain, Nickname).
-     *
-     * @param {HTMLElement} container - Mount target element.
-     * @param {Function} [onClose] - Close callback.
-     */
     function renderAdminUnifiedView(container, onClose) {
         if (!container) return;
 
@@ -403,7 +412,7 @@ if (!approved || !VPS_HOST || !deviceSecret) {
     }
 
     /**
-     * Sub-Tab 1: Device Governance & Master Session Token Injector.
+     * Sub-Tab 1: Device Governance, Cluster Surplus Telemetry, Balance Adjustment & Master Token Injector.
      *
      * @param {HTMLElement} contentHost - Inner content container.
      * @param {HTMLElement} parentContainer - Outer dialog container.
@@ -411,10 +420,16 @@ if (!approved || !VPS_HOST || !deviceSecret) {
      */
     async function renderGovernanceTab(contentHost, parentContainer, onClose) {
         contentHost.innerHTML = `
-            <div style="margin-bottom:15px;">
+            <div style="margin-bottom:12px;">
                 <label style="display:block; font-size:10px; color:var(--theme-textSecondary, #888); font-weight:bold; margin-bottom:5px; text-transform:uppercase;">MASTER NOVELAI SESSION TOKEN</label>
-                <input type="password" id="vps-master-token-input" placeholder="Bearer jti_..." style="width:100%; background:var(--theme-bg1, #111); border:1px solid var(--theme-bg2, #444); color:var(--theme-text, #fff); padding:8px; font-size:11px; border-radius:4px; box-sizing:border-box; font-family:inherit;">
+                <input type="password" id="vps-master-token-input" placeholder="Paste NovelAI Opus token (JWT / pst-...)" style="width:100%; background:var(--theme-bg1, #111); border:1px solid var(--theme-bg2, #444); color:var(--theme-text, #fff); padding:8px; font-size:11px; border-radius:4px; box-sizing:border-box; font-family:inherit;">
                 <button id="vps-btn-push-token" style="background:var(--theme-success, #27ae60); border:none; color:var(--theme-bg0, #fff); padding:8px 12px; margin-top:8px; font-size:11px; font-weight:bold; cursor:pointer; border-radius:4px; width:100%; font-family:inherit;">PUSH TO GUILDWEAVE STORAGE</button>
+            </div>
+
+            <div id="admin-cluster-telemetry" style="background:var(--theme-bg1, #111); padding:8px 10px; border-radius:4px; border:1px solid var(--theme-bg2, #333); margin-bottom:12px; font-size:10px; display:flex; justify-content:space-between; gap:6px; flex-wrap:wrap; color:var(--theme-textSecondary, #aaa);">
+                <span>Battery: <strong id="admin-stat-battery" style="color:var(--theme-accent, #00bc8c);">--%</strong></span>
+                <span>Surplus: <strong id="admin-stat-surplus" style="color:var(--theme-warning, #f39c12);">-- NCP</strong></span>
+                <span>Master Anlas: <strong id="admin-stat-anlas" style="color:var(--theme-text, #fff);">--</strong></span>
             </div>
 
             <div style="border-top:1px solid var(--theme-bg2, #333); padding-top:12px;">
@@ -434,7 +449,6 @@ if (!approved || !VPS_HOST || !deviceSecret) {
             </div>
         `;
 
-        // Handle master session token submission
         const pushBtn = contentHost.querySelector("#vps-btn-push-token");
         if (pushBtn) {
             pushBtn.onclick = async () => {
@@ -455,7 +469,6 @@ if (!approved || !VPS_HOST || !deviceSecret) {
             };
         }
 
-        // Attach event listeners for sort operations
         contentHost.querySelectorAll(".sort-trigger").forEach(el => {
             el.onclick = (e) => {
                 e.preventDefault();
@@ -475,12 +488,46 @@ if (!approved || !VPS_HOST || !deviceSecret) {
                 let groups = JSON.parse(res.responseText);
                 const container = contentHost.querySelector("#vps-client-list");
                 if (!container) return;
+
+                backgroundRequest({
+                    method: "GET",
+                    url: `${VPS_HOST}/admin/global-stats`,
+                    headers: { "Authorization": `Bearer ${deviceSecret}` }
+                }).then(statsRes => {
+                    if (statsRes && statsRes.status === 200 && statsRes.responseText) {
+                        const stats = JSON.parse(statsRes.responseText);
+                        const batEl = contentHost.querySelector("#admin-stat-battery");
+                        if (batEl && stats.telemetry) {
+                            const pctStr = typeof stats.telemetry.master_v5_percent === 'number'
+                                ? `${stats.telemetry.master_v5_percent.toFixed(1)}%`
+                                : '--%';
+                            if (stats.telemetry.subscription_active === false) {
+                                batEl.style.color = 'var(--theme-error, #e74c3c)';
+                                batEl.textContent = `${pctStr} [INACTIVE]`;
+                            } else if (stats.telemetry.is_grace_period) {
+                                batEl.style.color = 'var(--theme-warning, #f39c12)';
+                                batEl.textContent = `${pctStr} [GRACE]`;
+                            } else {
+                                batEl.style.color = 'var(--theme-accent, #00bc8c)';
+                                batEl.textContent = pctStr;
+                            }
+                        }
+                        const surEl = contentHost.querySelector("#admin-stat-surplus");
+                        if (surEl && typeof stats.v5_surplus_available === 'number') {
+                            surEl.textContent = `${stats.v5_surplus_available}/${stats.v5_surplus_pool} NCP`;
+                        }
+                        const anlasStatEl = contentHost.querySelector("#admin-stat-anlas");
+                        if (anlasStatEl && stats.telemetry && stats.telemetry.master_anlas !== null && stats.telemetry.master_anlas !== undefined) {
+                            anlasStatEl.textContent = `${stats.telemetry.master_anlas}`;
+                        }
+                    }
+                }).catch(() => {});
+
                 if (groups.length === 0) {
                     container.innerHTML = "No clients pending registration.";
                     return;
                 }
 
-                // Execute selected sort criteria
                 groups.sort((a, b) => {
                     if (currentSort === "anlas") return b.anlas_consumed - a.anlas_consumed;
                     if (currentSort === "reqs") return b.total_requests - a.total_requests;
@@ -491,21 +538,22 @@ if (!approved || !VPS_HOST || !deviceSecret) {
 
                 container.innerHTML = "";
                 groups.forEach(group => {
-                    const selectorId = group.discord_id || group.devices[0].browser_id;
+                    const selectorId = group.user_id || group.discord_id || (group.devices && group.devices[0] ? group.devices[0].browser_id : '');
                     const isLinked = !!group.discord_id;
                     const isExpanded = expandedKeys.has(selectorId);
                     
                     const el = document.createElement("div");
                     el.style.cssText = `background:var(--theme-bg1, #222); border-radius:4px; border:1px solid ${group.banned === 1 ? 'var(--theme-error, #c0392b)' : 'var(--theme-bg2, #333)'}; overflow:hidden; display:flex; flex-direction:column; transition: border-color 0.2s;`;
 
-                    // Online/Offline & Status tags
                     const statusDotColor = group.is_online ? "var(--theme-success, #2ecc71)" : "var(--theme-textSecondary, #7f8c8d)";
                     const statusTitle = group.is_online ? "Online" : "Offline";
                     const bannedBadge = group.banned === 1 
                         ? `<span style="background:var(--theme-error, #c0392b); color:#fff; font-size:8px; padding:1px 4px; border-radius:2px; font-weight:bold; margin-left:6px;">BANNED</span>` 
                         : '';
+                    const debtBadge = group.is_in_debt
+                        ? `<span style="background:var(--theme-error, #e74c3c); color:#fff; font-size:8px; padding:1px 4px; border-radius:2px; font-weight:bold; margin-left:4px;">DEBT</span>`
+                        : '';
 
-                    // In-band debug intent badge indicator on header
                     let headerDebugBadge = '';
                     if (group.has_debug_authorized) {
                         headerDebugBadge = `<span style="background:var(--theme-success, #27ae60); color:#fff; font-size:8px; padding:1px 4px; border-radius:2px; font-weight:bold; margin-left:6px;">DEBUG ACTIVE</span>`;
@@ -513,13 +561,13 @@ if (!approved || !VPS_HOST || !deviceSecret) {
                         headerDebugBadge = `<span style="background:var(--theme-warning, #e67e22); color:#fff; font-size:8px; padding:1px 4px; border-radius:2px; font-weight:bold; margin-left:6px;">DEBUG REQUESTED</span>`;
                     }
 
-                    // Collapsed condensed header markup
                     el.innerHTML = `
                         <div class="client-card-header" data-key="${selectorId}" style="padding:10px 12px; cursor:pointer; display:flex; align-items:center; justify-content:space-between; background:var(--theme-bg0, #1e1e1e); user-select:none;">
                             <div style="display:flex; align-items:center; gap:8px; max-width:60%;">
                                 <div style="width:7px; height:7px; border-radius:50%; background:${statusDotColor};" title="${statusTitle}"></div>
                                 <span style="font-weight:bold; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; color:var(--theme-text, #fff);">${group.discord_username}</span>
                                 ${bannedBadge}
+                                ${debtBadge}
                                 ${headerDebugBadge}
                             </div>
                             <div style="font-size:10px; color:var(--theme-textSecondary, #aaa); display:flex; gap:10px; align-items:center;">
@@ -530,18 +578,16 @@ if (!approved || !VPS_HOST || !deviceSecret) {
                         </div>
                     `;
 
-                    // Expanded detailed view panel
                     if (isExpanded) {
                         const body = document.createElement("div");
                         body.style.cssText = "padding:12px; border-top:1px solid var(--theme-bg2, #333); background:var(--theme-bg1, #252525); display:flex; flex-direction:column; gap:10px;";
                         
                         let devicesHtml = '';
-                        group.devices.forEach(d => {
+                        (group.devices || []).forEach(d => {
                             const devOnlineColor = d.is_online ? "var(--theme-success, #2ecc71)" : "var(--theme-textSecondary, #7f8c8d)";
                             const devBannedBadge = d.banned === 1 ? `<span style="color:var(--theme-error, #e74c3c); font-weight:bold; margin-left:4px;">(BANNED)</span>` : '';
                             const allowanceBadge = d.metered_allowance !== null ? `<span style="color:var(--theme-warning, #f39c12); font-weight:bold; margin-left:6px;">[${d.metered_allowance}/100 Imgs]</span>` : '';
                             
-                            // Bilateral Debug Status Badges & Action Buttons
                             let devDebugBadge = '';
                             let devDebugBtn = '';
 
@@ -569,15 +615,36 @@ if (!approved || !VPS_HOST || !deviceSecret) {
                         });
 
                         const lastActiveDate = group.last_active_at > 0 ? new Date(group.last_active_at).toLocaleTimeString() : 'Never';
+                        const virtualAnlasStr = group.anlas_unlimited
+                            ? 'Unlimited'
+                            : (group.virtual_anlas_balance !== undefined ? `${group.available_anlas_balance ?? group.virtual_anlas_balance}/${group.virtual_anlas_balance}` : '--');
+                        const v5BankStr = group.v5_banked_balance !== undefined
+                            ? `${group.v5_available_balance ?? group.v5_banked_balance}/${group.v5_banked_balance} NCP`
+                            : '-- NCP';
+                        const periodStr = `${group.subscription_period_anlas ?? 0}A / ${group.subscription_period_v5 ?? 0} V5`;
+
                         const banToggleBtn = group.banned === 1 
                             ? `<button class="btn-unban-group" data-key="${selectorId}" data-is-discord="${isLinked}" style="background:var(--theme-success, #27ae60); border:none; color:#fff; padding:5px 10px; font-size:10px; cursor:pointer; border-radius:3px; font-weight:bold; flex:1; font-family:inherit;">UNBAN USER</button>`
                             : `<button class="btn-ban-group" data-key="${selectorId}" data-is-discord="${isLinked}" style="background:var(--theme-error, #c0392b); border:none; color:#fff; padding:5px 10px; font-size:10px; cursor:pointer; border-radius:3px; font-weight:bold; flex:1; font-family:inherit;">BAN USER</button>`;
+
+                        const forgiveBtn = group.is_in_debt
+                            ? `<button class="btn-reconcile-debt" data-key="${selectorId}" data-is-discord="${isLinked}" style="background:var(--theme-warning, #e67e22); border:none; color:#fff; padding:4px 8px; font-size:9px; cursor:pointer; border-radius:3px; font-weight:bold; font-family:inherit;">FORGIVE DEBT</button>`
+                            : '';
 
                         body.innerHTML = `
                             <div style="display:grid; grid-template-columns:1fr 1fr; gap:6px; font-size:10px; color:var(--theme-textSecondary, #aaa); margin-bottom:4px;">
                                 <div>Tier: <strong style="color:var(--theme-accent, #00bc8c);">${group.priority_tier}</strong></div>
                                 <div>Last Active: <strong style="color:var(--theme-text, #fff);">${lastActiveDate}</strong></div>
-                                <div style="grid-column: span 2;">Discord ID: <code style="background:var(--theme-bg0, #111); padding:2px 4px; border-radius:2px; color:var(--theme-textSecondary, #888);">${group.discord_id || 'Unlinked'}</code></div>
+                                <div>Virtual Anlas: <strong style="color:${group.is_in_debt ? 'var(--theme-error, #e74c3c)' : 'var(--theme-accent, #00bc8c)'};">${virtualAnlasStr}</strong></div>
+                                <div>V5 Bank: <strong style="color:var(--theme-text, #fff);">${v5BankStr}</strong></div>
+                                <div>Cycle Usage: <strong style="color:var(--theme-text, #fff);">${periodStr}</strong></div>
+                                <div>Discord ID: <code style="background:var(--theme-bg0, #111); padding:2px 4px; border-radius:2px; color:var(--theme-textSecondary, #888);">${group.discord_id || 'Unlinked'}</code></div>
+                            </div>
+
+                            <div style="display:flex; gap:6px; align-items:center;">
+                                ${!group.anlas_unlimited ? `<button class="btn-adjust-anlas" data-key="${selectorId}" data-is-discord="${isLinked}" style="background:#16a085; border:none; color:#fff; padding:4px 8px; font-size:9px; cursor:pointer; border-radius:3px; font-weight:bold; font-family:inherit;">ADJUST ANLAS</button>` : ''}
+                                <button class="btn-adjust-v5" data-key="${selectorId}" data-is-discord="${isLinked}" style="background:#2980b9; border:none; color:#fff; padding:4px 8px; font-size:9px; cursor:pointer; border-radius:3px; font-weight:bold; font-family:inherit;">ADJUST V5 NCP</button>
+                                ${forgiveBtn}
                             </div>
 
                             <div style="background:var(--theme-bg0, #1a1a1a); padding:8px; border-radius:4px; border:1px solid var(--theme-bg2, #333);">
@@ -604,7 +671,6 @@ if (!approved || !VPS_HOST || !deviceSecret) {
                     container.appendChild(el);
                 });
 
-                // Expand/collapse click events
                 contentHost.querySelectorAll(".client-card-header").forEach(h => {
                     h.onclick = (e) => {
                         const key = e.currentTarget.getAttribute("data-key");
@@ -614,7 +680,66 @@ if (!approved || !VPS_HOST || !deviceSecret) {
                     };
                 });
 
-                // Bilateral Debug Arm/Disarm Action Button
+                contentHost.querySelectorAll(".btn-adjust-anlas").forEach(b => {
+                    b.onclick = async (e) => {
+                        const target = e.currentTarget;
+                        const key = target.getAttribute("data-key");
+                        const isDiscord = target.getAttribute("data-is-discord") === "true";
+                        const rawDelta = prompt("Enter signed integer Anlas delta (e.g. 100 or -50):");
+                        if (rawDelta === null) return;
+                        const delta = parseStrictPromptInt(rawDelta);
+                        if (delta === null) return alert("Invalid integer delta.");
+                        const payload = isDiscord ? { discord_id: key, anlas_delta: delta } : { user_id: key, anlas_delta: delta };
+                        const actionRes = await backgroundRequest({
+                            method: "POST",
+                            url: `${VPS_HOST}/admin/adjust-balance`,
+                            headers: { "Content-Type": "application/json", "Authorization": `Bearer ${deviceSecret}` },
+                            data: JSON.stringify(payload)
+                        });
+                        if (actionRes.status === 200) renderGovernanceTab(contentHost, parentContainer, onClose);
+                        else alert("Failed to adjust Anlas balance.");
+                    };
+                });
+
+                contentHost.querySelectorAll(".btn-adjust-v5").forEach(b => {
+                    b.onclick = async (e) => {
+                        const target = e.currentTarget;
+                        const key = target.getAttribute("data-key");
+                        const isDiscord = target.getAttribute("data-is-discord") === "true";
+                        const rawDelta = prompt("Enter signed integer V5 NCP delta (e.g. 36 or -18):");
+                        if (rawDelta === null) return;
+                        const delta = parseStrictPromptInt(rawDelta);
+                        if (delta === null) return alert("Invalid integer delta.");
+                        const payload = isDiscord ? { discord_id: key, v5_ncp_delta: delta } : { user_id: key, v5_ncp_delta: delta };
+                        const actionRes = await backgroundRequest({
+                            method: "POST",
+                            url: `${VPS_HOST}/admin/adjust-balance`,
+                            headers: { "Content-Type": "application/json", "Authorization": `Bearer ${deviceSecret}` },
+                            data: JSON.stringify(payload)
+                        });
+                        if (actionRes.status === 200) renderGovernanceTab(contentHost, parentContainer, onClose);
+                        else alert("Failed to adjust V5 NCP balance.");
+                    };
+                });
+
+                contentHost.querySelectorAll(".btn-reconcile-debt").forEach(b => {
+                    b.onclick = async (e) => {
+                        const target = e.currentTarget;
+                        const key = target.getAttribute("data-key");
+                        const isDiscord = target.getAttribute("data-is-discord") === "true";
+                        if (!confirm(`Forgive outstanding Anlas debt for ${key}?`)) return;
+                        const payload = isDiscord ? { discord_id: key } : { user_id: key };
+                        const actionRes = await backgroundRequest({
+                            method: "POST",
+                            url: `${VPS_HOST}/admin/reconcile-debt`,
+                            headers: { "Content-Type": "application/json", "Authorization": `Bearer ${deviceSecret}` },
+                            data: JSON.stringify(payload)
+                        });
+                        if (actionRes.status === 200) renderGovernanceTab(contentHost, parentContainer, onClose);
+                        else alert("Failed to reconcile Anlas debt.");
+                    };
+                });
+
                 contentHost.querySelectorAll(".btn-toggle-debug").forEach(b => {
                     b.onclick = async (e) => {
                         const bid = e.currentTarget.getAttribute("data-id");
@@ -631,7 +756,6 @@ if (!approved || !VPS_HOST || !deviceSecret) {
                     };
                 });
 
-                // Hardened action buttons utilizing e.currentTarget to bypass inner-node click tracking anomalies
                 contentHost.querySelectorAll(".btn-approve-group").forEach(b => {
                     b.onclick = async (e) => {
                         const target = e.currentTarget;
@@ -726,8 +850,8 @@ if (!approved || !VPS_HOST || !deviceSecret) {
     }
 
     /**
-     * Sub-Tab 2: Operator Personal Profile, Nickname, Domain, and Debug Mode Consent.
-     * Synchronously renders the DOM shell from local persistent memory; hydrates telemetry asynchronously.
+     * Sub-Tab 2: Operator Personal Profile, Dual-Ledger Telemetry, Subscription-Period Usage,
+     * Bypass Toggle, Nickname, Domain, and Debug Consent.
      *
      * @param {HTMLElement} contentHost - Inner content container.
      * @param {Function} [onClose] - Close handler.
@@ -738,19 +862,28 @@ if (!approved || !VPS_HOST || !deviceSecret) {
         const debugActive = GM_getValue("debug_mode", false);
         const imageCount = GM_getValue("count_image_gens", 0);
         const textCount = GM_getValue("count_text_gens", 0);
+        const bypassChecked = Boolean(GM_getValue("anlas_bypass_enabled", false));
 
-        // Synchronous DOM Mounting: Guarantees zero latency and instantaneous input availability
         contentHost.innerHTML = `
             <div style="background:var(--theme-bg1, #111); padding:12px; border-radius:6px; margin-bottom:12px; border:1px solid var(--theme-bg2, #333); font-size:11px; line-height:1.6;">
                 <label style="display:block; font-size:9px; color:var(--theme-textSecondary, #888); font-weight:bold; margin-bottom:6px; text-transform:uppercase;">Operator Telemetry & Profile</label>
                 <div style="display:grid; grid-template-columns:1fr 1fr; gap:8px;">
                     <div>Assigned Tier: <span style="color:var(--theme-accent, #00bc8c); font-weight:bold;">Admin</span></div>
                     <div>Precise Ref Limit: <span id="operator-precise-limit" style="color:var(--theme-warning, #f39c12); font-weight:bold;">Unlimited</span></div>
-                    <div>Anlas Consumed: <span id="operator-anlas-consumed" style="color:var(--theme-error, #e74c3c); font-weight:bold;">0 Anlas</span></div>
+                    <div>Master Battery: <span id="operator-v5-battery" style="color:var(--theme-accent, #00bc8c); font-weight:bold;">--%</span></div>
+                    <div>Cluster Surplus: <span id="operator-v5-surplus" style="font-weight:bold;">-- NCP</span></div>
+                    <div>Cycle Consumed: <span id="operator-period-usage" style="font-weight:bold;">0A / 0 V5</span></div>
+                    <div>Lifetime Anlas: <span id="operator-anlas-consumed" style="color:var(--theme-error, #e74c3c); font-weight:bold;">0 Anlas</span></div>
                     <div>Rolling Allowance: <span style="color:var(--theme-accent, #00bc8c); font-weight:bold;">Exempt (Unlimited)</span></div>
-                    <div>Image Gens: <span style="font-weight:bold;">${imageCount}</span></div>
-                    <div>Text Gens: <span style="font-weight:bold;">${textCount}</span></div>
+                    <div>Local Gens (I / T): <span style="font-weight:bold;">${imageCount} / ${textCount}</span></div>
                 </div>
+            </div>
+
+            <div style="background:var(--theme-bg1, #111); padding:10px; border-radius:6px; margin-bottom:12px; border:1px solid var(--theme-bg2, #333); font-size:11px;">
+                <label style="display:flex; align-items:center; gap:8px; cursor:pointer; font-weight:bold; color:var(--theme-warning, #f39c12);">
+                    <input type="checkbox" id="settings-anlas-bypass" ${bypassChecked ? 'checked' : ''} style="cursor:pointer;">
+                    Enable Anlas Bypass (High-Res / Steps / Samples)
+                </label>
             </div>
 
             <div style="margin-bottom:12px;">
@@ -788,7 +921,16 @@ if (!approved || !VPS_HOST || !deviceSecret) {
             </div>
         `;
 
-        // Asynchronous Telemetry Hydration: Updates ledger stats when network resolves without blocking UI
+        const bypassCheckbox = contentHost.querySelector("#settings-anlas-bypass");
+        if (bypassCheckbox) {
+            bypassCheckbox.onchange = () => {
+                const checked = Boolean(bypassCheckbox.checked);
+                GM_setValue("anlas_bypass_enabled", checked);
+                setClientPolicyState({ bypassEnabled: checked });
+                refreshDualLedgerHud();
+            };
+        }
+
         if (domain && deviceSecret) {
             backgroundRequest({
                 method: "GET",
@@ -797,10 +939,24 @@ if (!approved || !VPS_HOST || !deviceSecret) {
             }).then(res => {
                 if (res.status === 200) {
                     const data = JSON.parse(res.responseText);
+                    updateDualLedgerHud(data);
                     const anlasEl = contentHost.querySelector('#operator-anlas-consumed');
                     if (anlasEl) anlasEl.textContent = `${data.anlas_consumed || 0} Anlas`;
+                    const periodEl = contentHost.querySelector('#operator-period-usage');
+                    if (periodEl && data.subscription_period) {
+                        periodEl.textContent = `${data.subscription_period.anlas_consumed || 0}A / ${data.subscription_period.v5_consumed || 0} V5`;
+                    }
                     const refEl = contentHost.querySelector('#operator-precise-limit');
                     if (refEl) refEl.textContent = data.precise_limit === "Unlimited" ? "Unlimited" : `${data.precise_limit} Refs`;
+                    const batEl = contentHost.querySelector('#operator-v5-battery');
+                    if (batEl && data.telemetry && typeof data.telemetry.master_v5_percent === 'number') {
+                        const subSuffix = data.telemetry.subscription_active === false ? ' [INACTIVE]' : '';
+                        batEl.textContent = `${data.telemetry.master_v5_percent.toFixed(1)}% [${data.telemetry.cluster_state || 'ok'}]${subSuffix}`;
+                    }
+                    const surEl = contentHost.querySelector('#operator-v5-surplus');
+                    if (surEl && data.v5) {
+                        surEl.textContent = `${data.v5.surplus_available_ncp ?? 0} NCP`;
+                    }
                     const devicesEl = contentHost.querySelector('#operator-linked-devices');
                     if (devicesEl && data.linked_devices && data.linked_devices.length > 0) {
                         devicesEl.innerHTML = data.linked_devices.map(d => `- \`${d.id.substring(0, 10)}...\` (${d.label})`).join('<br>');
@@ -866,11 +1022,10 @@ if (!approved || !VPS_HOST || !deviceSecret) {
         };
     }
 
-    // Initialize unified DOM observer strictly for Badge, Allowance bar, and Button shield
     initDOMObserver({
         onOpenSettings: openAdminModal
     });
 
-    // Invariant: Enforce immediate display of Exempt status on the allowance bar for Administrator
     updateAllowanceBar(null, Infinity, 0);
+    setInterval(pollAdminTelemetryState, 10000);
 }

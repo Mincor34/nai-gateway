@@ -2,26 +2,33 @@
  * PHASE 8 COMMIT 2 VERIFICATION HARNESS (test/phase8_commit2_pricing_parser.test.js)
  *
  * Exhaustively exercises:
- * 1. Authoritative Anlas Pricing Engine:
+ * 1. Authoritative Anlas Pricing Engine (Module 643656 Parity):
  *    - Baseline Opus Lightweight Bonus (1024x1024, <=28 steps, 1 sample -> 0 Anlas).
  *    - Opus Lightweight Bonus Multi-sample (1024x1024, 28 steps, 2 samples -> 20 Anlas, 1 sample free).
- *    - High-resolution Opus generation (>1MP -> full sample billing at 60 Anlas).
- *    - V5 Medium Effort step_factor (1 / 1.06521739) parity:
+ *    - High-resolution Opus generation (>1MP -> full sample billing at 60 Anlas on V4.5).
+ *    - V5 Full (1.5x multiplier) live parity against ANLAS_ACTUAL.md:
+ *      * 832x1216 @ 29 steps -> 30 Anlas; 1024x1024 @ 29 steps -> 32 Anlas
+ *      * 1024x1024 @ 35 steps -> 38 Anlas; 1024x1024 @ 50 steps -> 51 Anlas
+ *      * 1024x1024 @ 23 steps x 4 -> 78 Anlas; 1472x1472 @ 28 steps -> 63 Anlas
+ *      * 1536x2048 @ 28 steps -> 90 Anlas
+ *    - V5 Medium Effort un-ceiled `/ 1.75` + `1.5x` V5 multiplier parity against ANLAS_ACTUAL.md:
  *      * Free baseline (1024x1024, 14 steps, 1 sample -> 0 Anlas).
  *      * Free baseline deadband bypass (1024x1024, 50 steps, 1 sample -> 0 Anlas, steps ignored).
- *      * Anlas-paid multi-sample (1024x1024, 14 steps, 2 samples -> 12 Anlas, exact step_factor parity).
- *      * Anlas-paid high-res (1536x2048, 14 steps, 1 sample -> 34 Anlas, exact step_factor parity).
- *      * Auxiliary step parameter override immunity (1536x2048, 50 steps, 1 sample -> 34 Anlas).
+ *      * Anlas-paid multi-sample (1024x1024, 2 samples -> 15 Anlas; 4 samples -> 45 Anlas).
+ *      * Anlas-paid high-res (1472x1472, 1 sample -> 31 Anlas; 4 samples -> 124 Anlas; 1536x2048, 1 sample -> 44 Anlas).
+ *      * Auxiliary step parameter override immunity (1536x2048, 50 steps, 1 sample -> 44 Anlas).
+ *    - `usageNegative: true` Opus Lightweight Bonus revocation on V5 multi-sample (`1024x1024, 2 samples` -> 52 High / 30 Medium)
+ *      without revoking V4.5 Opus discount.
  *    - Character Reference surcharges (5 Anlas per reference per requested sample).
  *    - Structured Reference array fallback extraction in pricing calculations.
- *    - SMEA & SMEA-DYN multipliers (1.2x and 1.4x).
+ *    - SMEA & SMEA-DYN multipliers (1.2x and 1.4x, including V5 1.5x interaction).
  *    - Img2Img & Inpaint strength scaling (with minimum 2 Anlas floor and NaN resilience).
  *    - Arbitrage Denial Invariant: Passing strength without an image defaults strictly to 1.0 (20 Anlas).
  *    - Inpainting Isolation Invariant: Mask presence evaluates inpaintImg2ImgStrength exclusively without strength fallback.
  *    - Multipart Img2Img/Inpaint Detection: Verifies binary name="image" and name="mask" parts apply strength scaling.
  *    - Vibe transfer surcharges on V4/V4.5 (2 Anlas per uncached encode, 2 Anlas per ref beyond 4).
  *    - Vibe immunity on V5 (vibe surcharges strictly 0 across all V5 identifier variants).
- *    - Hard per-image cap at 140 Anlas (structured exception thrown).
+ *    - Hard per-image cap at 140 Anlas (structured exception thrown, including V5 1536x2048 @ 50 steps = 150 > 140).
  *    - Hell Path: Array and Object coercive type injections (e.g. strength: [], width: [1024]).
  *    - Model decoupling sanity: Rejection of V4.5 models attempting to spoof V5 Medium identity.
  * 2. Zero-Copy Binary Buffer Parser:
@@ -79,8 +86,7 @@ const {
   calculateAnlasCostDetails,
   extractParametersFromRawBody,
   formatPayloadForLogging,
-  runBackgroundAudit,
-  MAX_JSON_PART_BYTES
+  runBackgroundAudit
 } = require('../auditEngine');
 
 const SANDBOX_DB_FILE = path.join(__dirname, 'test_sandbox_phase8_commit2.db');
@@ -111,7 +117,7 @@ test("Phase 8 Commit 2: Anlas Pricing Engine & Zero-Copy Binary Buffer Parser", 
   // ---------------------------------------------------------------------------
   // 1. ANLAS PRICING ENGINE TESTS
   // ---------------------------------------------------------------------------
-  await t.test("Pricing Engine: Baseline Opus Free-Tier Lightweight Bonus", () => {
+  await t.test("Pricing Engine: Baseline Opus Free-Tier Lightweight Bonus & V4.5 Parity", () => {
     // 1024x1024, 28 steps, 1 sample on Opus tier -> 0 Anlas
     const costFree = calculateAnlasCost({
       width: 1024,
@@ -144,9 +150,17 @@ test("Phase 8 Commit 2: Anlas Pricing Engine & Zero-Copy Binary Buffer Parser", 
     }, { isOpus: false });
 
     assert.strictEqual(costNonOpus, 20, "Non-Opus tier must bill 20 Anlas for 1024x1024 28 steps");
+
+    // Live V4.5 parity cases from ANLAS_ACTUAL.md
+    assert.strictEqual(calculateAnlasCost({ width: 832, height: 1216, steps: 29, n_samples: 1, model: "nai-diffusion-4-5-full" }), 20);
+    assert.strictEqual(calculateAnlasCost({ width: 1024, height: 1024, steps: 29, n_samples: 1, model: "nai-diffusion-4-5-full" }), 21);
+    assert.strictEqual(calculateAnlasCost({ width: 1024, height: 1024, steps: 35, n_samples: 1, model: "nai-diffusion-4-5-full" }), 25);
+    assert.strictEqual(calculateAnlasCost({ width: 1024, height: 1024, steps: 50, n_samples: 1, model: "nai-diffusion-4-5-full" }), 34);
+    assert.strictEqual(calculateAnlasCost({ width: 1024, height: 1024, steps: 23, n_samples: 4, model: "nai-diffusion-4-5-full" }), 51);
+    assert.strictEqual(calculateAnlasCost({ width: 1472, height: 1472, steps: 28, n_samples: 1, model: "nai-diffusion-4-5-full" }), 42);
   });
 
-  await t.test("Pricing Engine: High-Resolution Scaling on Opus Tier", () => {
+  await t.test("Pricing Engine: High-Resolution Scaling on V4.5 and V5 Full (1.5x Multiplier)", () => {
     // 1536x2048 (area = 3,145,728 > 1MP), 28 steps, 1 sample
     // base = ceil(2.951823174884865e-6 * 3145728 + 5.753298233447344e-7 * 3145728 * 28) = ceil(9.2856 + 50.6761) = ceil(59.96) = 60
     const costHighRes = calculateAnlasCost({
@@ -157,10 +171,20 @@ test("Phase 8 Commit 2: Anlas Pricing Engine & Zero-Copy Binary Buffer Parser", 
       model: "nai-diffusion-4-5-full"
     }, { isOpus: true });
 
-    assert.strictEqual(costHighRes, 60, "1536x2048, 28 steps, 1 sample must bill 60 Anlas (exceeds 1MP)");
+    assert.strictEqual(costHighRes, 60, "1536x2048, 28 steps, 1 sample on V4.5 must bill 60 Anlas (exceeds 1MP)");
+
+    // Live V5 Full (1.5x multiplier) parity cases from ANLAS_ACTUAL.md & Module 643656
+    assert.strictEqual(calculateAnlasCost({ width: 832, height: 1216, steps: 29, n_samples: 1, model: "nai-diffusion-5-full" }), 30);
+    assert.strictEqual(calculateAnlasCost({ width: 1024, height: 1024, steps: 29, n_samples: 1, model: "nai-diffusion-5-full" }), 32);
+    assert.strictEqual(calculateAnlasCost({ width: 1024, height: 1024, steps: 35, n_samples: 1, model: "nai-diffusion-5-full" }), 38);
+    assert.strictEqual(calculateAnlasCost({ width: 1024, height: 1024, steps: 50, n_samples: 1, model: "nai-diffusion-5-full" }), 51);
+    assert.strictEqual(calculateAnlasCost({ width: 1024, height: 1024, steps: 23, n_samples: 4, model: "nai-diffusion-5-full" }), 78);
+    assert.strictEqual(calculateAnlasCost({ width: 1472, height: 1472, steps: 28, n_samples: 1, model: "nai-diffusion-5-full" }), 63);
+    // V5 Full 1536x2048, 28 steps, 1 sample -> ceil(60 * 1.5) = 90 Anlas
+    assert.strictEqual(calculateAnlasCost({ width: 1536, height: 2048, steps: 28, n_samples: 1, model: "nai-diffusion-5-full" }), 90);
   });
 
-  await t.test("Pricing Engine: V5 Medium Effort step_factor (1 / 1.06521739) Parity", () => {
+  await t.test("Pricing Engine: V5 Medium Effort Un-Ceiled (/ 1.75) & 1.5x Parity", () => {
     // 1. Free baseline: <= 1MP, 1 sample -> 0 Anlas regardless of steps
     const costMediumFree14 = calculateAnlasCost({
       width: 1024,
@@ -186,15 +210,14 @@ test("Phase 8 Commit 2: Anlas Pricing Engine & Zero-Copy Binary Buffer Parser", 
       height: 1024,
       steps: 28,
       n_samples: 1,
-      model: "nai-diffusion-5-medium-inpainting"
+      model: "nai-diffusion-5-full-medium-inpainting"
     }, { isOpus: true });
     assert.strictEqual(costMediumInpaintFree, 0, "V5 Medium Inpainting identifier must be recognized");
 
-    // 2. Anlas-paid multi-sample: 1024x1024, 2 samples -> priced with step_factor (1 / 1.06521739)
-    // 1024x1024, steps = 14 * (1 / 1.06521739) = 13.142857:
-    // base = ceil(2.951823174884865e-6 * 1048576 + 5.753298233447344e-7 * 1048576 * 13.142857)
-    // base = ceil(3.0952 + 7.9289) = ceil(11.024) = 12 Anlas per image
-    // billable_samples = 2 - 1 = 1 -> 12 * 1 = 12 Anlas
+    // 2. Anlas-paid multi-sample: 1024x1024 -> priced via Module 643656 un-ceiled / 1.75 + 1.5x V5 multiplier
+    // base = (2.951823174884865e-6 * 1048576 + 5.753298233447344e-7 * 1048576 * 23) / 1.75 = 16.970582 / 1.75 = 9.697476
+    // m = 9.697476 * 1.5 = 14.546213 -> per-image = ceil(14.546213) = 15 Anlas
+    // 2 samples (billable = 1) -> 15 Anlas; 4 samples (billable = 3) -> 45 Anlas (ANLAS_ACTUAL.md)
     const costMedium2Samples = calculateAnlasCost({
       width: 1024,
       height: 1024,
@@ -202,10 +225,38 @@ test("Phase 8 Commit 2: Anlas Pricing Engine & Zero-Copy Binary Buffer Parser", 
       n_samples: 2,
       model: "nai-diffusion-5-full-medium"
     }, { isOpus: true });
-    assert.strictEqual(costMedium2Samples, 12, "V5 Medium 2 samples at 1024x1024 must cost 12 Anlas (14 / 1.06521739 parity)");
+    assert.strictEqual(costMedium2Samples, 15, "V5 Medium 2 samples at 1024x1024 must cost 15 Anlas (Module 643656 parity)");
 
-    // 3. Anlas-paid high-res: 1536x2048, 1 sample -> priced with step_factor (1 / 1.06521739)
-    // 1536x2048 at 13.142857 steps -> per-image = 34 Anlas -> billable = 1 -> total = 34 Anlas
+    const costMedium4Samples = calculateAnlasCost({
+      width: 1024,
+      height: 1024,
+      steps: 14,
+      n_samples: 4,
+      model: "nai-diffusion-5-full-medium"
+    }, { isOpus: true });
+    assert.strictEqual(costMedium4Samples, 45, "V5 Medium 4 samples at 1024x1024 must cost 45 Anlas (ANLAS_ACTUAL.md)");
+
+    // 3. Anlas-paid high-res:
+    //    1472x1472 -> 35.068168 / 1.75 * 1.5 = 30.058429 -> ceil = 31 Anlas (x4 = 124 Anlas, ANLAS_ACTUAL.md)
+    //    1536x2048 -> 50.912468 / 1.75 * 1.5 = 43.639258 -> ceil = 44 Anlas
+    const costMedium1472 = calculateAnlasCost({
+      width: 1472,
+      height: 1472,
+      steps: 14,
+      n_samples: 1,
+      model: "nai-diffusion-5-full-medium"
+    }, { isOpus: true });
+    assert.strictEqual(costMedium1472, 31, "V5 Medium 1472x1472 1 sample must cost 31 Anlas (ANLAS_ACTUAL.md)");
+
+    const costMedium1472x4 = calculateAnlasCost({
+      width: 1472,
+      height: 1472,
+      steps: 14,
+      n_samples: 4,
+      model: "nai-diffusion-5-full-medium"
+    }, { isOpus: true });
+    assert.strictEqual(costMedium1472x4, 124, "V5 Medium 1472x1472 4 samples must cost 124 Anlas (ANLAS_ACTUAL.md)");
+
     const costMediumHighRes = calculateAnlasCost({
       width: 1536,
       height: 2048,
@@ -213,7 +264,7 @@ test("Phase 8 Commit 2: Anlas Pricing Engine & Zero-Copy Binary Buffer Parser", 
       n_samples: 1,
       model: "nai-diffusion-5-full-medium"
     }, { isOpus: true });
-    assert.strictEqual(costMediumHighRes, 34, "V5 Medium 1536x2048 1 sample must cost 34 Anlas (14 / 1.06521739 parity)");
+    assert.strictEqual(costMediumHighRes, 44, "V5 Medium 1536x2048 1 sample must cost 44 Anlas (Module 643656 parity)");
 
     // 4. Immunity to client-supplied steps on High-Res Medium
     const costMediumHighRes50 = calculateAnlasCost({
@@ -223,7 +274,33 @@ test("Phase 8 Commit 2: Anlas Pricing Engine & Zero-Copy Binary Buffer Parser", 
       n_samples: 1,
       model: "nai-diffusion-5-full-medium"
     }, { isOpus: true });
-    assert.strictEqual(costMediumHighRes50, 34, "V5 Medium must ignore client steps and price with step_factor (34 Anlas)");
+    assert.strictEqual(costMediumHighRes50, 44, "V5 Medium must ignore client steps and price at 44 Anlas");
+  });
+
+  await t.test("Pricing Engine: usageNegative disables Opus free-sample bonus strictly on V5", () => {
+    assert.strictEqual(calculateAnlasCost({
+      width: 1024,
+      height: 1024,
+      steps: 23,
+      n_samples: 2,
+      model: "nai-diffusion-5-full"
+    }, { isOpus: true, usageNegative: true }), 52, "Negative V5 tank must bill both samples (26 * 2 = 52)");
+
+    assert.strictEqual(calculateAnlasCost({
+      width: 1024,
+      height: 1024,
+      steps: 14,
+      n_samples: 2,
+      model: "nai-diffusion-5-full-medium"
+    }, { isOpus: true, usageNegative: true }), 30, "Negative V5 tank must bill both Medium samples (15 * 2 = 30)");
+
+    assert.strictEqual(calculateAnlasCost({
+      width: 1024,
+      height: 1024,
+      steps: 28,
+      n_samples: 2,
+      model: "nai-diffusion-4-5-full"
+    }, { isOpus: true, usageNegative: true }), 20, "V4.5 Opus discount must remain unaffected by V5 usageNegative");
   });
 
   await t.test("Pricing Engine: Rejects V4.5 models attempting to hijack V5 Medium discounts", () => {
@@ -235,7 +312,7 @@ test("Phase 8 Commit 2: Anlas Pricing Engine & Zero-Copy Binary Buffer Parser", 
       model: "nai-diffusion-4-5-medium"
     }, { isOpus: true });
 
-    assert.strictEqual(costV45Medium, 20, "V4.5 model must not be spoofed into V5 Medium step discount");
+    assert.strictEqual(costV45Medium, 20, "V4.5 model must not be spoofed into V5 Medium formula");
   });
 
   await t.test("Pricing Engine: Character Reference Surcharges & Array Fallback", () => {
@@ -283,7 +360,7 @@ test("Phase 8 Commit 2: Anlas Pricing Engine & Zero-Copy Binary Buffer Parser", 
     assert.strictEqual(costArrayFallback, 15, "Pricing engine must evaluate references directly from arrays if precise_ref_count is omitted");
   });
 
-  await t.test("Pricing Engine: SMEA and SMEA-DYN Multipliers", () => {
+  await t.test("Pricing Engine: SMEA and SMEA-DYN Multipliers (V4 & V5 1.5x Interaction)", () => {
     // 1024x1024, 28 steps, non-Opus (base = 20)
     // sm: true, sm_dyn: false -> 20 * 1.2 = 24 Anlas
     const costSMEA = calculateAnlasCost({
@@ -308,6 +385,18 @@ test("Phase 8 Commit 2: Anlas Pricing Engine & Zero-Copy Binary Buffer Parser", 
       model: "nai-diffusion-4-full"
     }, { isOpus: false });
     assert.strictEqual(costSMEADyn, 28, "SMEA-DYN must apply 1.4x multiplier (20 -> 28)");
+
+    // V5 sm: true, sm_dyn: true -> ceil(20 * 1.4 * 1.5) = 42 Anlas
+    const costV5SMEADyn = calculateAnlasCost({
+      width: 1024,
+      height: 1024,
+      steps: 28,
+      n_samples: 1,
+      sm: true,
+      sm_dyn: true,
+      model: "nai-diffusion-5-full"
+    }, { isOpus: false });
+    assert.strictEqual(costV5SMEADyn, 42, "V5 SMEA-DYN must apply ceil(20 * 1.4 * 1.5) = 42");
   });
 
   await t.test("Pricing Engine: Img2Img and Inpainting Strength Scaling & Resilience", () => {
@@ -466,7 +555,7 @@ test("Phase 8 Commit 2: Anlas Pricing Engine & Zero-Copy Binary Buffer Parser", 
     }
   });
 
-  await t.test("Pricing Engine: Hard Per-Image Cap Enforcement", () => {
+  await t.test("Pricing Engine: Hard Per-Image Cap Enforcement (including V5 1.5x Cap)", () => {
     assert.throws(
       () => calculateAnlasCost({
         width: 3000,
@@ -477,6 +566,18 @@ test("Phase 8 Commit 2: Anlas Pricing Engine & Zero-Copy Binary Buffer Parser", 
       }),
       /exceeds maximum cap of 140 Anlas/i,
       "Per-image costs > 140 Anlas must throw a structured exception"
+    );
+
+    assert.throws(
+      () => calculateAnlasCost({
+        width: 1536,
+        height: 2048,
+        steps: 50,
+        n_samples: 1,
+        model: "nai-diffusion-5-full"
+      }),
+      /exceeds maximum cap of 140 Anlas/i,
+      "V5 1536x2048 @ 50 steps (100 * 1.5 = 150) must trip 140 Anlas cap"
     );
   });
 

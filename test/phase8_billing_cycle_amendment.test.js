@@ -12,24 +12,36 @@
  *      before `syncTelemetry()` resolves.
  *    - Enforces strict monotonic `activeCycleEpoch` progression on renewal even within the same millisecond.
  *    - Re-hydrates billing cycle state across restarts via `hydrateSubscriptionState`.
- * 3. Hell Path: Grace-Period Freeze & Late Renewal Alignment (both HTTP `syncTelemetry()` and `applyUsageTelemetry`):
+ * 3. Hell Path: Non-Opus / Inactive `/user/subscription` With Null/Omitted `usage`, Background Refill & `401` Harvester Invalidation:
+ *    - Verifies real NovelAI non-Opus payloads (`tier: 0`, `active: false`, `usage: null` or `{}`
+ *      with `purchasedTrainingSteps: 2995`) update `lastFetched > 0`, set `subscriptionActive: false`,
+ *      and surface `503 MASTER_SUBSCRIPTION_INACTIVE` instead of crashing `applyUsageTelemetry()`
+ *      and stranding the gateway in `TELEMETRY_FETCH_FAILED`.
+ *    - Verifies inactive subscriptions preserve background V5 refill projection while remaining
+ *      hard-locked (`isHardLocked: true`) and resuming directly from upstream % on renewal without
+ *      jumping to 100%, while forcing `queueManager.getProjectedBatteryPercent()` to `0` so stale
+ *      `v5SurplusPool` clears rather than minting unspendable surplus while unsubscribed.
+ *    - Verifies `syncTelemetry()` receiving HTTP `401` clears `last_fetched_at` to `0` so expired
+ *      tokens cannot admit V5 queue entries against stale cached telemetry.
+ *    - Verifies `active: true, tier: 3, usage: null` still fails closed.
+ * 4. Hell Path: Grace-Period Freeze & Late Renewal Alignment (both HTTP `syncTelemetry()` and `applyUsageTelemetry`):
  *    - Entering `isGracePeriod: true` (even with a 3-day Chargebee `expiresAt` bump and 0 fixed Anlas)
  *      does NOT advance `activeCycleEpoch` and freezes `evaluateAnlasReset()`.
  *    - Paying late (flipping `isGracePeriod: false` and advancing `expiresAt` >= 15 days past
  *      last paid expiration) advances `activeCycleEpoch` strictly once, triggering 1x reset + debt offset.
  *    - Inactive users spanning multiple renewals receive exactly 1x `monthlyAnlas` (zero stacking).
- * 4. Hell Path: Account Swap Downward Re-Anchor:
+ * 5. Hell Path: Account Swap Downward Re-Anchor:
  *    - Swapping to a master token whose `expiresAt` is >= 15 days earlier re-anchors
  *      `master_last_paid_expires_at` without triggering a spurious mid-cycle reset.
- * 5. Hell Path: Lapsed / Non-Opus Master Subscription Lockout (`503 MASTER_SUBSCRIPTION_INACTIVE`):
+ * 6. Hell Path: Lapsed / Non-Opus Master Subscription Lockout (`503 MASTER_SUBSCRIPTION_INACTIVE`):
  *    - `active: false` or `tier < 3` freezes `evaluateAnlasReset()`, blocks both V5 and legacy
  *      image generations in `proxyRouter.js` with HTTP 503 `MASTER_SUBSCRIPTION_INACTIVE`,
  *      and automatically releases the rejecting client's Channel A lock without leaving ghost locks.
- * 6. Hell Path: Stale Channel A Lock Evicted During Slow `ensureFresh()` Async I/O:
+ * 7. Hell Path: Stale Channel A Lock Evicted During Slow `ensureFresh()` Async I/O:
  *    - Evicting a task while `req.telemetry.ensureFresh()` is awaiting `/user/subscription` forces
  *      post-await lock re-verification to reject with `403`, blocking concurrent upstream dispatch
  *      without disturbing the promoted replacement task.
- * 7. Hell Path: Fail-Closed Validation on `evaluateAnlasReset()`:
+ * 8. Hell Path: Fail-Closed Validation on `evaluateAnlasReset()`:
  *    - Rejects `activeCycleEpoch: 0`, negative numbers, `NaN`, non-boolean flags, and arrays.
  */
 
@@ -71,6 +83,7 @@ cleanupFiles();
 const CYCLE_1_EXPIRES_SEC = 1796031198;
 const DAY_SEC = 86400;
 
+let mockSubStatus = 200;
 let mockSubPayload = {
   tier: 3,
   active: true,
@@ -88,7 +101,7 @@ const mockUpstream = http.createServer((req, res) => {
   const parsedUrl = new URL(req.url, `http://${req.headers.host}`);
   if (parsedUrl.pathname === '/user/subscription') {
     const respondSub = () => {
-      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.writeHead(mockSubStatus, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify(mockSubPayload));
     };
     if (mockSubDelayMs > 0) {
@@ -377,6 +390,102 @@ test('Phase 8 Billing-Cycle Amendment: Authoritative Subscription & Grace-Period
 
     assert.strictEqual(afterSwap.masterLastPaidExpiresAt, earlierExpires, 'Baseline expiresAt must re-anchor downward on account swap');
     assert.strictEqual(afterSwap.activeCycleEpoch, beforeSwap.activeCycleEpoch, 'Downward swap must NOT reset user quotas mid-cycle');
+  });
+
+  await t.test('Hell Path: Non-Opus / inactive payload omitting `usage`, background refill, surplus clearing & 401 harvester invalidation', async () => {
+    queueManager.reset();
+    upstreamImageHits = 0;
+
+    // Simulate cold boot receiving a real NovelAI non-Opus response (tier: 0, active: false, usage: null)
+    serverModule.resetTelemetryState({ lastFetchedAt: 0, lastNetworkAttemptAt: 0 });
+    mockSubPayload = {
+      tier: 0,
+      active: false,
+      expiresAt: 0,
+      trainingStepsLeft: { fixedTrainingStepsLeft: 0, purchasedTrainingSteps: 2995 },
+      isGracePeriod: false,
+      usage: null
+    };
+
+    const joinRes = await queryGateway('/queue/join', 'POST', {
+      'Authorization': 'Bearer sec_cycle_a'
+    }, {
+      browser_id: 'dev_cycle_a',
+      tab_id: 'tab_non_opus',
+      req_id: 'req_non_opus_join',
+      model: 'nai-diffusion-5-full-medium',
+      steps: 14,
+      width: 1024,
+      height: 1024,
+      n_samples: 1,
+      is_base_paid: false,
+      is_v5: true
+    });
+
+    assert.strictEqual(joinRes.status, 503);
+    assert.strictEqual(
+      joinRes.data.error,
+      'MASTER_SUBSCRIPTION_INACTIVE',
+      'Non-Opus /user/subscription omitting usage must resolve to MASTER_SUBSCRIPTION_INACTIVE, not TELEMETRY_FETCH_FAILED'
+    );
+    const snapAfter = serverModule.getTelemetrySnapshot();
+    assert.ok(snapAfter.lastFetched > 0, 'lastFetched must advance so subsequent polls do not re-hit cold boot');
+    assert.strictEqual(snapAfter.subscriptionActive, false);
+    assert.strictEqual(snapAfter.isHardLocked, true);
+    assert.strictEqual(snapAfter.masterAnlas, 2995);
+
+    // Expired Opus keeps refilling in background on upstream, stays hard-locked until renewal,
+    // resumes at the real upstream % on renewal (no 100% reset), and clears stale Bucket 2 surplus while inactive.
+    const sweepNow = Date.now();
+    queueManager.hydrateSurplusPool('3500', String(sweepNow - 86400000));
+    serverModule.applyUsageTelemetry({
+      tier: 3,
+      active: false,
+      expiresAt: CYCLE_1_EXPIRES_SEC,
+      isGracePeriod: false,
+      usage: { percent: 85, timeUntilNextPercent: 7200, isNegative: false }
+    }, undefined, sweepNow);
+
+    const inactivePlus1h = serverModule.getTelemetrySnapshot(sweepNow + 3600000);
+    assert.ok(
+      inactivePlus1h.percent > 85.4 && inactivePlus1h.percent < 85.6,
+      `Inactive V5 bucket must continue refilling in background (expected ~85.5%, got ${inactivePlus1h.percent})`
+    );
+    assert.strictEqual(inactivePlus1h.isHardLocked, true, 'Inactive subscription must stay hard-locked regardless of refilled %');
+
+    assert.strictEqual(queueManager.getProjectedBatteryPercent(), 0, 'Inactive subscription must force telemetryProvider to 0');
+    queueManager.sweep({ now: sweepNow });
+    assert.strictEqual(queueManager.getSurplusPool().pool, 0, 'Inactive subscription must clear stale Bucket 2 surplus pool');
+
+    // Renewal resumes directly from wherever NovelAI's background bucket refilled to (e.g. 61.5%, not 100%)
+    const renewedSnap = serverModule.applyUsageTelemetry({
+      tier: 3,
+      active: true,
+      expiresAt: CYCLE_1_EXPIRES_SEC + (30 * DAY_SEC),
+      isGracePeriod: false,
+      usage: { percent: 61.5, timeUntilNextPercent: 7200, isNegative: false }
+    }, undefined, sweepNow + 7200000);
+    assert.strictEqual(renewedSnap.subscriptionActive, true);
+    assert.strictEqual(renewedSnap.percent, 61.5, 'Renewal must resume from upstream tank level without jumping to 100%');
+
+    // Mid-session upstream HTTP 401 during syncTelemetry() must invalidate lastFetched to 0 so stale
+    // battery capacity cannot admit V5 queue tasks after the token expires.
+    assert.ok(serverModule.getTelemetrySnapshot().lastFetched > 0);
+    try {
+      mockSubStatus = 401;
+      mockSubPayload = { statusCode: 401, message: 'Unauthorized' };
+      await assert.rejects(() => serverModule.syncTelemetry({ rescheduleHeartbeat: false }), /401/);
+      assert.strictEqual(serverModule.getTelemetrySnapshot().lastFetched, 0, 'syncTelemetry() 401 must clear lastFetched to 0');
+      assert.strictEqual(queueManager.getProjectedBatteryPercent(), null);
+    } finally {
+      mockSubStatus = 200;
+    }
+
+    // Active Opus claiming usage: null must STILL fail closed
+    assert.throws(
+      () => serverModule.applyUsageTelemetry({ tier: 3, active: true, usage: null }),
+      /usage\.percent missing or invalid/
+    );
   });
 
   await t.test('Hell Path: Inactive or non-Opus subscription freezes resets, returns 503 MASTER_SUBSCRIPTION_INACTIVE, and releases Channel A lock', async () => {

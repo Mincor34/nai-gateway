@@ -2,14 +2,16 @@
  * PHASE 8 COMMIT 8 VERIFICATION HARNESS (test/phase8_commit8_ponr_settlement.test.js)
  *
  * Exhaustively tests:
- * 1. Happy Path: Anlas Base-Paid PoNR Settlement & V5 Battery Immunity:
- *    - `1536x2048` V5 High (`X-Base-Paid: true`, `X-Declared-Anlas: 60`, `X-Scraped-Anlas: 60`)
- *      holds `60` Anlas pre-dispatch, re-anchors `started_processing_at`, commits `60` Anlas debit
+ * 1. Happy Path: Anlas Base-Paid PoNR Settlement & V5 Battery Immunity (Module 643656 Parity):
+ *    - `1536x2048` V5 High (`X-Base-Paid: true`, `X-Declared-Anlas: 90`, `X-Scraped-Anlas: 90`)
+ *      holds `90` Anlas pre-dispatch, re-anchors `started_processing_at`, commits `90` Anlas debit
  *      (`virtual_anlas_balance`, `subscription_period_anlas`, `anlas_consumed`, device sync) on `200 OK`,
  *      clears holds, and leaves `v5_banked_balance` + `dispatchesHigh` completely untouched even
  *      while the 5.5% V5 circuit breaker is active.
- *    - V5 Medium Anlas-paid (`1536x2048, 1 sample` -> `34` Anlas; `1024x1024, 2 samples` -> `12` Anlas)
- *      enforces exact `step_factor` (`1 / 1.06521739`) PoNR settlement with zero V5 bank deduction.
+ *    - V5 Medium Anlas-paid (`1536x2048, 1 sample` -> `44` Anlas; `1024x1024, 2 samples` -> `15` Anlas)
+ *      enforces exact Module 643656 PoNR settlement with zero V5 bank deduction.
+ *    - Negative V5 tank (`isNegative: true`) revokes Opus 1-sample discount on V5 multi-sample
+ *      (`1024x1024, 2 samples` Medium -> `30` Anlas instead of `15`).
  * 2. Happy Path: Free V5 Bucket 1 / Bucket 2 PoNR & Orthogonal Addon Accounting:
  *    - Bucket 1 (`personal`) deducts `18` NCP (High) / `10` NCP (Medium) and increments
  *      `v5_daily_consumed` + `subscription_period_v5` strictly on `HTTP 200 OK`.
@@ -28,13 +30,16 @@
  *      -> immediate `403 PARAMETER_FORGERY`, permanent ban, `0` upstream hits.
  *    - Multipart `X-Gen-Model: legacy` vs `nai-diffusion-5-full` in body preceded by binary image
  *      -> immediate `403 PARAMETER_FORGERY`, permanent ban, `0` upstream hits.
- * 4. Hell Path: Pre-PoNR Failure vs. Post-PoNR Sunk Cost:
+ * 4. Hell Path: Pre-PoNR Failure vs. Post-PoNR Sunk Cost & Upstream 401 Isolation:
  *    - Pre-PoNR upstream `HTTP 500` and pre-header socket sever (`502`) release Anlas + V5 NCP holds
  *      with `0` debit and `0` `dispatchesHigh` increment.
+ *    - Upstream NovelAI `HTTP 401` (expired `master_token`) on `/user/subscription` or `/ai/generate-image`
+ *      converts to `503 MASTER_TOKEN_EXPIRED` (never `401`), invalidates `lastFetched`, charges `0`,
+ *      and releases locks cleanly.
  *    - Post-PoNR mid-stream socket sever *after* `HTTP 200 OK` headers preserves BOTH Anlas and
  *      V5 NCP SQLite debits as sunk costs while freeing holds and queue slots cleanly.
  * 5. Hell Path: Spend Cap, Debt Lockout, Forged Bypass, Deadband, Effort Escalation & Cross-Channel Races:
- *    - `C_auth > X-Declared-Anlas` (`60 > 10`) -> `400 SPEND_CAP_EXCEEDED`, `0` upstream hits, `0` debit.
+ *    - `C_auth > X-Declared-Anlas` (`90 > 10`) -> `400 SPEND_CAP_EXCEEDED`, `0` upstream hits, `0` debit.
  *    - Stealth character ref (`X-Declared-Anlas: 0`) -> `400 SPEND_CAP_EXCEEDED`, `0` upstream hits.
  *    - Forged `X-Base-Paid: true` on `1024x1024, 23 steps, 1 sample` (even at `<= 5.5%` battery)
  *      -> `400 PARAMETRIC_LIMIT_EXCEEDED`, `0` upstream hits.
@@ -43,18 +48,18 @@
  *    - Effort escalation (`Medium 10 NCP` at `/queue/join` -> `High 18 NCP` at `/proxy`) upgrades or
  *      rejects (`429 V5_CAPACITY_DEPLETED`) when only `10` NCP remain.
  *    - Negative Anlas debt (`-20`): free V5/Opus succeeds (`200`), any Anlas-consuming request fails `403 DEBT_LOCKED`.
- *    - Cross-channel race between `/proxy/image/*` (`60` Anlas) and `/ai/encode-vibe` (`2` Anlas) on
- *      a `60`-Anlas balance admits strictly 1 and rejects 1 (`403 INSUFFICIENT_ANLAS`), never overdrafting.
+ *    - Cross-channel race between `/proxy/image/*` (`90` Anlas) and `/ai/encode-vibe` (`2` Anlas) on
+ *      a `90`-Anlas balance admits strictly 1 and rejects 1 (`403 INSUFFICIENT_ANLAS`), never overdrafting.
  *    - Stage 9 commit-boundary TOCTOU race (including hostile post-200 client socket abort mid-`commitAnlasDebit`)
  *      serializes via `withUserAnlasAuthLock`, rejecting concurrent `/ai/encode-vibe` with `403 INSUFFICIENT_ANLAS`
  *      (`virtual_anlas_balance === 0`, never `-2`).
  *    - Bucket 1 personal NCP commit-boundary race (multi-device `/queue/join` replacing a task mid-`commitAnlasDebit`
  *      before `commitV5Debit` runs) is rejected at Stage 7 (`429 V5_CAPACITY_DEPLETED`) with `v5_banked_balance === 0`.
  * 6. Hell Path: Operational Canary Drift Logging:
- *    - `X-Scraped-Anlas: 999` differing from `C_auth = 60` emits `[GuildWeave Telemetry Canary]`
- *      warning and completes `200 OK` with `60` Anlas debited (zero ban, zero rejection).
+ *    - `X-Scraped-Anlas: 999` differing from `C_auth = 90` emits `[GuildWeave Telemetry Canary]`
+ *      warning and completes `200 OK` with `90` Anlas debited (zero ban, zero rejection).
  * 7. Hell Path: Master Solvency, Inactive Subscription, Stage 1 Malformed Headers & Bodies:
- *    - `masterAnlas < C_auth` (`5 < 60`) -> `503 MASTER_ANLAS_DEPLETED`, `0` upstream hits.
+ *    - `masterAnlas < C_auth` (`5 < 90`) -> `503 MASTER_ANLAS_DEPLETED`, `0` upstream hits.
  *    - `subscriptionActive === false` -> `503 MASTER_SUBSCRIPTION_INACTIVE`, `0` upstream hits.
  *    - Malformed `X-Declared-Anlas` / `X-Base-Paid` / `X-Gen-Model` / `X-Gen-Width` -> `400 INVALID_HEADERS`
  *      at Stage 1 without banning user or buffering payload.
@@ -103,7 +108,8 @@ let upstreamSubscriptionPayload = {
   usage: { percent: 80, timeUntilNextPercent: 7858, isNegative: false }
 };
 
-let imageUpstreamMode = 'ok'; // 'ok' | 'delay_ok' | '500' | 'pre_sever' | 'post_sever' | 'chunked_hold'
+let subscriptionUpstream401 = false;
+let imageUpstreamMode = 'ok'; // 'ok' | 'delay_ok' | '401' | '500' | 'pre_sever' | 'post_sever' | 'chunked_hold'
 let imageUpstreamDelayMs = 0;
 let imageUpstreamHits = 0;
 let vibeUpstreamHits = 0;
@@ -112,6 +118,10 @@ const mockUpstream = http.createServer((req, res) => {
   const parsedUrl = new URL(req.url, `http://${req.headers.host}`);
 
   if (parsedUrl.pathname === '/user/subscription') {
+    if (subscriptionUpstream401) {
+      res.writeHead(401, { 'Content-Type': 'application/json' });
+      return res.end(JSON.stringify({ statusCode: 401, message: 'Unauthorized' }));
+    }
     res.writeHead(200, { 'Content-Type': 'application/json' });
     return res.end(JSON.stringify(upstreamSubscriptionPayload));
   }
@@ -133,6 +143,11 @@ const mockUpstream = http.createServer((req, res) => {
       res.socket.write('HTTP/1.1 200 OK\r\nContent-Type: image/png\r\n');
       res.socket.destroy();
       return;
+    }
+
+    if (imageUpstreamMode === '401') {
+      res.writeHead(401, { 'Content-Type': 'application/json' });
+      return res.end(JSON.stringify({ statusCode: 401, message: 'Incorrect access token.' }));
     }
 
     if (imageUpstreamMode === '500') {
@@ -225,7 +240,7 @@ test('Phase 8 Commit 8: Pre-Upstream Validation, Anti-Spoofing & PoNR Settlement
 
   await dbModule.run(
     `INSERT INTO users (user_id, priority_tier, banned, virtual_anlas_balance, last_anlas_reset_epoch, v5_banked_balance, v5_last_accrual_epoch)
-     VALUES ('u_race60', 'Normal', 0, 60, ?, 100, ?)`,
+     VALUES ('u_race60', 'Normal', 0, 90, ?, 100, ?)`,
     [now, now]
   );
   await dbModule.run(
@@ -234,7 +249,7 @@ test('Phase 8 Commit 8: Pre-Upstream Validation, Anti-Spoofing & PoNR Settlement
 
   await dbModule.run(
     `INSERT INTO users (user_id, priority_tier, banned, virtual_anlas_balance, last_anlas_reset_epoch, v5_banked_balance, v5_last_accrual_epoch)
-     VALUES ('u_commit_race60', 'Normal', 0, 60, ?, 100, ?)`,
+     VALUES ('u_commit_race60', 'Normal', 0, 90, ?, 100, ?)`,
     [now, now]
   );
   await dbModule.run(
@@ -243,7 +258,7 @@ test('Phase 8 Commit 8: Pre-Upstream Validation, Anti-Spoofing & PoNR Settlement
 
   await dbModule.run(
     `INSERT INTO users (user_id, priority_tier, banned, virtual_anlas_balance, last_anlas_reset_epoch, v5_banked_balance, v5_last_accrual_epoch)
-     VALUES ('u_abort_race60', 'Normal', 0, 60, ?, 100, ?)`,
+     VALUES ('u_abort_race60', 'Normal', 0, 90, ?, 100, ?)`,
     [now, now]
   );
   await dbModule.run(
@@ -308,7 +323,7 @@ test('Phase 8 Commit 8: Pre-Upstream Validation, Anti-Spoofing & PoNR Settlement
   // ---------------------------------------------------------------------------
   // 1. HAPPY PATH: BASE-PAID ANLAS PoNR SETTLEMENT & V5 BATTERY IMMUNITY
   // ---------------------------------------------------------------------------
-  await t.test('Happy Path: Base-paid V5 High & Medium commit exact PoNR Anlas, re-anchor TTL, and spare V5 battery', async () => {
+  await t.test('Happy Path: Base-paid V5 High & Medium commit exact PoNR Anlas, re-anchor TTL, handle usageNegative & spare V5 battery', async () => {
     queueManager.reset();
     imageUpstreamHits = 0;
     imageUpstreamMode = 'delay_ok';
@@ -324,7 +339,7 @@ test('Phase 8 Commit 8: Pre-Upstream Validation, Anti-Spoofing & PoNR Settlement
       usage: { percent: 5.5, timeUntilNextPercent: 7858, isNegative: false }
     }, undefined, Date.now());
 
-    // 1. V5 High 1536x2048 (C_auth = 60 Anlas)
+    // 1. V5 High 1536x2048 (C_auth = 90 Anlas)
     const joinRes = await sendRawRequest({
       path: '/queue/join',
       headers: { 'Authorization': 'Bearer sec_paid', 'Content-Type': 'application/json' },
@@ -337,7 +352,7 @@ test('Phase 8 Commit 8: Pre-Upstream Validation, Anti-Spoofing & PoNR Settlement
         n_samples: 1,
         steps: 28,
         is_base_paid: true,
-        declared_anlas: 60
+        declared_anlas: 90
       })
     });
     assert.strictEqual(joinRes.status, 200);
@@ -358,8 +373,8 @@ test('Phase 8 Commit 8: Pre-Upstream Validation, Anti-Spoofing & PoNR Settlement
         'X-Gen-Samples': '1',
         'X-Gen-Model': 'V5',
         'X-Base-Paid': 'true',
-        'X-Declared-Anlas': '60',
-        'X-Scraped-Anlas': '60',
+        'X-Declared-Anlas': '90',
+        'X-Scraped-Anlas': '90',
         'Content-Type': 'application/json'
       },
       body: JSON.stringify({
@@ -368,9 +383,9 @@ test('Phase 8 Commit 8: Pre-Upstream Validation, Anti-Spoofing & PoNR Settlement
       })
     });
 
-    // Mid-flight inspection while upstream holds 120ms: verify held_cost = 60 and started_processing_at re-anchored
+    // Mid-flight inspection while upstream holds 120ms: verify held_cost = 90 and started_processing_at re-anchored
     await new Promise(r => setTimeout(r, 45));
-    assert.strictEqual(queueManager.getHeldAnlasForUser('u_paid'), 60, 'Mid-flight Channel A hold must equal C_auth (60)');
+    assert.strictEqual(queueManager.getHeldAnlasForUser('u_paid'), 90, 'Mid-flight Channel A hold must equal C_auth (90)');
     assert.ok(task1.started_processing_at > initialStartedAt, 'started_processing_at must re-anchor post-buffer');
 
     const res1 = await proxyPromise1;
@@ -379,17 +394,17 @@ test('Phase 8 Commit 8: Pre-Upstream Validation, Anti-Spoofing & PoNR Settlement
 
     let userRow = await dbModule.get('SELECT virtual_anlas_balance, subscription_period_anlas, anlas_consumed, v5_banked_balance, v5_daily_consumed, subscription_period_v5 FROM users WHERE user_id = ?', ['u_paid']);
     let devRow = await dbModule.get('SELECT virtual_anlas_balance, anlas_consumed FROM devices WHERE browser_id = ?', ['dev_paid']);
-    assert.strictEqual(userRow.virtual_anlas_balance, 440);
-    assert.strictEqual(userRow.subscription_period_anlas, 60);
-    assert.strictEqual(userRow.anlas_consumed, 60);
-    assert.strictEqual(devRow.virtual_anlas_balance, 440);
-    assert.strictEqual(devRow.anlas_consumed, 60);
+    assert.strictEqual(userRow.virtual_anlas_balance, 410);
+    assert.strictEqual(userRow.subscription_period_anlas, 90);
+    assert.strictEqual(userRow.anlas_consumed, 90);
+    assert.strictEqual(devRow.virtual_anlas_balance, 410);
+    assert.strictEqual(devRow.anlas_consumed, 90);
     assert.strictEqual(userRow.v5_banked_balance, 100, 'Base-paid V5 High must NOT deduct V5 banked NCP');
     assert.strictEqual(userRow.v5_daily_consumed, 0);
     assert.strictEqual(userRow.subscription_period_v5, 0);
     assert.strictEqual(serverModule.getTelemetrySnapshot().dispatchesHigh, 0, 'Base-paid V5 High must NOT increment battery dispatch counter');
 
-    // 2. V5 Medium Anlas-paid: 1536x2048, 1 sample -> 34 Anlas; 1024x1024, 2 samples -> 12 Anlas
+    // 2. V5 Medium Anlas-paid: 1536x2048, 1 sample -> 44 Anlas; 1024x1024, 2 samples -> 15 Anlas
     imageUpstreamMode = 'ok';
     queueManager.join({ browser_id: 'dev_paid', req_id: 'req_paid_med_res', user_id: 'u_paid', priority_tier: 'Normal' });
     const resMedHighRes = await sendRawRequest({
@@ -404,7 +419,7 @@ test('Phase 8 Commit 8: Pre-Upstream Validation, Anti-Spoofing & PoNR Settlement
         'X-Gen-Samples': '1',
         'X-Gen-Model': 'V5-medium',
         'X-Base-Paid': 'true',
-        'X-Declared-Anlas': '34',
+        'X-Declared-Anlas': '44',
         'Content-Type': 'application/json'
       },
       body: JSON.stringify({
@@ -427,7 +442,7 @@ test('Phase 8 Commit 8: Pre-Upstream Validation, Anti-Spoofing & PoNR Settlement
         'X-Gen-Samples': '2',
         'X-Gen-Model': 'V5-medium',
         'X-Base-Paid': 'true',
-        'X-Declared-Anlas': '12',
+        'X-Declared-Anlas': '15',
         'Content-Type': 'application/json'
       },
       body: JSON.stringify({
@@ -438,10 +453,45 @@ test('Phase 8 Commit 8: Pre-Upstream Validation, Anti-Spoofing & PoNR Settlement
     assert.strictEqual(resMed2Samp.status, 200);
 
     userRow = await dbModule.get('SELECT virtual_anlas_balance, v5_banked_balance FROM users WHERE user_id = ?', ['u_paid']);
-    assert.strictEqual(userRow.virtual_anlas_balance, 440 - 34 - 12, 'V5 Medium PoNR must bill 34 + 12 = 46 Anlas');
+    assert.strictEqual(userRow.virtual_anlas_balance, 410 - 44 - 15, 'V5 Medium PoNR must bill 44 + 15 = 59 Anlas');
     assert.strictEqual(userRow.v5_banked_balance, 100, 'Base-paid V5 Medium must NOT deduct V5 banked NCP');
     assert.strictEqual(serverModule.getTelemetrySnapshot().dispatchesMedium, 0);
-    assert.strictEqual(imageUpstreamHits, 3);
+
+    // 3. Negative master V5 tank (isNegative: true) revokes Opus 1-sample discount on V5 multi-sample (15 * 2 = 30)
+    serverModule.applyUsageTelemetry({
+      tier: 3,
+      active: true,
+      expiresAt: DEFAULT_SUB_EXPIRES,
+      trainingStepsLeft: { fixedTrainingStepsLeft: 9000, purchasedTrainingSteps: 0 },
+      isGracePeriod: false,
+      usage: { percent: 2.0, timeUntilNextPercent: 7858, isNegative: true }
+    }, undefined, Date.now());
+
+    queueManager.join({ browser_id: 'dev_paid', req_id: 'req_paid_med_neg_2samp', user_id: 'u_paid', priority_tier: 'Normal' });
+    const resMedNeg2Samp = await sendRawRequest({
+      path: '/proxy/image/ai/generate-image',
+      headers: {
+        'Authorization': 'Bearer sec_paid',
+        'X-Browser-Id': 'dev_paid',
+        'X-Request-Id': 'req_paid_med_neg_2samp',
+        'X-Gen-Width': '1024',
+        'X-Gen-Height': '1024',
+        'X-Gen-Steps': '14',
+        'X-Gen-Samples': '2',
+        'X-Gen-Model': 'V5-medium',
+        'X-Base-Paid': 'true',
+        'X-Declared-Anlas': '30',
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify({
+        model: 'nai-diffusion-5-full-medium',
+        parameters: { width: 1024, height: 1024, steps: 14, n_samples: 2 }
+      })
+    });
+    assert.strictEqual(resMedNeg2Samp.status, 200);
+    userRow = await dbModule.get('SELECT virtual_anlas_balance FROM users WHERE user_id = ?', ['u_paid']);
+    assert.strictEqual(userRow.virtual_anlas_balance, 351 - 30, 'Negative V5 tank must revoke Opus 1-sample discount (30 Anlas)');
+    assert.strictEqual(imageUpstreamHits, 4);
   });
 
   // ---------------------------------------------------------------------------
@@ -757,9 +807,9 @@ test('Phase 8 Commit 8: Pre-Upstream Validation, Anti-Spoofing & PoNR Settlement
   });
 
   // ---------------------------------------------------------------------------
-  // 4. HELL PATH: PRE-PoNR FAILURE VS. POST-PoNR SUNK COST
+  // 4. HELL PATH: PRE-PoNR FAILURE, UPSTREAM 401 SHIELD & POST-PoNR SUNK COST
   // ---------------------------------------------------------------------------
-  await t.test('Hell Path: Pre-PoNR failures charge 0 Anlas/NCP; Post-PoNR mid-stream drop commits sunk costs', async () => {
+  await t.test('Hell Path: Pre-PoNR failures & upstream 401 shield charge 0 Anlas/NCP; Post-PoNR drop commits sunk costs', async () => {
     queueManager.reset();
     serverModule.applyUsageTelemetry({
       tier: 3,
@@ -772,6 +822,69 @@ test('Phase 8 Commit 8: Pre-Upstream Validation, Anti-Spoofing & PoNR Settlement
 
     const startUser = await dbModule.get('SELECT virtual_anlas_balance, v5_banked_balance FROM users WHERE user_id = ?', ['u_paid']);
     const startDispatchesHigh = serverModule.getTelemetrySnapshot().dispatchesHigh;
+
+    // 0. Upstream NovelAI HTTP 401 (expired master_token) on /user/subscription & /ai/generate-image
+    //    must convert to 503 MASTER_TOKEN_EXPIRED (NEVER 401), invalidate telemetry, charge 0, and release locks
+    subscriptionUpstream401 = true;
+    const sub401Res = await sendRawRequest({
+      method: 'GET',
+      path: '/proxy/image/user/subscription',
+      headers: {
+        'Authorization': 'Bearer sec_paid',
+        'X-Browser-Id': 'dev_paid'
+      }
+    });
+    assert.strictEqual(sub401Res.status, 503, 'Upstream 401 on /user/subscription must convert to 503 MASTER_TOKEN_EXPIRED');
+    assert.strictEqual(sub401Res.data.error, 'MASTER_TOKEN_EXPIRED');
+    assert.strictEqual(serverModule.getTelemetrySnapshot().lastFetched, 0, 'Upstream 401 must invalidate lastFetched');
+    subscriptionUpstream401 = false;
+
+    // Re-seed valid telemetry, then test upstream 401 during /ai/generate-image
+    serverModule.applyUsageTelemetry({
+      tier: 3,
+      active: true,
+      expiresAt: DEFAULT_SUB_EXPIRES,
+      trainingStepsLeft: { fixedTrainingStepsLeft: 9000, purchasedTrainingSteps: 0 },
+      isGracePeriod: false,
+      usage: { percent: 80, timeUntilNextPercent: 7858, isNegative: false }
+    }, undefined, Date.now());
+    imageUpstreamMode = '401';
+    queueManager.join({ browser_id: 'dev_paid', req_id: 'req_upstream_401', user_id: 'u_paid', priority_tier: 'Normal', held_ncp: 18, held_ncp_source: 'personal' });
+    const img401Res = await sendRawRequest({
+      path: '/proxy/image/ai/generate-image',
+      headers: {
+        'Authorization': 'Bearer sec_paid',
+        'X-Browser-Id': 'dev_paid',
+        'X-Request-Id': 'req_upstream_401',
+        'X-Gen-Width': '1024',
+        'X-Gen-Height': '1024',
+        'X-Gen-Steps': '23',
+        'X-Gen-Samples': '1',
+        'X-Precise-Refs': '1',
+        'X-Gen-Model': 'V5',
+        'X-Declared-Anlas': '5',
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify({
+        model: 'nai-diffusion-5-full',
+        parameters: { width: 1024, height: 1024, steps: 23, n_samples: 1, reference_image_multiple: ['ref1'] }
+      })
+    });
+    assert.strictEqual(img401Res.status, 503);
+    assert.strictEqual(img401Res.data.error, 'MASTER_TOKEN_EXPIRED');
+    assert.strictEqual(queueManager.getQueueLength(), 0, 'Upstream 401 must release Channel A queue lock');
+    assert.strictEqual(queueManager.getHeldAnlasForUser('u_paid'), 0);
+    assert.strictEqual(queueManager.getHeldNcpForUser('u_paid'), 0);
+
+    // Re-seed telemetry for subsequent PoNR checks
+    serverModule.applyUsageTelemetry({
+      tier: 3,
+      active: true,
+      expiresAt: DEFAULT_SUB_EXPIRES,
+      trainingStepsLeft: { fixedTrainingStepsLeft: 9000, purchasedTrainingSteps: 0 },
+      isGracePeriod: false,
+      usage: { percent: 80, timeUntilNextPercent: 7858, isNegative: false }
+    }, undefined, Date.now());
 
     // 1. Pre-PoNR upstream HTTP 500 on Anlas + V5 High request (1 ref = 5 Anlas, 18 NCP)
     imageUpstreamMode = '500';
@@ -833,7 +946,7 @@ test('Phase 8 Commit 8: Pre-Upstream Validation, Anti-Spoofing & PoNR Settlement
         'X-Gen-Samples': '1',
         'X-Gen-Model': 'V5',
         'X-Base-Paid': 'true',
-        'X-Declared-Anlas': '60',
+        'X-Declared-Anlas': '90',
         'Content-Type': 'application/json'
       },
       body: JSON.stringify({
@@ -906,7 +1019,7 @@ test('Phase 8 Commit 8: Pre-Upstream Validation, Anti-Spoofing & PoNR Settlement
     imageUpstreamMode = 'ok';
     const hitsBefore = imageUpstreamHits;
 
-    // 1. C_auth > X-Declared-Anlas (60 > 10) -> 400 SPEND_CAP_EXCEEDED
+    // 1. C_auth > X-Declared-Anlas (90 > 10) -> 400 SPEND_CAP_EXCEEDED
     queueManager.join({ browser_id: 'dev_paid', req_id: 'req_cap_1', user_id: 'u_paid', priority_tier: 'Normal' });
     const capRes = await sendRawRequest({
       path: '/proxy/image/ai/generate-image',
@@ -1026,7 +1139,7 @@ test('Phase 8 Commit 8: Pre-Upstream Validation, Anti-Spoofing & PoNR Settlement
         'X-Gen-Samples': '1',
         'X-Gen-Model': 'V5',
         'X-Base-Paid': 'true',
-        'X-Declared-Anlas': '60',
+        'X-Declared-Anlas': '90',
         'Content-Type': 'application/json'
       },
       body: JSON.stringify({
@@ -1058,8 +1171,8 @@ test('Phase 8 Commit 8: Pre-Upstream Validation, Anti-Spoofing & PoNR Settlement
     });
     assert.strictEqual(debtFreeProxy.status, 200);
 
-    // 6. Pre-dispatch cross-channel double-spend race on u_race60 (60 Anlas balance):
-    //    Image request (60 Anlas) and vibe encode (2 Anlas) race simultaneously; balance must stay >= 0.
+    // 6. Pre-dispatch cross-channel double-spend race on u_race60 (90 Anlas balance):
+    //    Image request (90 Anlas) and vibe encode (2 Anlas) race simultaneously; balance must stay >= 0.
     imageUpstreamMode = 'delay_ok';
     imageUpstreamDelayMs = 120;
     queueManager.join({ browser_id: 'dev_race60', req_id: 'req_race_img60', user_id: 'u_race60', priority_tier: 'Normal' });
@@ -1077,7 +1190,7 @@ test('Phase 8 Commit 8: Pre-Upstream Validation, Anti-Spoofing & PoNR Settlement
           'X-Gen-Samples': '1',
           'X-Gen-Model': 'V5',
           'X-Base-Paid': 'true',
-          'X-Declared-Anlas': '60',
+          'X-Declared-Anlas': '90',
           'Content-Type': 'application/json'
         },
         body: JSON.stringify({
@@ -1097,18 +1210,18 @@ test('Phase 8 Commit 8: Pre-Upstream Validation, Anti-Spoofing & PoNR Settlement
     ]);
 
     const raceStatuses = [raceImg.status, raceVibe.status].sort((a, b) => a - b);
-    assert.deepStrictEqual(raceStatuses, [200, 403], 'Concurrent 60-Anlas image + 2-Anlas vibe race must admit strictly 1 and reject 1 with 403');
+    assert.deepStrictEqual(raceStatuses, [200, 403], 'Concurrent 90-Anlas image + 2-Anlas vibe race must admit strictly 1 and reject 1 with 403');
     const race60After = await dbModule.get('SELECT virtual_anlas_balance FROM users WHERE user_id = ?', ['u_race60']);
     assert.ok(race60After.virtual_anlas_balance >= 0, 'Cross-channel race must never overdraft virtual_anlas_balance below 0');
 
-    // 7. Stage 9 PoNR commit-boundary TOCTOU race on u_commit_race60 (60 Anlas balance):
+    // 7. Stage 9 PoNR commit-boundary TOCTOU race on u_commit_race60 (90 Anlas balance):
     //    Pause commitAnlasDebit for 80ms during image 200 OK settlement and fire /ai/encode-vibe
-    //    mid-commit. held_cost MUST stay 60 until SQLite settles, rejecting vibe with 403.
+    //    mid-commit. held_cost MUST stay 90 until SQLite settles, rejecting vibe with 403.
     imageUpstreamMode = 'ok';
     const originalCommit = auditEngine.commitAnlasDebit;
     let commitStarted = false;
     auditEngine.commitAnlasDebit = async function(userId, amount, bId) {
-      if (userId === 'u_commit_race60' && amount === 60 && !commitStarted) {
+      if (userId === 'u_commit_race60' && amount === 90 && !commitStarted) {
         commitStarted = true;
         await new Promise(r => setTimeout(r, 80));
       }
@@ -1130,7 +1243,7 @@ test('Phase 8 Commit 8: Pre-Upstream Validation, Anti-Spoofing & PoNR Settlement
           'X-Gen-Samples': '1',
           'X-Gen-Model': 'V5',
           'X-Base-Paid': 'true',
-          'X-Declared-Anlas': '60',
+          'X-Declared-Anlas': '90',
           'Content-Type': 'application/json'
         },
         body: JSON.stringify({
@@ -1164,7 +1277,7 @@ test('Phase 8 Commit 8: Pre-Upstream Validation, Anti-Spoofing & PoNR Settlement
       auditEngine.commitAnlasDebit = originalCommit;
     }
 
-    // 8. Hostile post-200 client socket abort mid-commitAnlasDebit on u_abort_race60 (60 Anlas):
+    // 8. Hostile post-200 client socket abort mid-commitAnlasDebit on u_abort_race60 (90 Anlas):
     //    Client drops socket while commitAnlasDebit is paused 80ms -> executeCleanup() removes task
     //    from queueManager.queue, yet withUserAnlasAuthLock must block concurrent /ai/encode-vibe
     //    until SQLite settles to 0, preventing a -2 overdraft.
@@ -1172,7 +1285,7 @@ test('Phase 8 Commit 8: Pre-Upstream Validation, Anti-Spoofing & PoNR Settlement
     const origCommitAbort = auditEngine.commitAnlasDebit;
     let abortCommitStarted = false;
     auditEngine.commitAnlasDebit = async function(userId, amount, bId) {
-      if (userId === 'u_abort_race60' && amount === 60 && !abortCommitStarted) {
+      if (userId === 'u_abort_race60' && amount === 90 && !abortCommitStarted) {
         abortCommitStarted = true;
         await new Promise(r => setTimeout(r, 80));
       }
@@ -1197,7 +1310,7 @@ test('Phase 8 Commit 8: Pre-Upstream Validation, Anti-Spoofing & PoNR Settlement
           'X-Gen-Samples': '1',
           'X-Gen-Model': 'V5',
           'X-Base-Paid': 'true',
-          'X-Declared-Anlas': '60',
+          'X-Declared-Anlas': '90',
           'Content-Type': 'application/json'
         }
       });
@@ -1382,7 +1495,7 @@ test('Phase 8 Commit 8: Pre-Upstream Validation, Anti-Spoofing & PoNR Settlement
           'X-Gen-Samples': '1',
           'X-Gen-Model': 'V5',
           'X-Base-Paid': 'true',
-          'X-Declared-Anlas': '60',
+          'X-Declared-Anlas': '90',
           'X-Scraped-Anlas': '999',
           'Content-Type': 'application/json'
         },
@@ -1393,11 +1506,11 @@ test('Phase 8 Commit 8: Pre-Upstream Validation, Anti-Spoofing & PoNR Settlement
       });
 
       assert.strictEqual(driftRes.status, 200);
-      assert.match(capturedWarnings, /\[GuildWeave Telemetry Canary\] Formula drift detected: Upstream UI reported 999, server calculated 60/);
+      assert.match(capturedWarnings, /\[GuildWeave Telemetry Canary\] Formula drift detected: Upstream UI reported 999, server calculated 90/);
 
       const afterRow = await dbModule.get('SELECT virtual_anlas_balance, banned FROM users WHERE user_id = ?', ['u_paid']);
       assert.strictEqual(afterRow.banned, 0, 'Canary drift must NEVER ban user');
-      assert.strictEqual(afterRow.virtual_anlas_balance, beforeBal - 60, 'Server authoritative C_auth (60) must be billed');
+      assert.strictEqual(afterRow.virtual_anlas_balance, beforeBal - 90, 'Server authoritative C_auth (90) must be billed');
     } finally {
       console.warn = originalWarn;
     }
@@ -1410,7 +1523,7 @@ test('Phase 8 Commit 8: Pre-Upstream Validation, Anti-Spoofing & PoNR Settlement
     queueManager.reset();
     const hitsBefore = imageUpstreamHits;
 
-    // 1. Master Anlas Depleted (5 < 60) -> 503 MASTER_ANLAS_DEPLETED
+    // 1. Master Anlas Depleted (5 < 90) -> 503 MASTER_ANLAS_DEPLETED
     serverModule.applyUsageTelemetry({
       tier: 3,
       active: true,
@@ -1433,7 +1546,7 @@ test('Phase 8 Commit 8: Pre-Upstream Validation, Anti-Spoofing & PoNR Settlement
         'X-Gen-Samples': '1',
         'X-Gen-Model': 'V5',
         'X-Base-Paid': 'true',
-        'X-Declared-Anlas': '60',
+        'X-Declared-Anlas': '90',
         'Content-Type': 'application/json'
       },
       body: JSON.stringify({

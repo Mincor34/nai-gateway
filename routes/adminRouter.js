@@ -540,13 +540,27 @@ router.post('/prune-device', async (req, res) => {
 
 router.post('/update-token', async (req, res) => {
   const body = (req.body && typeof req.body === 'object' && !Array.isArray(req.body)) ? req.body : null;
-  const masterToken = body ? body.master_token : undefined;
-  if (typeof masterToken !== 'string' || masterToken.trim().length === 0) {
+  const rawMasterToken = body ? body.master_token : undefined;
+  if (typeof rawMasterToken !== 'string') {
+    return res.status(400).json({ error: 'Missing or invalid master_token string.' });
+  }
+  const masterToken = rawMasterToken.trim().replace(/^Bearer(?:\s+|$)/i, '').trim();
+  if (masterToken.length === 0) {
     return res.status(400).json({ error: 'Missing or invalid master_token string.' });
   }
   try {
     await run('INSERT OR REPLACE INTO config (key, value) VALUES (?, ?)', ['master_token', masterToken]);
     console.log('[GuildWeave Admin] Pushed fresh master Opus session token to configuration schema.');
+
+    // Immediately re-sync master subscription telemetry so non-Opus lockouts clear without restarting PM2
+    if (req.telemetry && typeof req.telemetry.refresh === 'function') {
+      try {
+        await req.telemetry.refresh();
+      } catch (syncErr) {
+        console.warn('[GuildWeave Admin] Token saved, but immediate telemetry refresh failed:', syncErr.message);
+      }
+    }
+
     res.json({ success: true });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });

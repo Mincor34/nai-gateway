@@ -5,8 +5,12 @@
  * Enforces ACS-1 ingress staging semaphore (activeBufferingStreams <= INGRESS_SEMAPHORE_MAX),
  * upload inactivity & duration deadlines, TTL re-anchoring at req.on('end'), synchronous
  * Stage 5 anti-spoofing parameter reconciliation, Stage 6 V5 model-aware deadband firewall,
- * Stage 7 authoritative cost calculation (`C_auth`) + in-memory holds + V5 NCP verification,
- * and Stage 9 Point-of-No-Return (PoNR) SQLite settlement strictly on upstream HTTP 200 OK.
+ * Stage 7 authoritative cost calculation (`C_auth`, including Module 643656 V5 1.5x,
+ * Medium / 1.75, and `usageNegative` Opus lightweight bonus guard) + in-memory holds +
+ * V5 NCP verification, and Stage 9 Point-of-No-Return (PoNR) SQLite settlement strictly on
+ * upstream HTTP 200 OK.
+ * Converts upstream NovelAI 401 responses into 503 MASTER_TOKEN_EXPIRED so expired master
+ * credentials never wipe guest device approvals or trigger client reload loops.
  * Orchestrates payload WAF buffering, upstream piping, and isolated Channel B `/ai/encode-vibe`
  * PoNR 2-Anlas settlement under a unified per-principal Anlas authorization gate.
  * Relational Normalization: Deducts allowances, charges Anlas/NCP, and evaluates bans against canonical user_id.
@@ -479,6 +483,7 @@ router.all('/:subdomain/{*splat}', async (req, res) => {
         }
 
         const skipColdBootReset = Boolean(
+          req.telemetry &&
           req.telemetry.lastFetched === 0 &&
           req.telemetry.activeCycleEpoch === null
         );
@@ -596,10 +601,12 @@ router.all('/:subdomain/{*splat}', async (req, res) => {
     // Retrieve master NovelAI session credential before acquiring synchronous locks/semaphores
     const configRecord = await get('SELECT value FROM config WHERE key = ?', ['master_token']);
     if (isConnectionAborted()) return;
-    if (!configRecord || !configRecord.value) {
+    const masterToken = (configRecord && configRecord.value)
+      ? String(configRecord.value).trim().replace(/^Bearer(?:\s+|$)/i, '').trim()
+      : '';
+    if (!masterToken) {
       return sendEarlyError(503, { error: 'System unconfigured: No master token pushed.' });
     }
-    const masterToken = configRecord.value;
 
     // Channel B Slot & Vibe Anlas Hold Reservation (serialized per user_id; zero awaits between balance check and acquireTextSlot)
     if (isVibeEncode) {
@@ -1000,7 +1007,11 @@ router.all('/:subdomain/{*splat}', async (req, res) => {
           // Stage 7: Authoritative Cost Calculation (C_auth), Canary Drift, Hold Placement & V5 NCP Check
           let costDetails;
           try {
-            costDetails = auditEngine.calculateAnlasCostDetails(extractedParams, { isOpus: true });
+            const isV5UsageNegative = Boolean(bodyIsV5 && req.telemetry && req.telemetry.isNegative);
+            costDetails = auditEngine.calculateAnlasCostDetails(extractedParams, {
+              isOpus: true,
+              usageNegative: isV5UsageNegative
+            });
           } catch (costErr) {
             executeCleanup();
             if (!res.headersSent) {
@@ -1351,12 +1362,39 @@ router.all('/:subdomain/{*splat}', async (req, res) => {
         upstreamReq = transport.request(upstreamUrl, { method: req.method, headers }, async (upstreamRes) => {
           console.log(`[GuildWeave Telemetry] Received upstream headers. Status: ${upstreamRes.statusCode}`);
 
+          // Master Token Expiry Shield: NEVER pipe an upstream NovelAI 401 to the client as 401.
+          // Client credentials already passed verifyDevice(); upstream 401 means the server's
+          // master_token is expired/revoked and would falsely trigger client revocation loops.
+          if (upstreamRes.statusCode === 401) {
+            console.error(`[GuildWeave Master Auth] Upstream NovelAI rejected master_token with HTTP 401 on "${cleanPath}". Push a fresh token.`);
+            if (isVibeEncode) {
+              const vibeLock = textGenLockId ? queueManager.getTextLock(textGenLockId) : null;
+              if (vibeLock) vibeLock.held_cost = 0;
+            } else if (isImageGen && activeTask) {
+              queueManager.clearTaskHold(activeTask.req_id, browserId);
+            }
+            if (req.telemetry && typeof req.telemetry.invalidate === 'function') {
+              req.telemetry.invalidate();
+            }
+            upstreamRes.on('error', () => {});
+            upstreamRes.resume();
+            if (!res.headersSent) {
+              res.status(503).json({
+                statusCode: 503,
+                error: 'MASTER_TOKEN_EXPIRED',
+                message: 'Master NovelAI session token was rejected upstream (401). Ask the administrator to push a fresh token.'
+              });
+            }
+            executeCleanup();
+            return;
+          }
+
           // Active Cleanup Invariant: Attach error/aborted/close listeners immediately before any async await
           upstreamRes.on('error', (err) => {
             console.error('[GuildWeave Telemetry] Upstream response stream error occurred:', err);
             executeCleanup();
             if (!res.headersSent) {
-              res.status(502).json({
+              res.status(502).json({ 
                 error: 'Upstream dynamic pipe disconnected',
                 reason: err.message,
                 code: err.code

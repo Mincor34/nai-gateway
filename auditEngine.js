@@ -9,8 +9,9 @@
  *   temporal accruals, and serialized administrative balance/debt mutations.
  * - Relational Normalization: Evaluates quotas, allowances, Anlas deductions, and bans strictly
  *   against the canonical user_id (Security Principal), eliminating multi-device quota inflation.
- * - ACS-1 Domain Engine: Authoritative NovelAI Anlas formula, bounded zero-copy binary multipart parser,
- *   isolated Channel B vibe payload validator, and integer-only NCP/Anlas financial ledger mutations.
+ * - ACS-1 Domain Engine: Authoritative NovelAI Anlas formula (Module 643656 parity), bounded
+ *   zero-copy binary multipart parser, isolated Channel B vibe payload validator, and
+ *   integer-only NCP/Anlas financial ledger mutations.
  */
 
 'use strict';
@@ -18,9 +19,12 @@
 const { get, all, run } = require('./database');
 const { loadConfig } = require('./config');
 
-// NovelAI Pricing Formula Constants (from anlas-calculation.md)
+// NovelAI Pricing Formula Constants (Module 643656 / anlas-calculation.md)
 const ANLAS_ALPHA = 2.951823174884865e-6;
 const ANLAS_BETA = 5.753298233447344e-7;
+const V5_MEDIUM_REF_STEPS = 23;
+const V5_MEDIUM_DIVISOR = 1.75;
+const V5_COST_MULTIPLIER = 1.5;
 const ANLAS_MAX_PER_IMAGE_CAP = 140;
 const ANLAS_MIN_PER_IMAGE_FLOOR = 2;
 
@@ -403,16 +407,24 @@ function parseOptionalFloat(val, fallback = null) {
 
 /**
  * Evaluates the authoritative Anlas cost breakdown for generation parameters.
- * Implements exact reverse-engineered NovelAI billing calculations including V5 Medium 14-step factor.
- * Immunized against NaN leakage, string poisoning, boolean coercion, and unbounded floats.
+ * Implements exact reverse-engineered NovelAI Module 643656 billing calculations:
+ * - V5 Medium (`nai-diffusion-5-full-medium` & inpainting): un-ceiled
+ *   `(ANLAS_ALPHA * area + ANLAS_BETA * area * 23) / 1.75`
+ * - All other V4/V4.5/V5/SDXL models: `Math.ceil(ANLAS_ALPHA * area + ANLAS_BETA * area * steps)`
+ * - SMEA multiplier (`1.4` for `sm && sm_dyn`, `1.2` for `sm`, `1.0` otherwise)
+ * - V5 architecture multiplier (`1.5x`) applied after SMEA across all V5 variants
+ * - Strength scaling + `Math.ceil` + `2` Anlas per-image floor + `140` Anlas per-image cap
+ * - Opus lightweight bonus (`billable_samples = n_samples - 1`) disabled for V5 when `usageNegative === true`
+ * - Immunized against NaN leakage, string poisoning, boolean coercion, and unbounded floats.
  *
  * @param {object} params - Extracted payload parameters.
  * @param {object} [options={}] - Calculation context.
  * @param {boolean} [options.isOpus=true] - Whether the generating account holds Opus tier perks.
+ * @param {boolean} [options.usageNegative=false] - Whether the master V5 tank is in negative overdraft.
  * @returns {object} Detailed breakdown of integer Anlas costs.
  * @throws {Error} If per-image cost exceeds NovelAI's maximum 140 Anlas ceiling.
  */
-function calculateAnlasCostDetails(params, { isOpus = true } = {}) {
+function calculateAnlasCostDetails(params, { isOpus = true, usageNegative = false } = {}) {
   if (!params || typeof params !== 'object') {
     return {
       total: 0,
@@ -436,13 +448,12 @@ function calculateAnlasCostDetails(params, { isOpus = true } = {}) {
   const isV5Medium = isV5MediumModel(model);
   const isV5 = isV5ModelFamily(model);
 
-  // NovelAI upstream: Medium always runs at 14 steps with step_factor = 1 / 1.06521739
-  const stepFactor = isV5Medium ? (1 / 1.06521739) : 1.0;
   const parsedSteps = parseOptionalInt(params.steps, 28);
-  const rawSteps = isV5Medium ? 14 : (parsedSteps > 0 ? parsedSteps : 28);
-  const effectiveSteps = rawSteps * stepFactor;
+  const rawSteps = parsedSteps > 0 ? parsedSteps : 28;
 
-  const baseCalculated = Math.ceil(ANLAS_ALPHA * area + ANLAS_BETA * area * effectiveSteps);
+  const baseCalculated = isV5Medium
+    ? ((ANLAS_ALPHA * area + ANLAS_BETA * area * V5_MEDIUM_REF_STEPS) / V5_MEDIUM_DIVISOR)
+    : Math.ceil(ANLAS_ALPHA * area + ANLAS_BETA * area * rawSteps);
 
   // SMEA Multipliers
   let multiplier = 1.0;
@@ -454,7 +465,12 @@ function calculateAnlasCostDetails(params, { isOpus = true } = {}) {
   } else if (sm) {
     multiplier = 1.2;
   }
-  const w = baseCalculated * multiplier;
+  let w = baseCalculated * multiplier;
+
+  // V5 Model Group 1.5x Multiplier (applies across all V5 variants including Medium)
+  if (isV5) {
+    w *= V5_COST_MULTIPLIER;
+  }
 
   // Img2Img and Inpaint Strength Factors: strictly bounded to [0.0, 1.0]
   // Invariant: If a mask is present, inpaintImg2ImgStrength is checked exclusively.
@@ -487,8 +503,11 @@ function calculateAnlasCostDetails(params, { isOpus = true } = {}) {
   let billableSamples = nSamples;
 
   // Opus Lightweight Bonus:
-  // If account is Opus, dimensions <= 1MP (1048576), and effective steps <= 28, 1 sample is free
-  if (isOpus && area <= 1048576 && effectiveSteps <= 28) {
+  // If account is Opus, V5 tank is not negative, dimensions <= 1MP (1048576), and steps <= 28
+  // (V5 Medium always runs at 14 steps upstream regardless of payload steps), 1 sample is free.
+  const withinOpusSteps = isV5Medium || rawSteps <= 28;
+  const opusUsageExhausted = isV5 && Boolean(usageNegative);
+  if (isOpus && !opusUsageExhausted && area <= 1048576 && withinOpusSteps) {
     billableSamples = Math.max(0, nSamples - 1);
   }
 

@@ -260,6 +260,8 @@ function getPollingIntervalMs(projectedPercent, config = getRuntimeConfig()) {
  * Latches the circuit breaker for at least one 60s polling window whenever upstream
  * confirms master capacity <= V5_CIRCUIT_BREAKER_PERCENT, preventing sub-second
  * continuous refill interpolation from flapping an exact-boundary 5.5% tank open.
+ * Preserves continuous background refill projection across inactive subscription states
+ * while holding `isHardLocked: true` until an active Opus subscription resumes.
  *
  * @param {number} [now=Date.now()] - Epoch timestamp in ms.
  * @returns {object} Telemetry snapshot.
@@ -279,6 +281,7 @@ function getTelemetrySnapshot(now = Date.now()) {
     master_v5_percent <= config.V5_CIRCUIT_BREAKER_PERCENT &&
     projection.elapsedSeconds < (POLL_LOW_BATTERY_MS / 1000);
   const isHardLocked =
+    !master_subscription_active ||
     projection.rawProjected <= config.V5_CIRCUIT_BREAKER_PERCENT ||
     isLatchedWithinPollWindow;
   const pollingIntervalMs = getPollingIntervalMs(projection.clampedProjected, config);
@@ -390,31 +393,21 @@ async function flushPendingCyclePersist() {
  * Applies a validated `/user/subscription` payload to the RAM telemetry registry,
  * normalizing `timeUntilNextPercent`, handling `isNegative` overdrafts with symmetric
  * [-100, 100] sanity bounds, tracking `active`/`tier`/`isGracePeriod`/`trainingStepsLeft`,
- * advancing `master_anlas_cycle_epoch` exclusively and monotonically on genuine non-grace renewals,
+ * gracefully accepting omitted/null `usage` strictly when `active === false || tier < 3`
+ * (non-Opus/expired accounts may omit V5 usage telemetry), advancing
+ * `master_anlas_cycle_epoch` exclusively and monotonically on genuine non-grace renewals,
  * and resetting local V5 dispatch counters.
  *
  * @param {object} payload - Parsed JSON response from `/user/subscription`.
  * @param {object} [config=getRuntimeConfig()] - Validated configuration manifest.
  * @param {number} [now=Date.now()] - Epoch timestamp in ms.
  * @returns {object} Updated telemetry snapshot.
- * @throws {Error} If payload.usage.percent is missing, non-numeric, non-finite, or outside [-100, 100].
+ * @throws {Error} If payload is non-object or active-Opus `usage.percent` is missing, non-numeric, non-finite, or outside [-100, 100].
  */
 function applyUsageTelemetry(payload, config = getRuntimeConfig(), now = Date.now()) {
-  const usage = payload && typeof payload === 'object' ? payload.usage : null;
-  const rawPercent = usage ? usage.percent : undefined;
-
-  if (typeof rawPercent !== 'number' || !Number.isFinite(rawPercent) || rawPercent < -100 || rawPercent > 100) {
+  if (!payload || typeof payload !== 'object' || Array.isArray(payload)) {
     throw new Error('Malformed subscription response payload: usage.percent missing or invalid.');
   }
-
-  const isNegative = usage.isNegative === true;
-  const signedPercent = rawPercent === 0
-    ? 0
-    : (isNegative ? -Math.abs(rawPercent) : rawPercent);
-  const periodEval = normalizeTelemetryPeriod(usage.timeUntilNextPercent, config);
-
-  const safeNow = (typeof now === 'number' && Number.isFinite(now) && now >= 0) ? now : Date.now();
-  const cycleStampMs = safeNow > 0 ? safeNow : Date.now();
 
   // Evaluate subscription status (gracefully defaulting to active when minimal usage-only mocks omit metadata)
   const hasSubMetadata = (typeof payload.active === 'boolean') || (typeof payload.tier === 'number');
@@ -426,6 +419,32 @@ function applyUsageTelemetry(payload, config = getRuntimeConfig(), now = Date.no
       : (typeof payload.tier === 'number' && Number.isFinite(payload.tier) && payload.tier >= OPUS_MIN_TIER);
     nextSubActive = activeOk && tierOk;
   }
+
+  const usage = (payload.usage && typeof payload.usage === 'object' && !Array.isArray(payload.usage))
+    ? payload.usage
+    : null;
+  const rawPercent = usage ? usage.percent : undefined;
+  const hasValidPercent = typeof rawPercent === 'number' && Number.isFinite(rawPercent) && rawPercent >= -100 && rawPercent <= 100;
+
+  let isNegative = false;
+  let signedPercent = 0;
+  let periodEval;
+
+  if (hasValidPercent) {
+    isNegative = usage.isNegative === true;
+    signedPercent = rawPercent === 0
+      ? 0
+      : (isNegative ? -Math.abs(rawPercent) : rawPercent);
+    periodEval = normalizeTelemetryPeriod(usage.timeUntilNextPercent, config);
+  } else if (!nextSubActive && (rawPercent === undefined || rawPercent === null)) {
+    // Non-Opus / expired subscriptions may omit V5 battery `usage` telemetry upstream.
+    periodEval = normalizeTelemetryPeriod(null, config);
+  } else {
+    throw new Error('Malformed subscription response payload: usage.percent missing or invalid.');
+  }
+
+  const safeNow = (typeof now === 'number' && Number.isFinite(now) && now >= 0) ? now : Date.now();
+  const cycleStampMs = safeNow > 0 ? safeNow : Date.now();
 
   const nextGracePeriod = payload.isGracePeriod === true;
 
@@ -668,6 +687,8 @@ function scheduleNextHeartbeat() {
 /**
  * Asynchronously synchronizes master account subscription telemetry.
  * Leverages shared Promise resolution to prevent cache stampedes.
+ * Clears `last_fetched_at` immediately if upstream rejects with HTTP 401 so expired
+ * master credentials never admit V5 tasks against stale cached telemetry.
  *
  * @param {object} [options={}] - Execution options.
  * @param {boolean} [options.rescheduleHeartbeat=true] - Whether to reschedule adaptive heartbeat on completion.
@@ -682,11 +703,13 @@ function syncTelemetry({ rescheduleHeartbeat = true } = {}) {
     try {
       const config = getRuntimeConfig();
       const configRecord = await database.get('SELECT value FROM config WHERE key = ?', ['master_token']);
-      if (!configRecord || !configRecord.value) {
+      const masterToken = (configRecord && configRecord.value)
+        ? String(configRecord.value).trim().replace(/^Bearer(?:\s+|$)/i, '').trim()
+        : '';
+      if (!masterToken) {
         console.warn("[GuildWeave Harvester] Telemetry sync skipped: No master_token configured in database yet.");
         return;
       }
-      const masterToken = configRecord.value;
       last_network_attempt_at = Date.now();
 
       console.log("[GuildWeave Harvester] Fetching master subscription telemetry...");
@@ -727,6 +750,9 @@ function syncTelemetry({ rescheduleHeartbeat = true } = {}) {
                 }
                 resolve();
               } else {
+                if (res.statusCode === 401) {
+                  last_fetched_at = 0;
+                }
                 reject(new Error(`Upstream returned error status code: ${res.statusCode}`));
               }
             } catch (parseErr) {
@@ -755,10 +781,14 @@ function syncTelemetry({ rescheduleHeartbeat = true } = {}) {
 }
 
 // Wire Level 3 QueueCoordinator telemetry provider with strict [0, 100] clamping.
-// Returns null until initial telemetry fetch completes so Bucket 2 never mints phantom surplus on cold boot.
+// Returns null until initial telemetry fetch completes so Bucket 2 never mints phantom surplus on cold boot,
+// and returns 0 when subscription is inactive so unspendable surplus cannot accrue while unsubscribed.
 queueManager.setTelemetryProvider(() => {
   if (last_fetched_at === 0) {
     return null;
+  }
+  if (!master_subscription_active) {
+    return 0;
   }
   return getTelemetrySnapshot().percent;
 });
@@ -796,6 +826,18 @@ app.use((req, res, next) => {
           syncTelemetry().catch(err => console.error("[GuildWeave Telemetry] Out-of-band sync failed:", err.message));
         });
       }
+    },
+    invalidate: () => {
+      last_fetched_at = 0;
+      last_network_attempt_at = Date.now();
+    },
+    refresh: async () => {
+      last_fetched_at = 0;
+      last_network_attempt_at = 0;
+      if (activeFetchPromise) {
+        try { await activeFetchPromise; } catch (_) {}
+      }
+      await syncTelemetry();
     },
     ensureFresh: async () => {
       const config = getRuntimeConfig();

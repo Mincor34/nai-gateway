@@ -7,31 +7,47 @@
  * 2. Split-Token Local Spoofing: Intercepts `/user/data` and `/ai/trial-status`. Preserves the user's
  *    native keystore (E2EE keys) and account preferences while injecting an artificial Opus tier (tier 3)
  *    and 19,998 Anlas. This unlocks generation controls and eliminates client-side trial lockouts.
- * 3. WAF Request Smuggling Shield: Outbound proxy calls delete `Content-Length`, `Content-Type`
- *    (for FormData), and `Host` headers. This allows the browser background transport to append valid
- *    boundary metrics natively during transmission, preventing Cloudflare HTTP Request Smuggling drops.
- * 4. Dual-Timing Stream Coordination: Bypasses Tampermonkey stream exhaustion bugs by resolving
- *    piped `Response` instances inside `onloadstart` as soon as HTTP 200 headers arrive, streaming
- *    binary msgpack blocks directly to the React UI without memory buffering.
- * 5. Strict Lock Teardown: Aborted status queries transmit authoritative hardware footprints and
- *    authorization context to `/queue/complete`, preventing 75-second server-side ghost lock delays.
- * 6. Role-Agnostic Abstraction: Implements environment callbacks for 401 revocation handlers to prevent
- *    polluting shared layers with arbitrary role conditions.
+ * 3. Pre-Flight Policy & Pricing Parity: Computes local Anlas costs (`pricing.js`, implementing
+ *    Module 643656 V5 1.5x, Medium un-ceiled `/ 1.75` at 23 reference steps, and `usageNegative`
+ *    guards), blocks V5 High 24-28 deadband steps client-side, enforces Anlas Bypass and negative-debt
+ *    lockouts, scrapes UI cost into `X-Scraped-Anlas` with canary drift alerts, and sends complete
+ *    Commit 6 `/queue/join` + Commit 8 Stage 5 `/proxy/image/*` headers.
+ * 4. Stage 5 Header Parity Invariant: Never alters outbound generation `body`; forwards exact `steps`
+ *    from the request body in `X-Gen-Steps` (defaulting to 14 for Medium or 28 otherwise only when
+ *    absent) and transmits `X-Gen-Model` as `V5-medium`, `V5`, or `legacy`.
+ * 5. WAF Request Smuggling Shield: Deletes `Content-Length`, `Content-Type` (for FormData), and `Host`.
+ * 6. Dual-Timing Stream Coordination & Strict Lock Teardown: Resolves on `onloadstart` for HTTP 200
+ *    streams, propagates structured server error messages (`400`, `403`, `429`, `503`), surfaces HUD
+ *    alerts + refreshes telemetry on proxy rejections, and triggers `/queue/complete` on client aborts.
  */
 
 'use strict';
 
 import { generateUUID } from './crypto.js';
 import { extractImageParams } from './params.js';
+import {
+  isV5ModelFamily,
+  isV5MediumModel,
+  evaluateGenerationPolicy
+} from './pricing.js';
 import { backgroundRequest, parseResponseHeaders, extractStatusCode, readStreamAsString } from './network.js';
-import { showQueueStatusBanner, hideQueueStatusBanner } from './ui.js';
+import {
+  showQueueStatusBanner,
+  hideQueueStatusBanner,
+  scrapeDisplayedAnlasCost,
+  getClientPolicyState,
+  setClientPolicyState,
+  refreshDualLedgerHud,
+  setHudAlert
+} from './ui.js';
 
 let envConfig = {
     browserId: '',
     deviceSecret: '',
     VPS_HOST: '',
     logPrefix: 'GuildWeave',
-    onRevoked: () => {}
+    onRevoked: () => {},
+    onTelemetryRefresh: () => {}
 };
 
 /**
@@ -42,7 +58,8 @@ let envConfig = {
  * @param {string} config.deviceSecret - Secret authentication passkey.
  * @param {string} config.VPS_HOST - Target gateway base URL.
  * @param {string} [config.logPrefix='GuildWeave'] - Diagnostic logging prefix string.
- * @param {Function} [config.onRevoked] - Callback to execute upon HTTP 401 unauthorization signatures.
+ * @param {Function} [config.onRevoked] - Callback invoked upon HTTP 401 unauthorization signatures.
+ * @param {Function} [config.onTelemetryRefresh] - Callback invoked post-settlement to refresh HUD telemetry.
  */
 export function initInterceptor(config) {
     envConfig = { ...envConfig, ...config };
@@ -57,7 +74,7 @@ export function initInterceptor(config) {
  * @param {object} responseDetails - Raw Tampermonkey response context.
  * @param {Function} resolveObj - Native fetch Promise resolver.
  * @param {boolean} isImageGen - Channel A image task flag.
- * @param {boolean} isTextGen - Channel B text task flag.
+ * @param {boolean} isTextGen - Channel B text/vibe task flag.
  * @returns {Promise<boolean>} True if stream resolution was completed.
  */
 async function tryResolveProxyResponse(responseDetails, resolveObj, isImageGen, isTextGen) {
@@ -69,33 +86,34 @@ async function tryResolveProxyResponse(responseDetails, resolveObj, isImageGen, 
     if (status === 200) {
         if (!responseDetails.response) {
             console.error("[GuildWeave] Telemetry: Success code detected, but readable response stream was empty.");
-            return false; // Wait for response body context to bind
+            return false;
         }
         console.log("[GuildWeave] Telemetry: Stream successfully acquired. Piping stream response directly to fetch promise.");
         
-        // Increment telemetry variables on validation success
         if (isImageGen) {
             GM_setValue("count_image_gens", GM_getValue("count_image_gens", 0) + 1);
         } else if (isTextGen) {
             GM_setValue("count_text_gens", GM_getValue("count_text_gens", 0) + 1);
         }
 
-        // Resolve immediately on stream header initiation to preserve live piping features.
+        if (typeof envConfig.onTelemetryRefresh === 'function') {
+            setTimeout(() => {
+                try { envConfig.onTelemetryRefresh(); } catch (_) {}
+            }, 0);
+        }
+
         resolveObj(new Response(responseDetails.response, {
             status: status,
             headers: parseResponseHeaders(responseDetails.responseHeaders)
         }));
         return true;
     } else {
-        // For error responses, defer resolution until the request has fully completed (readyState 4)
-        // so the fully buffered error body can be read.
         if (responseDetails.readyState !== 4 && responseDetails.readyState !== undefined) {
             return false;
         }
 
         console.error("[GuildWeave] Telemetry: Proxy returned exception status code:", status);
 
-        // Self-Healing Hook for Admin/Guest
         if (status === 401) {
             console.warn("[GuildWeave] Revocation signature caught. Restoring setup lock.");
             GM_setValue("approved", false);
@@ -114,7 +132,6 @@ async function tryResolveProxyResponse(responseDetails, resolveObj, isImageGen, 
                     errorText = responseDetails.response;
                 }
             }
-            // Fallback to text representation if stream parsing yielded nothing
             if (!errorText && responseDetails.responseText) {
                 errorText = responseDetails.responseText;
             }
@@ -124,15 +141,30 @@ async function tryResolveProxyResponse(responseDetails, resolveObj, isImageGen, 
 
         console.log(`[GuildWeave] Telemetry: Received raw error text: "${errorText}"`);
 
-        // Standardize raw anomalies into structured exception parameters for SPA parsing
         let parsedError = null;
         try {
             if (errorText) parsedError = JSON.parse(errorText);
         } catch (e) {}
 
+        if (parsedError && parsedError.error === 'DEBT_LOCKED') {
+            GM_setValue("anlas_bypass_enabled", false);
+            setClientPolicyState({ isInDebt: true, bypassEnabled: false });
+            refreshDualLedgerHud();
+            setHudAlert(parsedError.message || 'Account is in Anlas debt. Bypass locked.', 'error');
+        } else if (parsedError && (parsedError.message || parsedError.error) && (status === 400 || status === 403 || status === 429 || status === 503)) {
+            setHudAlert(parsedError.message || parsedError.error, (status === 403 || status === 503) ? 'error' : 'warning');
+        }
+
+        if (typeof envConfig.onTelemetryRefresh === 'function' && (status === 403 || status === 429 || status === 503)) {
+            setTimeout(() => {
+                try { envConfig.onTelemetryRefresh(); } catch (_) {}
+            }, 0);
+        }
+
         const responseBody = parsedError && (parsedError.statusCode || parsedError.message || parsedError.error)
             ? JSON.stringify({
                 statusCode: parsedError.statusCode || status,
+                error: parsedError.error,
                 message: parsedError.message || parsedError.error || errorText || "GuildWeave processing error"
               })
             : JSON.stringify({
@@ -150,7 +182,9 @@ async function tryResolveProxyResponse(responseDetails, resolveObj, isImageGen, 
 
 /**
  * Handles Channel A image generation lifecycle.
- * Manages FIFO queue registration, transient status polling, and stream proxy forwarding.
+ * Evaluates local pricing/policy directly against NovelAI's native payload, scrapes DOM cost canary,
+ * executes FIFO queue registration with full Commit 6 metadata, polls status, and forwards via stream
+ * proxy with Stage 5/8 headers.
  *
  * @param {string} url - Target upstream destination URL.
  * @param {object} config - Native fetch request parameters.
@@ -167,13 +201,72 @@ async function handleGenerationIntercept(url, config) {
     })();
 
     const originalBody = config.body;
-    let imgParams = { width: 1024, height: 1024, steps: 28, n_samples: 1, precise_refs: 0, model: "" };
+    let imgParams = {
+        width: 1024,
+        height: 1024,
+        steps: 28,
+        has_explicit_steps: false,
+        n_samples: 1,
+        precise_refs: 0,
+        model: "",
+        sm: false,
+        sm_dyn: false,
+        strength: null,
+        inpaintImg2ImgStrength: null,
+        has_image: false,
+        has_mask: false,
+        uncached_vibe_count: 0,
+        vibe_reference_count: 0
+    };
 
     const extracted = await extractImageParams(originalBody);
     if (extracted) imgParams = extracted;
 
+    let currentState = getClientPolicyState();
+    if (imgParams.model) {
+        currentState = setClientPolicyState({ activeModel: imgParams.model });
+        refreshDualLedgerHud();
+    }
+
+    const policy = evaluateGenerationPolicy(imgParams, currentState);
+    const scrapedAnlas = scrapeDisplayedAnlasCost();
+
+    if (scrapedAnlas !== null && scrapedAnlas !== policy.costDetails.total) {
+        console.warn(`[GuildWeave Canary] Displayed UI cost (${scrapedAnlas}) differs from local estimate (${policy.costDetails.total}).`);
+        setHudAlert('Displayed cost may differ from estimate.', 'warning');
+    } else if (policy.ok) {
+        setHudAlert('', 'info');
+    }
+
+    if (!policy.ok) {
+        hideQueueStatusBanner();
+        setHudAlert(policy.message, policy.status === 403 ? 'error' : 'warning');
+        return new Response(JSON.stringify({
+            statusCode: policy.status,
+            error: policy.error,
+            message: policy.message
+        }), {
+            status: policy.status,
+            headers: { 'Content-Type': 'application/json' }
+        });
+    }
+
     const executeQueueJoin = async () => {
         try {
+            const joinPayload = {
+                browser_id: envConfig.browserId,
+                tab_id,
+                req_id,
+                ...(imgParams.model ? { model: imgParams.model } : {}),
+                steps: imgParams.steps,
+                width: imgParams.width,
+                height: imgParams.height,
+                n_samples: imgParams.n_samples,
+                is_base_paid: policy.isBasePaid,
+                is_v5: policy.isV5,
+                declared_anlas: policy.costDetails.total
+            };
+
             const joinRes = await backgroundRequest({
                 method: "POST",
                 url: `${envConfig.VPS_HOST}/queue/join`,
@@ -181,7 +274,7 @@ async function handleGenerationIntercept(url, config) {
                     "Content-Type": "application/json",
                     "Authorization": `Bearer ${envConfig.deviceSecret}`
                 },
-                data: JSON.stringify({ browser_id: envConfig.browserId, tab_id, req_id })
+                data: JSON.stringify(joinPayload)
             });
 
             if (joinRes.status === 401) {
@@ -193,24 +286,53 @@ async function handleGenerationIntercept(url, config) {
                 return new Response(JSON.stringify({ statusCode: 401, message: "Device revoked." }), { status: 401 });
             }
 
-            if (joinRes.status === 403) {
+            if (joinRes.status !== 200) {
                 let errorDetails = {};
                 try {
-                    errorDetails = JSON.parse(joinRes.responseText);
+                    errorDetails = JSON.parse(joinRes.responseText || '{}');
                 } catch (e) {
                     console.error(`[${envConfig.logPrefix}]: Failed to parse error response text safely`, e);
                 }
 
+                hideQueueStatusBanner();
+
                 if (errorDetails.error === 'ALLOWANCE_EXHAUSTED') {
-                    hideQueueStatusBanner();
+                    const msg = "Allowance Exhausted: You have run out of image tokens. Allowance refills at a rate of 1 image per 30 minutes (max 100).";
+                    setHudAlert(msg, 'error');
                     return new Response(JSON.stringify({
                         statusCode: 403,
-                        message: "Allowance Exhausted: You have run out of image tokens. Allowance refills at a rate of 1 image per 30 minutes (max 100)."
+                        error: 'ALLOWANCE_EXHAUSTED',
+                        message: msg
                     }), { status: 403 });
                 }
-            }
 
-            if (joinRes.status !== 200) throw new Error("Join rejection");
+                if (errorDetails.error === 'DEBT_LOCKED') {
+                    GM_setValue("anlas_bypass_enabled", false);
+                    setClientPolicyState({ isInDebt: true, bypassEnabled: false });
+                    refreshDualLedgerHud();
+                }
+
+                if (typeof envConfig.onTelemetryRefresh === 'function' && (joinRes.status === 403 || joinRes.status === 429 || joinRes.status === 503)) {
+                    setTimeout(() => {
+                        try { envConfig.onTelemetryRefresh(); } catch (_) {}
+                    }, 0);
+                }
+
+                if (joinRes.status === 400 || joinRes.status === 403 || joinRes.status === 429 || joinRes.status === 503) {
+                    const msg = errorDetails.message || errorDetails.error || "Queue admission rejected.";
+                    setHudAlert(msg, joinRes.status === 403 || joinRes.status === 503 ? 'error' : 'warning');
+                    return new Response(JSON.stringify({
+                        statusCode: joinRes.status,
+                        error: errorDetails.error,
+                        message: msg
+                    }), {
+                        status: joinRes.status,
+                        headers: { 'Content-Type': 'application/json' }
+                    });
+                }
+
+                throw new Error("Join rejection");
+            }
         } catch (e) {
             return new Response(JSON.stringify({ statusCode: 502, message: "Queue allocation failure" }), { status: 502 });
         }
@@ -219,7 +341,6 @@ async function handleGenerationIntercept(url, config) {
         showQueueStatusBanner("Acquiring channel slot...");
 
         while (!turnAcquired) {
-            // Reduced to 1000ms to reduce dead-time gaps between generations
             await new Promise(r => setTimeout(r, 1000));
             try {
                 const statusRes = await backgroundRequest({
@@ -240,7 +361,6 @@ async function handleGenerationIntercept(url, config) {
                 }
             } catch (e) {
                 hideQueueStatusBanner();
-                // Send fully-formed authorization and hardware context to prevent ghost locks on the server
                 backgroundRequest({
                     method: "POST",
                     url: `${envConfig.VPS_HOST}/queue/complete`,
@@ -255,7 +375,6 @@ async function handleGenerationIntercept(url, config) {
         }
 
         const originalUrlObj = new URL(url);
-        // Extract subdomain dynamically (e.g., 'image' or 'text' or 'api') to support flexible routing across multiple NovelAI subdomains.
         const subdomain = originalUrlObj.hostname.split('.')[0];
         const proxyUrl = `${envConfig.VPS_HOST}/proxy/${subdomain}${originalUrlObj.pathname}${originalUrlObj.search}`;
 
@@ -272,33 +391,41 @@ async function handleGenerationIntercept(url, config) {
             }
         }
 
-        // v5 Safeguard: Explicitly mark v5 generations to prevent legacy false-positive bans on GuildWeave
-        const isV5 = typeof imgParams.model === 'string' && /[-_]5[-_]/i.test(imgParams.model) && !imgParams.model.includes('4-5');
+        const isV5Medium = isV5MediumModel(imgParams.model);
+        const isV5 = isV5ModelFamily(imgParams.model);
 
         updatedHeaders.set("x-browser-id", envConfig.browserId);
         updatedHeaders.set("x-request-id", req_id);
         updatedHeaders.set("x-gen-width", imgParams.width.toString());
         updatedHeaders.set("x-gen-height", imgParams.height.toString());
+        // Stage 5 Invariant: forward exact body steps (14 default for Medium / 28 default otherwise when absent)
         updatedHeaders.set("x-gen-steps", imgParams.steps.toString());
         updatedHeaders.set("x-gen-samples", imgParams.n_samples.toString());
         updatedHeaders.set("x-precise-refs", imgParams.precise_refs.toString());
-        
-        // Enforce explicit model headers for all generations to prevent legacy false-positive bans
-        if (isV5) {
+
+        if (isV5Medium) {
+            updatedHeaders.set("x-gen-model", "V5-medium");
+        } else if (isV5) {
             updatedHeaders.set("x-gen-model", "V5");
         } else {
             updatedHeaders.set("x-gen-model", "legacy");
         }
 
+        updatedHeaders.set("x-base-paid", policy.isBasePaid ? "true" : "false");
+        updatedHeaders.set("x-declared-anlas", policy.costDetails.total.toString());
+        if (scrapedAnlas !== null) {
+            updatedHeaders.set("x-scraped-anlas", scrapedAnlas.toString());
+        }
+
         updatedHeaders.set("authorization", `Bearer ${envConfig.deviceSecret}`);
-        updatedHeaders.set("x-script-version", GM_info.script.version); // Dyn Version Injection
+        updatedHeaders.set("x-script-version", GM_info.script.version);
         if (GM_getValue("debug_mode", false)) {
             updatedHeaders.set("x-debug-mode", "true");
             console.log(`[GuildWeave Debug Mode] Outbound image generation details:`, originalBody);
         }
 
         updatedHeaders.delete("host");
-        updatedHeaders.delete("content-length"); // Prevent dynamic framing corruption upstream
+        updatedHeaders.delete("content-length");
 
         if (typeof FormData !== 'undefined' && originalBody instanceof FormData) {
             updatedHeaders.delete("content-type");
@@ -317,7 +444,6 @@ async function handleGenerationIntercept(url, config) {
                 onloadstart: async function(responseDetails) {
                     console.log(`[${envConfig.logPrefix}] Telemetry: onloadstart fired. ReadyState: ${responseDetails.readyState}, Status: ${extractStatusCode(responseDetails)}`);
                     if (hasResolved) return;
-                    // Resolve immediately on stream header initiation to preserve live piping features.
                     if (await tryResolveProxyResponse(responseDetails, resolve, true, false)) {
                         hasResolved = true;
                     }
@@ -325,7 +451,6 @@ async function handleGenerationIntercept(url, config) {
                 onreadystatechange: async function(responseDetails) {
                     console.log(`[${envConfig.logPrefix}] Telemetry: onreadystatechange fired. ReadyState: ${responseDetails.readyState}, ExtractedStatus: ${extractStatusCode(responseDetails)}`);
                     if (hasResolved) return;
-                    // Fallback evaluation for legacy engines
                     if (responseDetails.readyState >= 2) {
                         if (await tryResolveProxyResponse(responseDetails, resolve, true, false)) {
                             hasResolved = true;
@@ -361,7 +486,6 @@ async function handleGenerationIntercept(url, config) {
         });
     };
 
-    // Leverage outer scoping references to handle clean recursion parameters
     let resolveOuter, rejectOuter;
     const outerPromise = new Promise((res, rej) => {
         resolveOuter = res;
@@ -382,7 +506,6 @@ async function handleGenerationIntercept(url, config) {
  */
 async function handleTextGenerationIntercept(url, config) {
     const originalUrlObj = new URL(url);
-    // Extract subdomain dynamically (e.g., 'image' or 'text' or 'api') to support flexible routing across multiple NovelAI subdomains.
     const subdomain = originalUrlObj.hostname.split('.')[0];
     const proxyUrl = `${envConfig.VPS_HOST}/proxy/${subdomain}${originalUrlObj.pathname}${originalUrlObj.search}`;
     const updatedHeaders = new Map();
@@ -401,14 +524,14 @@ async function handleTextGenerationIntercept(url, config) {
 
     updatedHeaders.set("x-browser-id", envConfig.browserId);
     updatedHeaders.set("authorization", `Bearer ${envConfig.deviceSecret}`);
-    updatedHeaders.set("x-script-version", GM_info.script.version); // Dyn Version Injection
+    updatedHeaders.set("x-script-version", GM_info.script.version);
     if (GM_getValue("debug_mode", false)) {
         updatedHeaders.set("x-debug-mode", "true");
         console.log(`[GuildWeave Debug Mode] Outbound text prompt payload:`, config.body);
     }
 
     updatedHeaders.delete("host");
-    updatedHeaders.delete("content-length"); // Prevent stream desynchronization
+    updatedHeaders.delete("content-length");
 
     if (typeof FormData !== 'undefined' && config.body instanceof FormData) {
         updatedHeaders.delete("content-type");
@@ -477,7 +600,6 @@ function hijackFetch() {
         const urlString = typeof url === 'string' ? url : (url instanceof URL ? url.href : '');
 
         if (urlString) {
-            // Spoof personal metadata retrieval endpoints to display Opus eligibility status
             if (urlString.includes('/user/data')) {
                 const response = await originalFetch(...args);
                 if (response && response.ok) {
@@ -517,7 +639,6 @@ function hijackFetch() {
                 return response;
             }
 
-            // Spoof Trial limitations to prevent local UI blockades
             if (urlString.includes('/ai/trial-status')) {
                 const mockTrial = {
                     "used_text_actions": 0,
@@ -534,22 +655,18 @@ function hijackFetch() {
                 });
             }
 
-            // Intercept subscription telemetry to return the master account's real metrics natively
             if (urlString.includes('/user/subscription')) {
                 return handleTextGenerationIntercept(urlString, config);
             }
 
-            // Generation Interceptions (Explicitly bypass tag suggestions autocomplete to keep autocomplete functional)
             if (urlString.includes('/ai/generate-image') && !urlString.includes('/suggest-tags')) {
                 return handleGenerationIntercept(urlString, config);
             }
 
-            // Route both legacy and new OpenAI-compatible text generation endpoints through secure fast-track text queue
             if (urlString.includes('/ai/generate-stream') || urlString.includes('/oa/v1/completions')) {
                 return handleTextGenerationIntercept(urlString, config);
             }
 
-            // Intercept vibe transfer pre-processing requests to swap with master token instantly
             if (urlString.includes('/ai/encode-vibe')) {
                 return handleTextGenerationIntercept(urlString, config);
             }

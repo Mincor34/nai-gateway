@@ -16,9 +16,19 @@
 import {
   injectNavBadge,
   injectAllowanceBar,
+  injectDualLedgerBar,
   updateAllowanceBar,
+  updateDualLedgerHud,
+  refreshDualLedgerHud,
+  readNativeModelAndEffortFromDOM,
+  setHudAlert,
+  syncUIControlConstraints,
+  scrapeDisplayedAnlasCost,
+  getClientPolicyState,
+  setClientPolicyState,
   injectQueueShield,
   setQueueShieldState,
+  setGenerateLockoutState,
   initDOMObserver,
   stopDOMObserver
 } from './domEngine.js';
@@ -26,9 +36,19 @@ import {
 export {
   injectNavBadge,
   injectAllowanceBar,
+  injectDualLedgerBar,
   updateAllowanceBar,
+  updateDualLedgerHud,
+  refreshDualLedgerHud,
+  readNativeModelAndEffortFromDOM,
+  setHudAlert,
+  syncUIControlConstraints,
+  scrapeDisplayedAnlasCost,
+  getClientPolicyState,
+  setClientPolicyState,
   injectQueueShield,
   setQueueShieldState,
+  setGenerateLockoutState,
   initDOMObserver,
   stopDOMObserver
 };

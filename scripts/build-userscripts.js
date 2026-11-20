@@ -8,12 +8,12 @@ const OUT_DIR = path.join(__dirname, '..', 'UserScripts');
 // TODO: Versioning and metadata don't belong in the build script.
 
 // UserScript metadata banners for Tampermonkey
-// Adhere to SemVer versioning for the @version field
+// Adhere to SemVer versioning for the @version field (X.Y.Z; increment Z for minor changes, Y for new user-facing features, X for breaking changes).
 // Note: @updateURL/@downloadURL and output filenames retain the legacy repository slug for upgrade continuity
 const adminBanner = `// ==UserScript==
 // @name         GuildWeave (Admin)
 // @namespace    http://tampermonkey.net/
-// @version      5.0.0
+// @version      6.0.0
 // @description  Secure administration panel, telemetry dashboard, bilateral debug coordinator, and session token injector
 // @author       Minco
 // @match        https://novelai.net/*
@@ -30,7 +30,7 @@ const adminBanner = `// ==UserScript==
 const guestBanner = `// ==UserScript==
 // @name         GuildWeave
 // @namespace    http://tampermonkey.net/
-// @version      5.0.0
+// @version      6.0.0
 // @description  FIFO queue coordination, rolling allowance telemetry visualization, and background stream proxy pipeline
 // @author       Minco
 // @match        https://novelai.net/*
