@@ -10,8 +10,9 @@
  * - Relational Normalization: Evaluates quotas, allowances, Anlas deductions, and bans strictly
  *   against the canonical user_id (Security Principal), eliminating multi-device quota inflation.
  * - ACS-1 Domain Engine: Authoritative NovelAI Anlas formula (Module 643656 parity), bounded
- *   zero-copy binary multipart parser, isolated Channel B vibe payload validator, and
- *   integer-only NCP/Anlas financial ledger mutations.
+ *   zero-copy binary multipart parser, isolated Channel B vibe payload validator,
+ *   segregated Character Reference (director_reference_images*) vs. Vibe Transfer
+ *   (reference_image_multiple) accounting, and integer-only NCP/Anlas ledger mutations.
  */
 
 'use strict';
@@ -19,7 +20,7 @@
 const { get, all, run } = require('./database');
 const { loadConfig } = require('./config');
 
-// NovelAI Pricing Formula Constants (Module 643656 / anlas-calculation.md)
+// NovelAI Pricing Formula Constants (Module 643656 / Module 875333 / anlas-calculation.md)
 const ANLAS_ALPHA = 2.951823174884865e-6;
 const ANLAS_BETA = 5.753298233447344e-7;
 const V5_MEDIUM_REF_STEPS = 23;
@@ -27,6 +28,8 @@ const V5_MEDIUM_DIVISOR = 1.75;
 const V5_COST_MULTIPLIER = 1.5;
 const ANLAS_MAX_PER_IMAGE_CAP = 140;
 const ANLAS_MIN_PER_IMAGE_FLOOR = 2;
+const MAX_NOVELAI_PIXELS = 3145728;
+const MAX_NOVELAI_STEPS = 50;
 
 // ACS-1 Ledger Temporal & Compute Constants
 const DAY_MS = 86400000;
@@ -156,8 +159,8 @@ function assertValidTimestamp(value, fieldName) {
 
 /**
  * Evaluates whether a given model identifier belongs to the V5 architecture family.
- * Strictly distinguishes V5 models from V4.5 variants (including 4-5, 4_5, 4.5) and matches
- * both suffixed ('nai-diffusion-5-full') and bare ('nai-diffusion-5', 'v5') identifiers.
+ * Strictly distinguishes V5 models from `.5` legacy variants (e.g., `1.5`, `3-5`, `4-5`, `4_5`, `4.5`)
+ * and matches both suffixed ('nai-diffusion-5-full') and bare ('nai-diffusion-5', 'v5') identifiers.
  *
  * @param {string|null|undefined} model - Target model identifier string.
  * @returns {boolean} True if the model represents a NovelAI V5 variant.
@@ -165,7 +168,7 @@ function assertValidTimestamp(value, fieldName) {
 function isV5ModelFamily(model) {
   if (typeof model !== 'string') return false;
   const trimmed = model.trim();
-  if (/4[-_.]5/i.test(trimmed)) return false;
+  if (/\d[-_.]5/i.test(trimmed)) return false;
   return /(?:^|[-_])v?5(?:[-_]|$)/i.test(trimmed);
 }
 
@@ -407,14 +410,19 @@ function parseOptionalFloat(val, fallback = null) {
 
 /**
  * Evaluates the authoritative Anlas cost breakdown for generation parameters.
- * Implements exact reverse-engineered NovelAI Module 643656 billing calculations:
+ * Implements exact reverse-engineered NovelAI Module 643656 & Module 875333 billing calculations:
  * - V5 Medium (`nai-diffusion-5-full-medium` & inpainting): un-ceiled
  *   `(ANLAS_ALPHA * area + ANLAS_BETA * area * 23) / 1.75`
  * - All other V4/V4.5/V5/SDXL models: `Math.ceil(ANLAS_ALPHA * area + ANLAS_BETA * area * steps)`
  * - SMEA multiplier (`1.4` for `sm && sm_dyn`, `1.2` for `sm`, `1.0` otherwise)
  * - V5 architecture multiplier (`1.5x`) applied after SMEA across all V5 variants
  * - Strength scaling + `Math.ceil` + `2` Anlas per-image floor + `140` Anlas per-image cap
+ * - Hard NovelAI structural limits: area <= 3,145,728 px (3MP) across all models and
+ *   steps <= 50 on non-Medium models (closes `strength: 0` cap evasion)
  * - Opus lightweight bonus (`billable_samples = n_samples - 1`) disabled for V5 when `usageNegative === true`
+ * - Character References (`director_reference_images*`) billed at 5 Anlas/ref/sample
+ * - Vibe Transfer (`reference_image_multiple` on V3/V4/V4.5) billed at 2 Anlas per ref beyond 4
+ *   (and 2 Anlas per uncached encode), disabled on V5
  * - Immunized against NaN leakage, string poisoning, boolean coercion, and unbounded floats.
  *
  * @param {object} params - Extracted payload parameters.
@@ -422,7 +430,7 @@ function parseOptionalFloat(val, fallback = null) {
  * @param {boolean} [options.isOpus=true] - Whether the generating account holds Opus tier perks.
  * @param {boolean} [options.usageNegative=false] - Whether the master V5 tank is in negative overdraft.
  * @returns {object} Detailed breakdown of integer Anlas costs.
- * @throws {Error} If per-image cost exceeds NovelAI's maximum 140 Anlas ceiling.
+ * @throws {Error} If per-image cost exceeds 140 Anlas, resolution exceeds 3MP, or non-Medium steps exceed 50.
  */
 function calculateAnlasCostDetails(params, { isOpus = true, usageNegative = false } = {}) {
   if (!params || typeof params !== 'object') {
@@ -498,6 +506,14 @@ function calculateAnlasCostDetails(params, { isOpus = true, usageNegative = fals
     throw new Error(`Per-image cost of ${perImageAnlas} Anlas exceeds maximum cap of ${ANLAS_MAX_PER_IMAGE_CAP} Anlas.`);
   }
 
+  if (area > MAX_NOVELAI_PIXELS) {
+    throw new Error(`Image resolution area of ${area}px (${width}x${height}) exceeds maximum NovelAI cap of ${MAX_NOVELAI_PIXELS}px.`);
+  }
+
+  if (!isV5Medium && rawSteps > MAX_NOVELAI_STEPS) {
+    throw new Error(`Step count of ${rawSteps} exceeds maximum NovelAI cap of ${MAX_NOVELAI_STEPS} steps.`);
+  }
+
   const parsedSamples = parseOptionalInt(params.n_samples, 1);
   const nSamples = parsedSamples > 0 ? parsedSamples : 1;
   let billableSamples = nSamples;
@@ -514,13 +530,13 @@ function calculateAnlasCostDetails(params, { isOpus = true, usageNegative = fals
   const baseAnlas = perImageAnlas * billableSamples;
 
   // Character / Precise Reference Surcharge: 5 Anlas per reference per requested sample
+  // Strictly counts Character Reference arrays (director_reference_images*); never Vibe Transfer arrays.
   let rawRefs = params.precise_ref_count ?? params.precise_refs ?? params.character_reference_count ?? params.reference_count;
-  
+
   if (rawRefs === undefined || rawRefs === null) {
     const cachedCount = Array.isArray(params.director_reference_images_cached) ? params.director_reference_images_cached.length : 0;
     const directCount = Array.isArray(params.director_reference_images) ? params.director_reference_images.length : 0;
-    const multiCount = Array.isArray(params.reference_image_multiple) ? params.reference_image_multiple.length : 0;
-    const arrayTotal = cachedCount + directCount + multiCount;
+    const arrayTotal = cachedCount + directCount;
     if (arrayTotal > 0) rawRefs = arrayTotal;
   }
 
@@ -528,7 +544,7 @@ function calculateAnlasCostDetails(params, { isOpus = true, usageNegative = fals
   const preciseRefs = parsedRefs > 0 ? parsedRefs : 0;
   const characterReferenceAnlas = 5 * preciseRefs * nSamples;
 
-  // Vibe Transfer Surcharges (Exclusively for V4 / V4.5 models; V5 does not support Vibe)
+  // Vibe Transfer Surcharges (Exclusively for V3 / V4 / V4.5 models; V5 does not support Vibe)
   let vibeEncodingAnlas = 0;
   let vibeReferenceAnlas = 0;
 
@@ -537,8 +553,13 @@ function calculateAnlasCostDetails(params, { isOpus = true, usageNegative = fals
     let rawVibeRefs = params.vibe_reference_count;
 
     if (rawVibeRefs === undefined || rawVibeRefs === null) {
-      if (Array.isArray(params.vibe_images)) rawVibeRefs = params.vibe_images.length;
-      else if (Array.isArray(params.vibes)) rawVibeRefs = params.vibes.length;
+      if (Array.isArray(params.reference_image_multiple) && params.reference_image_multiple.length > 0) {
+        rawVibeRefs = params.reference_image_multiple.length;
+      } else if (Array.isArray(params.vibe_images)) {
+        rawVibeRefs = params.vibe_images.length;
+      } else if (Array.isArray(params.vibes)) {
+        rawVibeRefs = params.vibes.length;
+      }
     }
 
     const uncachedVibes = Math.max(0, parseOptionalInt(rawUncached, 0));
@@ -1909,7 +1930,8 @@ function validateVibeEncodePayload(buffer, contentType = null) {
 
 /**
  * Format-agnostic parameter extractor.
- * Safely parses JSON blocks or multipart streams, identifying character references.
+ * Safely parses JSON blocks or multipart streams, segregating Character References
+ * (`director_reference_images*`) from Vibe Transfer (`reference_image_multiple`).
  * Hardened against malformed JSON, truncated boundaries, and ReDoS injections.
  *
  * @param {Buffer} buffer - Outbound raw client payload buffer.
@@ -1926,10 +1948,9 @@ function extractParametersFromRawBody(buffer, contentType = null) {
       ? parsed.parameters
       : parsed;
 
-    const preciseRefs = 
+    const preciseRefs =
       (Array.isArray(params.director_reference_images_cached) ? params.director_reference_images_cached.length : 0) +
-      (Array.isArray(params.director_reference_images) ? params.director_reference_images.length : 0) +
-      (Array.isArray(params.reference_image_multiple) ? params.reference_image_multiple.length : 0);
+      (Array.isArray(params.director_reference_images) ? params.director_reference_images.length : 0);
 
     const rawWidth = params.width ?? parsed.width;
     const rawHeight = params.height ?? parsed.height;
@@ -1953,8 +1974,13 @@ function extractParametersFromRawBody(buffer, contentType = null) {
 
     let rawVibeRefs = params.vibe_reference_count ?? parsed.vibe_reference_count;
     if (rawVibeRefs === undefined || rawVibeRefs === null) {
-      if (Array.isArray(params.vibe_images)) rawVibeRefs = params.vibe_images.length;
-      else if (Array.isArray(params.vibes)) rawVibeRefs = params.vibes.length;
+      if (Array.isArray(params.reference_image_multiple) && params.reference_image_multiple.length > 0) {
+        rawVibeRefs = params.reference_image_multiple.length;
+      } else if (Array.isArray(params.vibe_images)) {
+        rawVibeRefs = params.vibe_images.length;
+      } else if (Array.isArray(params.vibes)) {
+        rawVibeRefs = params.vibes.length;
+      }
     }
     const parsedVibeRefs = parseOptionalInt(rawVibeRefs, 0);
     const vibeRefs = parsedVibeRefs > 0 ? parsedVibeRefs : 0;
@@ -2275,6 +2301,8 @@ module.exports = {
   getOrUpdateAllowance,
   getNextRefillTime,
   MAX_JSON_PART_BYTES,
+  MAX_NOVELAI_PIXELS,
+  MAX_NOVELAI_STEPS,
   TELEMETRY_PROMPT_KEYS,
   DAY_MS,
   THIRTY_DAYS_MS

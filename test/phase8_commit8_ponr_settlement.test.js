@@ -12,13 +12,17 @@
  *      enforces exact Module 643656 PoNR settlement with zero V5 bank deduction.
  *    - Negative V5 tank (`isNegative: true`) revokes Opus 1-sample discount on V5 multi-sample
  *      (`1024x1024, 2 samples` Medium -> `30` Anlas instead of `15`).
- * 2. Happy Path: Free V5 Bucket 1 / Bucket 2 PoNR & Orthogonal Addon Accounting:
+ * 2. Happy Path: Free V5 Bucket 1 / Bucket 2 PoNR, Serialized Surplus Writes, Orthogonal Character Refs & V4.5 Vibe Segregation:
  *    - Bucket 1 (`personal`) deducts `18` NCP (High) / `10` NCP (Medium) and increments
  *      `v5_daily_consumed` + `subscription_period_v5` strictly on `HTTP 200 OK`.
- *    - Bucket 2 (`surplus`) deducts `18` NCP from RAM `v5SurplusPool`, persists `v5_surplus_pool`
- *      to SQLite `config`, and increments daily/period counters without deducting `v5_banked_balance`.
- *    - Free-base V5 High with `1` character reference (`X-Base-Paid: false`, `X-Declared-Anlas: 5`)
- *      commits BOTH `5` Anlas AND `18` V5 NCP + `dispatchesHigh += 1` (addons do not exempt V5 battery).
+ *    - Bucket 2 (`surplus`) deducts `18`/`10` NCP from RAM `v5SurplusPool`, serializes `v5_surplus_pool`
+ *      persistence against sleeping 24h `persistSurplusState` retries, and increments daily/period counters
+ *      without deducting `v5_banked_balance`.
+ *    - Free-base V5 High with `1` character reference (`director_reference_images: ['ref1']`,
+ *      `X-Base-Paid: false`, `X-Declared-Anlas: 5`) commits BOTH `5` Anlas AND `18` V5 NCP +
+ *      `dispatchesHigh += 1` (addons do not exempt V5 battery).
+ *    - V4.5 pre-encoded Vibe Transfer (`reference_image_multiple` 2 vibes) bills `0` Anlas and `0` precise refs
+ *      (passes even on `Low` tier with `preciseLimit: 1`), while 6 vibes bills `4` Anlas (`(6 - 4) * 2`).
  *    - No double-counting of `anlas_consumed` from legacy `runBackgroundAudit`.
  * 3. Hell Path: Synchronous Stage 5 Parameter Forgery Ban & Queue Eviction:
  *    - `X-Gen-Width: 1024` vs `2048` in body -> immediate `403 PARAMETER_FORGERY`, `0` upstream hits,
@@ -30,19 +34,22 @@
  *      -> immediate `403 PARAMETER_FORGERY`, permanent ban, `0` upstream hits.
  *    - Multipart `X-Gen-Model: legacy` vs `nai-diffusion-5-full` in body preceded by binary image
  *      -> immediate `403 PARAMETER_FORGERY`, permanent ban, `0` upstream hits.
- * 4. Hell Path: Pre-PoNR Failure vs. Post-PoNR Sunk Cost & Upstream 401 Isolation:
+ * 4. Hell Path: Pre-PoNR Failure vs. Post-PoNR Sunk Cost, Upstream 401 Isolation & Cooldown Shielding:
  *    - Pre-PoNR upstream `HTTP 500` and pre-header socket sever (`502`) release Anlas + V5 NCP holds
  *      with `0` debit and `0` `dispatchesHigh` increment.
  *    - Upstream NovelAI `HTTP 401` (expired `master_token`) on `/user/subscription` or `/ai/generate-image`
- *      converts to `503 MASTER_TOKEN_EXPIRED` (never `401`), invalidates `lastFetched`, charges `0`,
- *      and releases locks cleanly.
+ *      converts to `503 MASTER_TOKEN_EXPIRED` (never `401`), invalidates telemetry, clears stale capacity,
+ *      charges `0`, and releases locks cleanly.
+ *    - Subsequent `/queue/join` and `/proxy/image/*` requests (both V5 and legacy free) within the 60s
+ *      cooldown after `401` return `503 MASTER_TOKEN_EXPIRED` (never `TELEMETRY_FETCH_FAILED`) with `0` upstream hits.
  *    - Post-PoNR mid-stream socket sever *after* `HTTP 200 OK` headers preserves BOTH Anlas and
  *      V5 NCP SQLite debits as sunk costs while freeing holds and queue slots cleanly.
- * 5. Hell Path: Spend Cap, Debt Lockout, Forged Bypass, Deadband, Effort Escalation & Cross-Channel Races:
+ * 5. Hell Path: Spend Cap, Debt Lockout, Forged Bypass, `strength: 0` Cap Evasion, Deadband, Effort Escalation & Cross-Channel Races:
  *    - `C_auth > X-Declared-Anlas` (`90 > 10`) -> `400 SPEND_CAP_EXCEEDED`, `0` upstream hits, `0` debit.
  *    - Stealth character ref (`X-Declared-Anlas: 0`) -> `400 SPEND_CAP_EXCEEDED`, `0` upstream hits.
  *    - Forged `X-Base-Paid: true` on `1024x1024, 23 steps, 1 sample` (even at `<= 5.5%` battery)
  *      -> `400 PARAMETRIC_LIMIT_EXCEEDED`, `0` upstream hits.
+ *    - `strength: 0` on `100000x100000` dimensions -> `400 PARAMETRIC_LIMIT_EXCEEDED`, `0` upstream hits.
  *    - Omitting `X-Gen-*` headers to sneak `nai-diffusion-5-full` `25` steps (deadband) or `>1MP`
  *      past Stage 1 is caught at Stage 6 (`400 PARAMETRIC_LIMIT_EXCEEDED`), `0` upstream hits.
  *    - Effort escalation (`Medium 10 NCP` at `/queue/join` -> `High 18 NCP` at `/proxy`) upgrades or
@@ -236,6 +243,15 @@ test('Phase 8 Commit 8: Pre-Upstream Validation, Anti-Spoofing & PoNR Settlement
   );
   await dbModule.run(
     "INSERT INTO devices (browser_id, user_id, device_secret, priority_tier, approved, banned, anlas_consumed) VALUES ('dev_paid', 'u_paid', 'sec_paid', 'Normal', 1, 0, 0)"
+  );
+
+  await dbModule.run(
+    `INSERT INTO users (user_id, priority_tier, banned, virtual_anlas_balance, last_anlas_reset_epoch, v5_banked_balance, v5_last_accrual_epoch)
+     VALUES ('u_low_vibe', 'Low', 0, 50, ?, 100, ?)`,
+    [now, now]
+  );
+  await dbModule.run(
+    "INSERT INTO devices (browser_id, user_id, device_secret, priority_tier, approved, banned) VALUES ('dev_low_vibe', 'u_low_vibe', 'sec_low_vibe', 'Low', 1, 0)"
   );
 
   await dbModule.run(
@@ -495,9 +511,9 @@ test('Phase 8 Commit 8: Pre-Upstream Validation, Anti-Spoofing & PoNR Settlement
   });
 
   // ---------------------------------------------------------------------------
-  // 2. HAPPY PATH: V5 BUCKET 1 / BUCKET 2 PoNR & ORTHOGONAL ADDON ACCOUNTING
+  // 2. HAPPY PATH: V5 BUCKET 1 / BUCKET 2 PoNR, SURPLUS SERIALIZATION & CHARACTER/VIBE SEGREGATION
   // ---------------------------------------------------------------------------
-  await t.test('Happy Path: Commits V5 Bucket 1, Bucket 2 surplus persistence & orthogonal addon Anlas without double-counting', async () => {
+  await t.test('Happy Path: Commits V5 Bucket 1, serialized Bucket 2 surplus persistence, orthogonal Character Refs & V4.5 Vibe Segregation', async () => {
     queueManager.reset();
     imageUpstreamMode = 'ok';
 
@@ -510,7 +526,8 @@ test('Phase 8 Commit 8: Pre-Upstream Validation, Anti-Spoofing & PoNR Settlement
       usage: { percent: 80, timeUntilNextPercent: 7858, isNegative: false }
     }, undefined, Date.now());
 
-    // 1. Baseline free V5 High + 1 character reference (addon = 5 Anlas) -> must charge BOTH 5 Anlas AND 18 personal NCP
+    // 1. Baseline free V5 High + 1 character reference (director_reference_images = ['ref1'], addon = 5 Anlas)
+    //    must charge BOTH 5 Anlas AND 18 personal NCP
     const balBeforeAddon = (await dbModule.get('SELECT virtual_anlas_balance, anlas_consumed FROM users WHERE user_id = ?', ['u_paid']));
     await sendRawRequest({
       path: '/queue/join',
@@ -545,7 +562,7 @@ test('Phase 8 Commit 8: Pre-Upstream Validation, Anti-Spoofing & PoNR Settlement
       },
       body: JSON.stringify({
         model: 'nai-diffusion-5-full',
-        parameters: { width: 1024, height: 1024, steps: 23, n_samples: 1, reference_image_multiple: ['ref1'] }
+        parameters: { width: 1024, height: 1024, steps: 23, n_samples: 1, director_reference_images: ['ref1'] }
       })
     });
     assert.strictEqual(addonRes.status, 200);
@@ -559,49 +576,124 @@ test('Phase 8 Commit 8: Pre-Upstream Validation, Anti-Spoofing & PoNR Settlement
     assert.strictEqual(userAfterAddon.subscription_period_v5, 1);
     assert.strictEqual(serverModule.getTelemetrySnapshot().dispatchesHigh, 1);
 
-    // 2. Bucket 2 Surplus PoNR deduction & SQLite persistence
-    await dbModule.run("UPDATE users SET v5_banked_balance = 0, v5_last_accrual_epoch = ? WHERE user_id = 'u_paid'", [Date.now()]);
-    queueManager.hydrateSurplusPool('100', String(Date.now()));
-
-    const joinSurplus = await sendRawRequest({
-      path: '/queue/join',
-      headers: { 'Authorization': 'Bearer sec_paid', 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        browser_id: 'dev_paid',
-        req_id: 'req_v5_surplus_1',
-        model: 'nai-diffusion-5-full-medium',
-        width: 1024,
-        height: 1024,
-        n_samples: 1,
-        steps: 14,
-        is_base_paid: false
-      })
-    });
-    assert.strictEqual(joinSurplus.status, 200);
-    assert.strictEqual(queueManager.getHeldNcpForUser('u_paid', 'surplus'), 10);
-
-    const surplusRes = await sendRawRequest({
+    // 1b. V4.5 Vibe Transfer (`reference_image_multiple`) on Low tier (`preciseLimit: 1`):
+    //     - 2 pre-encoded vibes must cost 0 Anlas and NOT fail `preciseLimit: 1`
+    //     - 6 pre-encoded vibes must cost (6 - 4) * 2 = 4 Anlas
+    queueManager.join({ browser_id: 'dev_low_vibe', req_id: 'req_v45_vibe2', user_id: 'u_low_vibe', priority_tier: 'Low' });
+    const vibe2Res = await sendRawRequest({
       path: '/proxy/image/ai/generate-image',
       headers: {
-        'Authorization': 'Bearer sec_paid',
-        'X-Browser-Id': 'dev_paid',
-        'X-Request-Id': 'req_v5_surplus_1',
+        'Authorization': 'Bearer sec_low_vibe',
+        'X-Browser-Id': 'dev_low_vibe',
+        'X-Request-Id': 'req_v45_vibe2',
         'X-Gen-Width': '1024',
         'X-Gen-Height': '1024',
-        'X-Gen-Steps': '14',
+        'X-Gen-Steps': '28',
         'X-Gen-Samples': '1',
-        'X-Gen-Model': 'V5-medium',
+        'X-Precise-Refs': '0',
+        'X-Gen-Model': 'legacy',
+        'X-Base-Paid': 'false',
+        'X-Declared-Anlas': '0',
         'Content-Type': 'application/json'
       },
       body: JSON.stringify({
-        model: 'nai-diffusion-5-full-medium',
-        parameters: { width: 1024, height: 1024, steps: 14, n_samples: 1 }
+        model: 'nai-diffusion-4-5-full',
+        parameters: { width: 1024, height: 1024, steps: 28, n_samples: 1, reference_image_multiple: ['v1', 'v2'] }
       })
     });
-    assert.strictEqual(surplusRes.status, 200);
+    assert.strictEqual(vibe2Res.status, 200, '2 V4.5 Vibe Transfers must pass Low tier preciseLimit: 1 with 0 Anlas');
+
+    queueManager.join({ browser_id: 'dev_low_vibe', req_id: 'req_v45_vibe6', user_id: 'u_low_vibe', priority_tier: 'Low' });
+    const vibe6Res = await sendRawRequest({
+      path: '/proxy/image/ai/generate-image',
+      headers: {
+        'Authorization': 'Bearer sec_low_vibe',
+        'X-Browser-Id': 'dev_low_vibe',
+        'X-Request-Id': 'req_v45_vibe6',
+        'X-Gen-Width': '1024',
+        'X-Gen-Height': '1024',
+        'X-Gen-Steps': '28',
+        'X-Gen-Samples': '1',
+        'X-Precise-Refs': '0',
+        'X-Gen-Model': 'legacy',
+        'X-Base-Paid': 'false',
+        'X-Declared-Anlas': '4',
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify({
+        model: 'nai-diffusion-4-5-full',
+        parameters: { width: 1024, height: 1024, steps: 28, n_samples: 1, reference_image_multiple: ['v1', 'v2', 'v3', 'v4', 'v5', 'v6'] }
+      })
+    });
+    assert.strictEqual(vibe6Res.status, 200);
+    const lowVibeUser = await dbModule.get("SELECT virtual_anlas_balance FROM users WHERE user_id = 'u_low_vibe'");
+    assert.strictEqual(lowVibeUser.virtual_anlas_balance, 46, '2 vibes = 0 Anlas; 6 vibes = 4 Anlas (50 -> 46)');
+
+    // 2. Bucket 2 Surplus PoNR deduction & serialized SQLite persistence (prevents sleeping 24h retry overwrite)
+    await dbModule.run("UPDATE users SET v5_banked_balance = 0, v5_last_accrual_epoch = ? WHERE user_id = 'u_paid'", [Date.now()]);
+    const surplusEpoch = Date.now();
+    queueManager.hydrateSurplusPool('100', String(surplusEpoch));
+
+    // Simulate a transient SQLITE_BUSY sleeping retry inside persistSurplusState(100, surplusEpoch)
+    const originalDbRun = dbModule.run;
+    let failFirstSurplusWrite = true;
+    dbModule.run = async function(sql, params) {
+      if (failFirstSurplusWrite && typeof sql === 'string' && sql.includes('v5_surplus_last_accrual')) {
+        failFirstSurplusWrite = false;
+        throw new Error('SQLITE_BUSY: simulated lock during 24h accrual');
+      }
+      return originalDbRun.apply(this, arguments);
+    };
+
+    let sleepingRetryPromise;
+    try {
+      sleepingRetryPromise = serverModule.persistSurplusState(100, surplusEpoch);
+      await new Promise(r => setTimeout(r, 10));
+
+      const joinSurplus = await sendRawRequest({
+        path: '/queue/join',
+        headers: { 'Authorization': 'Bearer sec_paid', 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          browser_id: 'dev_paid',
+          req_id: 'req_v5_surplus_1',
+          model: 'nai-diffusion-5-full-medium',
+          width: 1024,
+          height: 1024,
+          n_samples: 1,
+          steps: 14,
+          is_base_paid: false
+        })
+      });
+      assert.strictEqual(joinSurplus.status, 200);
+      assert.strictEqual(queueManager.getHeldNcpForUser('u_paid', 'surplus'), 10);
+
+      const surplusRes = await sendRawRequest({
+        path: '/proxy/image/ai/generate-image',
+        headers: {
+          'Authorization': 'Bearer sec_paid',
+          'X-Browser-Id': 'dev_paid',
+          'X-Request-Id': 'req_v5_surplus_1',
+          'X-Gen-Width': '1024',
+          'X-Gen-Height': '1024',
+          'X-Gen-Steps': '14',
+          'X-Gen-Samples': '1',
+          'X-Gen-Model': 'V5-medium',
+          'Content-Type': 'application/json'
+        },
+        body: JSON.stringify({
+          model: 'nai-diffusion-5-full-medium',
+          parameters: { width: 1024, height: 1024, steps: 14, n_samples: 1 }
+        })
+      });
+      assert.strictEqual(surplusRes.status, 200);
+      await sleepingRetryPromise;
+    } finally {
+      dbModule.run = originalDbRun;
+    }
+
     assert.strictEqual(queueManager.getSurplusPool().pool, 90, 'Surplus RAM pool must deduct 10 NCP');
     const dbSurplusRow = await dbModule.get("SELECT value FROM config WHERE key = 'v5_surplus_pool'");
-    assert.strictEqual(dbSurplusRow.value, '90', 'Surplus deduction must persist to SQLite config');
+    assert.strictEqual(dbSurplusRow.value, '90', 'Serialized PoNR surplus write must supersede stale sleeping retry (90, not 100)');
 
     const userAfterSurplus = await dbModule.get('SELECT v5_banked_balance, v5_daily_consumed, subscription_period_v5 FROM users WHERE user_id = ?', ['u_paid']);
     assert.strictEqual(userAfterSurplus.v5_banked_balance, 0);
@@ -824,7 +916,7 @@ test('Phase 8 Commit 8: Pre-Upstream Validation, Anti-Spoofing & PoNR Settlement
     const startDispatchesHigh = serverModule.getTelemetrySnapshot().dispatchesHigh;
 
     // 0. Upstream NovelAI HTTP 401 (expired master_token) on /user/subscription & /ai/generate-image
-    //    must convert to 503 MASTER_TOKEN_EXPIRED (NEVER 401), invalidate telemetry, charge 0, and release locks
+    //    must convert to 503 MASTER_TOKEN_EXPIRED (NEVER 401), invalidate telemetry, clear stale capacity, charge 0, and release locks
     subscriptionUpstream401 = true;
     const sub401Res = await sendRawRequest({
       method: 'GET',
@@ -837,6 +929,68 @@ test('Phase 8 Commit 8: Pre-Upstream Validation, Anti-Spoofing & PoNR Settlement
     assert.strictEqual(sub401Res.status, 503, 'Upstream 401 on /user/subscription must convert to 503 MASTER_TOKEN_EXPIRED');
     assert.strictEqual(sub401Res.data.error, 'MASTER_TOKEN_EXPIRED');
     assert.strictEqual(serverModule.getTelemetrySnapshot().lastFetched, 0, 'Upstream 401 must invalidate lastFetched');
+    assert.strictEqual(serverModule.getTelemetrySnapshot().masterTokenExpired, true);
+    assert.strictEqual(serverModule.getTelemetrySnapshot().percent, 0, 'Upstream 401 must clear stale cached percentage');
+
+    // Cooldown shielding: subsequent /queue/join (V5 and legacy free) and /proxy/image/* inside 60s cooldown
+    // must return 503 MASTER_TOKEN_EXPIRED (never TELEMETRY_FETCH_FAILED) with 0 upstream hits
+    const hitsAt401 = imageUpstreamHits;
+    const v5CooldownJoin = await sendRawRequest({
+      path: '/queue/join',
+      headers: { 'Authorization': 'Bearer sec_paid', 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        browser_id: 'dev_paid',
+        req_id: 'req_401_cooldown_v5',
+        model: 'nai-diffusion-5-full',
+        width: 1024,
+        height: 1024,
+        n_samples: 1,
+        steps: 23,
+        is_base_paid: false
+      })
+    });
+    assert.strictEqual(v5CooldownJoin.status, 503);
+    assert.strictEqual(v5CooldownJoin.data.error, 'MASTER_TOKEN_EXPIRED', 'V5 cooldown join after 401 must surface MASTER_TOKEN_EXPIRED, not TELEMETRY_FETCH_FAILED');
+
+    const legacyCooldownJoin = await sendRawRequest({
+      path: '/queue/join',
+      headers: { 'Authorization': 'Bearer sec_paid', 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        browser_id: 'dev_paid',
+        req_id: 'req_401_cooldown_legacy',
+        model: 'nai-diffusion-4-5-full',
+        width: 1024,
+        height: 1024,
+        n_samples: 1,
+        steps: 28,
+        is_base_paid: false
+      })
+    });
+    assert.strictEqual(legacyCooldownJoin.status, 503);
+    assert.strictEqual(legacyCooldownJoin.data.error, 'MASTER_TOKEN_EXPIRED', 'Legacy free join while master token is expired must short-circuit with 503 MASTER_TOKEN_EXPIRED');
+
+    queueManager.join({ browser_id: 'dev_paid', req_id: 'req_401_cooldown_proxy', user_id: 'u_paid', priority_tier: 'Normal' });
+    const legacyCooldownProxy = await sendRawRequest({
+      path: '/proxy/image/ai/generate-image',
+      headers: {
+        'Authorization': 'Bearer sec_paid',
+        'X-Browser-Id': 'dev_paid',
+        'X-Request-Id': 'req_401_cooldown_proxy',
+        'X-Gen-Width': '1024',
+        'X-Gen-Height': '1024',
+        'X-Gen-Steps': '28',
+        'X-Gen-Samples': '1',
+        'X-Gen-Model': 'legacy',
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify({
+        model: 'nai-diffusion-4-5-full',
+        parameters: { width: 1024, height: 1024, steps: 28, n_samples: 1 }
+      })
+    });
+    assert.strictEqual(legacyCooldownProxy.status, 503);
+    assert.strictEqual(legacyCooldownProxy.data.error, 'MASTER_TOKEN_EXPIRED');
+    assert.strictEqual(imageUpstreamHits, hitsAt401, 'Expired master token must never forward subsequent requests upstream');
     subscriptionUpstream401 = false;
 
     // Re-seed valid telemetry, then test upstream 401 during /ai/generate-image
@@ -867,7 +1021,7 @@ test('Phase 8 Commit 8: Pre-Upstream Validation, Anti-Spoofing & PoNR Settlement
       },
       body: JSON.stringify({
         model: 'nai-diffusion-5-full',
-        parameters: { width: 1024, height: 1024, steps: 23, n_samples: 1, reference_image_multiple: ['ref1'] }
+        parameters: { width: 1024, height: 1024, steps: 23, n_samples: 1, director_reference_images: ['ref1'] }
       })
     });
     assert.strictEqual(img401Res.status, 503);
@@ -875,6 +1029,7 @@ test('Phase 8 Commit 8: Pre-Upstream Validation, Anti-Spoofing & PoNR Settlement
     assert.strictEqual(queueManager.getQueueLength(), 0, 'Upstream 401 must release Channel A queue lock');
     assert.strictEqual(queueManager.getHeldAnlasForUser('u_paid'), 0);
     assert.strictEqual(queueManager.getHeldNcpForUser('u_paid'), 0);
+    assert.strictEqual(serverModule.getTelemetrySnapshot().masterTokenExpired, true);
 
     // Re-seed telemetry for subsequent PoNR checks
     serverModule.applyUsageTelemetry({
@@ -920,7 +1075,7 @@ test('Phase 8 Commit 8: Pre-Upstream Validation, Anti-Spoofing & PoNR Settlement
       },
       body: JSON.stringify({
         model: 'nai-diffusion-5-full',
-        parameters: { width: 1024, height: 1024, steps: 23, n_samples: 1, reference_image_multiple: ['ref1'] }
+        parameters: { width: 1024, height: 1024, steps: 23, n_samples: 1, director_reference_images: ['ref1'] }
       })
     });
     assert.strictEqual(res500.status, 500);
@@ -995,7 +1150,7 @@ test('Phase 8 Commit 8: Pre-Upstream Validation, Anti-Spoofing & PoNR Settlement
         },
         body: JSON.stringify({
           model: 'nai-diffusion-5-full',
-          parameters: { width: 1024, height: 1024, steps: 23, n_samples: 1, reference_image_multiple: ['ref1'] }
+          parameters: { width: 1024, height: 1024, steps: 23, n_samples: 1, director_reference_images: ['ref1'] }
         })
       }),
       /.+/
@@ -1012,9 +1167,9 @@ test('Phase 8 Commit 8: Pre-Upstream Validation, Anti-Spoofing & PoNR Settlement
   });
 
   // ---------------------------------------------------------------------------
-  // 5. HELL PATH: SPEND CAP, DEBT LOCKOUT, DEADBAND, EFFORT ESCALATION & CROSS-CHANNEL RACES
+  // 5. HELL PATH: SPEND CAP, STRENGTH=0 EVASION, DEBT LOCKOUT, DEADBAND, EFFORT ESCALATION & CROSS-CHANNEL RACES
   // ---------------------------------------------------------------------------
-  await t.test('Hell Path: Enforces spend cap, debt lockout, deadband, effort escalation & cross-channel double-spend locks', async () => {
+  await t.test('Hell Path: Enforces spend cap, strength=0 cap evasion, debt lockout, deadband, effort escalation & cross-channel double-spend locks', async () => {
     queueManager.reset();
     imageUpstreamMode = 'ok';
     const hitsBefore = imageUpstreamHits;
@@ -1044,6 +1199,31 @@ test('Phase 8 Commit 8: Pre-Upstream Validation, Anti-Spoofing & PoNR Settlement
     assert.strictEqual(capRes.status, 400);
     assert.strictEqual(capRes.data.error, 'SPEND_CAP_EXCEEDED');
 
+    // 1b. strength: 0 with 100000x100000 dimensions -> 400 PARAMETRIC_LIMIT_EXCEEDED (zero upstream hits)
+    queueManager.join({ browser_id: 'dev_paid', req_id: 'req_strength0_evade', user_id: 'u_paid', priority_tier: 'Normal' });
+    const strength0EvadeRes = await sendRawRequest({
+      path: '/proxy/image/ai/generate-image',
+      headers: {
+        'Authorization': 'Bearer sec_paid',
+        'X-Browser-Id': 'dev_paid',
+        'X-Request-Id': 'req_strength0_evade',
+        'X-Gen-Width': '100000',
+        'X-Gen-Height': '100000',
+        'X-Gen-Steps': '28',
+        'X-Gen-Samples': '1',
+        'X-Gen-Model': 'legacy',
+        'X-Base-Paid': 'true',
+        'X-Declared-Anlas': '5',
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify({
+        model: 'nai-diffusion-4-5-full',
+        parameters: { width: 100000, height: 100000, steps: 28, n_samples: 1, image: 'base64img', strength: 0 }
+      })
+    });
+    assert.strictEqual(strength0EvadeRes.status, 400);
+    assert.strictEqual(strength0EvadeRes.data.error, 'PARAMETRIC_LIMIT_EXCEEDED');
+
     // 2. Stealth addon (1 ref = 5 Anlas) with X-Declared-Anlas: 0 -> 400 SPEND_CAP_EXCEEDED
     queueManager.join({ browser_id: 'dev_paid', req_id: 'req_stealth_ref', user_id: 'u_paid', priority_tier: 'Normal' });
     const stealthRefRes = await sendRawRequest({
@@ -1063,7 +1243,7 @@ test('Phase 8 Commit 8: Pre-Upstream Validation, Anti-Spoofing & PoNR Settlement
       },
       body: JSON.stringify({
         model: 'nai-diffusion-5-full',
-        parameters: { width: 1024, height: 1024, steps: 23, n_samples: 1, reference_image_multiple: ['ref1'] }
+        parameters: { width: 1024, height: 1024, steps: 23, n_samples: 1, director_reference_images: ['ref1'] }
       })
     });
     assert.strictEqual(stealthRefRes.status, 400);
@@ -1401,7 +1581,7 @@ test('Phase 8 Commit 8: Pre-Upstream Validation, Anti-Spoofing & PoNR Settlement
         },
         body: JSON.stringify({
           model: 'nai-diffusion-5-full',
-          parameters: { width: 1024, height: 1024, steps: 23, n_samples: 1, reference_image_multiple: ['ref1'] }
+          parameters: { width: 1024, height: 1024, steps: 23, n_samples: 1, director_reference_images: ['ref1'] }
         })
       });
 

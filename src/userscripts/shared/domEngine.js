@@ -15,10 +15,10 @@
  *      `#gw-allowance-bar.nextElementSibling === .image-gen-generate-button` always remains intact.
  *    - Displays personal V5 banked NCP (`available / max`), Cluster Surplus Pool NCP, live master
  *      battery replenishment countdown (`next_percent_eta_ms`), color-coded cluster state
- *      (`surplus_active`, `reserve_mode`, `throttled`, `frozen`), virtual Anlas balance with
- *      zero-rollover or red debt lockout indicators, active NCP cost for the natively selected
- *      NovelAI Model/Effort (`10 NCP (Med)`, `18 NCP (High)`, `Legacy (0 NCP)`), inline Anlas
- *      Bypass toggle, and contextual drift/deadband/capacity alerts.
+ *      (`surplus_active`, `reserve_mode`, `throttled`, `frozen`, `token_expired`, `telemetry_offline`),
+ *      virtual Anlas balance with zero-rollover or red debt lockout indicators, active NCP cost for
+ *      the natively selected NovelAI Model/Effort (`10 NCP (Med)`, `18 NCP (High)`, `Legacy (0 NCP)`),
+ *      inline Anlas Bypass toggle, and contextual drift/deadband/capacity alerts.
  *    - Shields the primary Generate button with an opaque, absolute event-gating overlay (`inset: 0`,
  *      `z-index: 9999`), hiding sibling children to prevent text superposition.
  * 4. Single Presentation Portal: Eliminates redundant user settings sidebar tabs, centralizing
@@ -62,6 +62,7 @@ let cachedPolicyState = {
   clusterState: null,
   nextPercentEtaMs: null,
   isHardLocked: false,
+  masterTokenExpired: false,
   subscriptionActive: true,
   isGracePeriod: false,
   lastFetchedAt: 0,
@@ -218,8 +219,9 @@ function detectActiveEffortButton(medBtn, highBtn) {
 /**
  * Reads NovelAI's natively selected Model and Effort (`Medium` / `High`) directly from
  * `.image-gen-model-mode-row` without relying on fragile styled-component hashes.
- * Strictly requires boundary-delimited `v?5` tokens so legacy models containing `5`
- * (e.g. `1.5`, `3.5`, `4.5`) are never misclassified as V5.
+ * Handles inline badge text adjacent to `V5` (e.g., `"NAI Diffusion V5New"`) while
+ * strictly rejecting decimal legacy versions (`1.5`, `3.5`, `4.5`), multi-digit
+ * numbers (`V50`), or unanchored tokens (`heavy5`).
  *
  * @returns {string|null} Canonical model family identifier (`nai-diffusion-5-full-medium`,
  *   `nai-diffusion-5-full`, or `legacy`) or null if `.image-gen-model-mode-row` is absent.
@@ -262,7 +264,7 @@ export function readNativeModelAndEffortFromDOM() {
     return null;
   }
 
-  const isNativeV5 = !/4[-_.]5/i.test(trimmedModel) && /(?:^|[\s\-_])v?5(?:[\s\-_]|$)/i.test(trimmedModel);
+  const isNativeV5 = !/\d[-_.]5/i.test(trimmedModel) && /(?:^|[\s\-_])v?5(?![\d.])/i.test(trimmedModel);
 
   if (!isNativeV5) {
     return 'legacy';
@@ -642,8 +644,8 @@ function formatNextPercentEta(etaMs) {
  * @returns {string} CSS color expression.
  */
 function resolveClusterStateColor(clusterState) {
-  if (clusterState === 'frozen') return 'var(--theme-error, #e74c3c)';
-  if (clusterState === 'throttled') return 'var(--theme-warning, #e67e22)';
+  if (clusterState === 'frozen' || clusterState === 'token_expired') return 'var(--theme-error, #e74c3c)';
+  if (clusterState === 'throttled' || clusterState === 'telemetry_offline') return 'var(--theme-warning, #e67e22)';
   if (clusterState === 'reserve_mode') return 'var(--theme-warning, #f1c40f)';
   return 'var(--theme-success, #2ecc71)';
 }
@@ -651,8 +653,8 @@ function resolveClusterStateColor(clusterState) {
 /**
  * Renders the `#gw-v5-bar` labels, native NCP cost indicator, progress fill, debt warnings,
  * and bypass toggle using the normalized client policy state.
- * Evaluates subscription-inactive and 5.5% circuit-breaker states before unlimited-tier
- * shortcuts because those gates apply across all tiers including Admin.
+ * Evaluates token-expired, subscription-inactive, and 5.5% circuit-breaker states before
+ * unlimited-tier shortcuts because those gates apply across all tiers including Admin.
  *
  * @param {object} state - Normalized client policy state.
  */
@@ -675,7 +677,11 @@ function renderDualLedgerHudFromState(state) {
       ? `${state.masterV5Percent.toFixed(1)}%`
       : '--%';
 
-    if (state.subscriptionActive === false && state.lastFetchedAt > 0) {
+    if (state.masterTokenExpired || state.clusterState === 'token_expired') {
+      v5Label.textContent = 'Master Token Expired (Awaiting Admin)';
+      v5Fill.style.width = '0%';
+      v5Fill.style.backgroundColor = 'var(--theme-error, #e74c3c)';
+    } else if (state.subscriptionActive === false && state.lastFetchedAt > 0) {
       v5Label.textContent = 'Master Subscription Inactive';
       v5Fill.style.width = '0%';
       v5Fill.style.backgroundColor = 'var(--theme-error, #e74c3c)';
@@ -687,7 +693,7 @@ function renderDualLedgerHudFromState(state) {
     } else if (state.isUnlimitedV5) {
       v5Label.textContent = `V5 Bank: Exempt (Unlimited) | Tank: ${pctText}`;
       v5Fill.style.width = '100%';
-      v5Fill.style.backgroundColor = 'var(--theme-accent, #00bc8c)';
+      v5Fill.style.backgroundColor = resolveClusterStateColor(state.clusterState);
     } else if (typeof state.v5AvailableNcp === 'number') {
       const maxNcp = typeof state.v5MaxBankNcp === 'number' && state.v5MaxBankNcp > 0 ? state.v5MaxBankNcp : state.v5AvailableNcp;
       const surplusSuffix = (state.v5SurplusEligible && typeof state.v5SurplusAvailableNcp === 'number' && state.v5SurplusAvailableNcp > 0)
@@ -767,11 +773,13 @@ function renderDualLedgerHudFromState(state) {
     }
   }
 
-  // Sync Generate button capacity lockout state when subscription is inactive or V5 is locked/depleted
+  // Sync Generate button capacity lockout state when subscription is inactive or V5 is locked/depleted.
+  // Note: master_token_expired surfaces prominently in the HUD without locking the button via shield
+  // so guests can recover immediately once the admin pushes a fresh token without waiting 10s.
   if (!queueShieldLockActive) {
     if (state.subscriptionActive === false && state.lastFetchedAt > 0) {
       setGenerateLockoutState(true, 'Subscription Inactive');
-    } else if (isV5 && !state.bypassEnabled) {
+    } else if (isV5 && !state.bypassEnabled && !state.masterTokenExpired && state.clusterState !== 'token_expired') {
       if (state.isHardLocked) {
         setGenerateLockoutState(true, 'Battery Recharging');
       } else if (
@@ -845,6 +853,7 @@ export function updateDualLedgerHud(statusData) {
     patch.clusterState = telemetry.cluster_state;
     patch.nextPercentEtaMs = telemetry.next_percent_eta_ms;
     patch.isHardLocked = Boolean(telemetry.is_hard_locked);
+    patch.masterTokenExpired = Boolean(telemetry.master_token_expired) || telemetry.cluster_state === 'token_expired';
     patch.subscriptionActive = telemetry.subscription_active !== false;
     patch.isGracePeriod = Boolean(telemetry.is_grace_period);
     patch.lastFetchedAt = telemetry.last_fetched_at || 0;

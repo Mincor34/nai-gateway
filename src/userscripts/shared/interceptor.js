@@ -15,8 +15,11 @@
  * 4. Stage 5 Header Parity Invariant: Never alters outbound generation `body`; forwards exact `steps`
  *    from the request body in `X-Gen-Steps` (defaulting to 14 for Medium or 28 otherwise only when
  *    absent) and transmits `X-Gen-Model` as `V5-medium`, `V5`, or `legacy`.
- * 5. WAF Request Smuggling Shield: Deletes `Content-Length`, `Content-Type` (for FormData), and `Host`.
- * 6. Dual-Timing Stream Coordination & Strict Lock Teardown: Resolves on `onloadstart` for HTTP 200
+ * 5. Method & Counter Isolation: Preserves `GET` semantics on `/user/subscription` when `config.method`
+ *    is omitted, increments `count_text_gens` strictly on actual text generations, and triggers HUD
+ *    telemetry refreshes on Anlas-consuming `/ai/encode-vibe` and image generations.
+ * 6. WAF Request Smuggling Shield: Deletes `Content-Length`, `Content-Type` (for FormData), and `Host`.
+ * 7. Dual-Timing Stream Coordination & Strict Lock Teardown: Resolves on `onloadstart` for HTTP 200
  *    streams, propagates structured server error messages (`400`, `403`, `429`, `503`), surfaces HUD
  *    alerts + refreshes telemetry on proxy rejections, and triggers `/queue/complete` on client aborts.
  */
@@ -74,10 +77,11 @@ export function initInterceptor(config) {
  * @param {object} responseDetails - Raw Tampermonkey response context.
  * @param {Function} resolveObj - Native fetch Promise resolver.
  * @param {boolean} isImageGen - Channel A image task flag.
- * @param {boolean} isTextGen - Channel B text/vibe task flag.
+ * @param {boolean} [countAsTextGen=false] - Whether to increment local `count_text_gens` counter.
+ * @param {boolean} [refreshTelemetry=isImageGen] - Whether to refresh HUD telemetry on 200 OK.
  * @returns {Promise<boolean>} True if stream resolution was completed.
  */
-async function tryResolveProxyResponse(responseDetails, resolveObj, isImageGen, isTextGen) {
+async function tryResolveProxyResponse(responseDetails, resolveObj, isImageGen, countAsTextGen = false, refreshTelemetry = isImageGen) {
     const status = extractStatusCode(responseDetails);
     if (status === 0) {
         return false; // Status code not yet populated; defer resolution
@@ -92,11 +96,11 @@ async function tryResolveProxyResponse(responseDetails, resolveObj, isImageGen, 
         
         if (isImageGen) {
             GM_setValue("count_image_gens", GM_getValue("count_image_gens", 0) + 1);
-        } else if (isTextGen) {
+        } else if (countAsTextGen) {
             GM_setValue("count_text_gens", GM_getValue("count_text_gens", 0) + 1);
         }
 
-        if (typeof envConfig.onTelemetryRefresh === 'function') {
+        if ((isImageGen || refreshTelemetry) && typeof envConfig.onTelemetryRefresh === 'function') {
             setTimeout(() => {
                 try { envConfig.onTelemetryRefresh(); } catch (_) {}
             }, 0);
@@ -444,7 +448,7 @@ async function handleGenerationIntercept(url, config) {
                 onloadstart: async function(responseDetails) {
                     console.log(`[${envConfig.logPrefix}] Telemetry: onloadstart fired. ReadyState: ${responseDetails.readyState}, Status: ${extractStatusCode(responseDetails)}`);
                     if (hasResolved) return;
-                    if (await tryResolveProxyResponse(responseDetails, resolve, true, false)) {
+                    if (await tryResolveProxyResponse(responseDetails, resolve, true, false, true)) {
                         hasResolved = true;
                     }
                 },
@@ -452,7 +456,7 @@ async function handleGenerationIntercept(url, config) {
                     console.log(`[${envConfig.logPrefix}] Telemetry: onreadystatechange fired. ReadyState: ${responseDetails.readyState}, ExtractedStatus: ${extractStatusCode(responseDetails)}`);
                     if (hasResolved) return;
                     if (responseDetails.readyState >= 2) {
-                        if (await tryResolveProxyResponse(responseDetails, resolve, true, false)) {
+                        if (await tryResolveProxyResponse(responseDetails, resolve, true, false, true)) {
                             hasResolved = true;
                         }
                     }
@@ -460,7 +464,7 @@ async function handleGenerationIntercept(url, config) {
                 onload: async function(responseDetails) {
                     console.log(`[${envConfig.logPrefix}] Telemetry: onload fired. Status: ${extractStatusCode(responseDetails)}. Socket download complete.`);
                     if (hasResolved) return;
-                    if (await tryResolveProxyResponse(responseDetails, resolve, true, false)) {
+                    if (await tryResolveProxyResponse(responseDetails, resolve, true, false, true)) {
                         hasResolved = true;
                     }
                 },
@@ -497,14 +501,21 @@ async function handleGenerationIntercept(url, config) {
 }
 
 /**
- * Handles Channel B fast-track streaming text generation and vibe transfer requests.
- * Routes directly to the parallel shared lock queue without acquiring Channel A exclusive locks.
+ * Handles Channel B fast-track streaming text generation, vibe transfer encoding,
+ * and subscription telemetry passthrough requests without acquiring Channel A exclusive locks.
  *
  * @param {string} url - Target endpoint URL.
  * @param {object} config - Native fetch options.
+ * @param {string} [defaultMethod="POST"] - Default HTTP method when `config.method` is omitted.
+ * @param {object} [options={}] - Counter and HUD telemetry refresh flags.
+ * @param {boolean} [options.countAsTextGen=true] - Increment `count_text_gens` on 200 OK.
+ * @param {boolean} [options.refreshTelemetry=false] - Refresh HUD telemetry on 200 OK.
  * @returns {Promise<Response>} Wrapped fetch response delivering stream bytes.
  */
-async function handleTextGenerationIntercept(url, config) {
+async function handleTextGenerationIntercept(url, config, defaultMethod = "POST", options = {}) {
+    const { countAsTextGen = true, refreshTelemetry = false } = options;
+    const requestMethod = config.method || defaultMethod;
+
     const originalUrlObj = new URL(url);
     const subdomain = originalUrlObj.hostname.split('.')[0];
     const proxyUrl = `${envConfig.VPS_HOST}/proxy/${subdomain}${originalUrlObj.pathname}${originalUrlObj.search}`;
@@ -527,7 +538,7 @@ async function handleTextGenerationIntercept(url, config) {
     updatedHeaders.set("x-script-version", GM_info.script.version);
     if (GM_getValue("debug_mode", false)) {
         updatedHeaders.set("x-debug-mode", "true");
-        console.log(`[GuildWeave Debug Mode] Outbound text prompt payload:`, config.body);
+        console.log(`[GuildWeave Debug Mode] Outbound text/telemetry payload:`, config.body);
     }
 
     updatedHeaders.delete("host");
@@ -541,7 +552,7 @@ async function handleTextGenerationIntercept(url, config) {
 
     return new Promise((resolve, reject) => {
         GM_xmlhttpRequest({
-            method: config.method || "POST",
+            method: requestMethod,
             url: proxyUrl,
             headers: Object.fromEntries(updatedHeaders.entries()),
             data: config.body,
@@ -549,7 +560,7 @@ async function handleTextGenerationIntercept(url, config) {
             onloadstart: async function(responseDetails) {
                 console.log(`[${envConfig.logPrefix}] Telemetry (Text): onloadstart fired. ReadyState: ${responseDetails.readyState}, Status: ${extractStatusCode(responseDetails)}`);
                 if (hasResolved) return;
-                if (await tryResolveProxyResponse(responseDetails, resolve, false, true)) {
+                if (await tryResolveProxyResponse(responseDetails, resolve, false, countAsTextGen, refreshTelemetry)) {
                     hasResolved = true;
                 }
             },
@@ -557,7 +568,7 @@ async function handleTextGenerationIntercept(url, config) {
                 console.log(`[${envConfig.logPrefix}] Telemetry (Text): onreadystatechange fired. ReadyState: ${responseDetails.readyState}, Status: ${extractStatusCode(responseDetails)}`);
                 if (hasResolved) return;
                 if (responseDetails.readyState >= 2) {
-                    if (await tryResolveProxyResponse(responseDetails, resolve, false, true)) {
+                    if (await tryResolveProxyResponse(responseDetails, resolve, false, countAsTextGen, refreshTelemetry)) {
                         hasResolved = true;
                     }
                 }
@@ -565,7 +576,7 @@ async function handleTextGenerationIntercept(url, config) {
             onload: async function(responseDetails) {
                 console.log(`[${envConfig.logPrefix}] Telemetry (Text): onload fired. Status: ${extractStatusCode(responseDetails)}. Socket download complete.`);
                 if (hasResolved) return;
-                if (await tryResolveProxyResponse(responseDetails, resolve, false, true)) {
+                if (await tryResolveProxyResponse(responseDetails, resolve, false, countAsTextGen, refreshTelemetry)) {
                     hasResolved = true;
                 }
             },
@@ -656,7 +667,10 @@ function hijackFetch() {
             }
 
             if (urlString.includes('/user/subscription')) {
-                return handleTextGenerationIntercept(urlString, config);
+                return handleTextGenerationIntercept(urlString, config, "GET", {
+                    countAsTextGen: false,
+                    refreshTelemetry: false
+                });
             }
 
             if (urlString.includes('/ai/generate-image') && !urlString.includes('/suggest-tags')) {
@@ -664,11 +678,17 @@ function hijackFetch() {
             }
 
             if (urlString.includes('/ai/generate-stream') || urlString.includes('/oa/v1/completions')) {
-                return handleTextGenerationIntercept(urlString, config);
+                return handleTextGenerationIntercept(urlString, config, "POST", {
+                    countAsTextGen: true,
+                    refreshTelemetry: false
+                });
             }
 
             if (urlString.includes('/ai/encode-vibe')) {
-                return handleTextGenerationIntercept(urlString, config);
+                return handleTextGenerationIntercept(urlString, config, "POST", {
+                    countAsTextGen: false,
+                    refreshTelemetry: true
+                });
             }
         }
 

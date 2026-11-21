@@ -11,7 +11,9 @@
  *   adaptive polling escalation (10m -> 2m -> 60s floor), and 5.5% circuit breaker
  * - Authoritative master subscription billing-cycle tracking (active, tier, expiresAt,
  *   isGracePeriod, trainingStepsLeft) with SQLite config persistence and fail-closed guards
- * - Bucket 2 surplus pool hydration, clamped [0, 100] telemetry injection, and atomic retry-safe persistence
+ * - Explicit master_token_expired clearing of stale cached capacity on upstream 401
+ * - Bucket 2 surplus pool hydration, clamped [0, 100] telemetry injection, and unified
+ *   retry-safe SQLite persistence across 24h sweeps and PoNR deductions
  */
 
 'use strict';
@@ -111,6 +113,7 @@ let master_subscription_active = true;
 let master_is_grace_period = false;
 let master_expires_at = null;
 let master_anlas_total = null;
+let master_token_expired = false;
 let master_last_paid_expires_at = 0;
 let master_anlas_cycle_epoch = 0;
 
@@ -126,6 +129,24 @@ let cyclePersistChain = Promise.resolve(true);
 let serverInstance = null;
 let heartbeatInterval = null;
 let isShuttingDown = false;
+
+/**
+ * Clears stale cached battery/Anlas/grace/expiration readings and marks the master
+ * session credential as expired when upstream NovelAI rejects with HTTP 401.
+ * Preserves billing-cycle anchor markers (`master_last_paid_expires_at` / `master_anlas_cycle_epoch`).
+ */
+function clearTelemetryToExpired() {
+  last_fetched_at = 0;
+  master_token_expired = true;
+  master_v5_percent = 0;
+  master_v5_is_negative = false;
+  master_is_grace_period = false;
+  master_expires_at = null;
+  raw_time_until_next_percent = null;
+  dispatches_high_since_sync = 0;
+  dispatches_medium_since_sync = 0;
+  master_anlas_total = null;
+}
 
 /**
  * Normalizes NovelAI's `timeUntilNextPercent` metric into seconds, validates sanity bounds
@@ -282,6 +303,7 @@ function getTelemetrySnapshot(now = Date.now()) {
     projection.elapsedSeconds < (POLL_LOW_BATTERY_MS / 1000);
   const isHardLocked =
     !master_subscription_active ||
+    master_token_expired ||
     projection.rawProjected <= config.V5_CIRCUIT_BREAKER_PERCENT ||
     isLatchedWithinPollWindow;
   const pollingIntervalMs = getPollingIntervalMs(projection.clampedProjected, config);
@@ -294,6 +316,7 @@ function getTelemetrySnapshot(now = Date.now()) {
     lastFetched: last_fetched_at,
     lastNetworkAttempt: last_network_attempt_at,
     isHardLocked,
+    masterTokenExpired: master_token_expired,
     nominalDailyCompute: nominal_daily_v5_compute,
     timeUntilNextPercent: raw_time_until_next_percent,
     activePeriodSeconds: active_period_seconds,
@@ -396,7 +419,7 @@ async function flushPendingCyclePersist() {
  * gracefully accepting omitted/null `usage` strictly when `active === false || tier < 3`
  * (non-Opus/expired accounts may omit V5 usage telemetry), advancing
  * `master_anlas_cycle_epoch` exclusively and monotonically on genuine non-grace renewals,
- * and resetting local V5 dispatch counters.
+ * clearing `master_token_expired`, and resetting local V5 dispatch counters.
  *
  * @param {object} payload - Parsed JSON response from `/user/subscription`.
  * @param {object} [config=getRuntimeConfig()] - Validated configuration manifest.
@@ -471,6 +494,7 @@ function applyUsageTelemetry(payload, config = getRuntimeConfig(), now = Date.no
 
   master_v5_percent = signedPercent;
   master_v5_is_negative = isNegative || signedPercent < 0;
+  master_token_expired = false;
   last_fetched_at = safeNow;
   active_period_seconds = periodEval.activePeriodSeconds;
   nominal_daily_v5_compute = periodEval.cBase;
@@ -550,6 +574,7 @@ function resetTelemetryState(overrides = {}) {
     ? (overrides.percent === 0 ? 0 : overrides.percent)
     : 100;
   master_v5_is_negative = overrides.isNegative !== undefined ? Boolean(overrides.isNegative) : (master_v5_percent < 0);
+  master_token_expired = Boolean(overrides.masterTokenExpired);
   last_fetched_at = (typeof overrides.lastFetchedAt === 'number' && Number.isFinite(overrides.lastFetchedAt))
     ? overrides.lastFetchedAt
     : 0;
@@ -619,11 +644,76 @@ function persistSurplusState(poolNcp, accrualEpoch) {
         }
         return true;
       } catch (err) {
-        if (attempt === SURPLUS_PERSIST_MAX_RETRIES || isShuttingDown || surplusPersistSeq > mySeq) {
+        if (
+          attempt === SURPLUS_PERSIST_MAX_RETRIES ||
+          isShuttingDown ||
+          surplusPersistSeq > mySeq ||
+          (err && typeof err.message === 'string' && err.message.includes('Database has not been initialized'))
+        ) {
           if (surplusPersistSeq > mySeq) {
             return true;
           }
           console.error(`[GuildWeave Surplus] Failed to persist Bucket 2 surplus state after ${attempt} attempts:`, err.message);
+          return false;
+        }
+        await new Promise(resolve => {
+          const timer = setTimeout(resolve, 50 * attempt);
+          if (timer.unref) timer.unref();
+        });
+      }
+    }
+    return false;
+  };
+
+  surplusPersistChain = surplusPersistChain.catch(() => false).then(executeWrite);
+  return surplusPersistChain;
+}
+
+/**
+ * Serializes PoNR Bucket 2 surplus pool deductions onto the exact `surplusPersistSeq` /
+ * `surplusPersistChain` pipeline used by 24h `sweep()` accruals, preventing sleeping
+ * retry timers from overwriting post-deduction pool balances in SQLite.
+ *
+ * @param {number} poolNcp - Updated surplus pool value in NCP.
+ * @returns {Promise<boolean>} True if persisted or superseded; false on unrecovered error.
+ */
+function persistSurplusPool(poolNcp) {
+  const currentAccrual = queueManager.getSurplusPool().lastAccrual;
+  if (currentAccrual > 0) {
+    return persistSurplusState(poolNcp, currentAccrual);
+  }
+
+  const mySeq = ++surplusPersistSeq;
+  pendingSurplusPersist = { pool: poolNcp, lastAccrual: null, seq: mySeq };
+
+  const executeWrite = async () => {
+    for (let attempt = 1; attempt <= SURPLUS_PERSIST_MAX_RETRIES; attempt++) {
+      if (isShuttingDown) {
+        return false;
+      }
+      if (surplusPersistSeq > mySeq) {
+        return true;
+      }
+      try {
+        await database.run(
+          "INSERT OR REPLACE INTO config (key, value) VALUES ('v5_surplus_pool', ?)",
+          [String(poolNcp)]
+        );
+        if (pendingSurplusPersist && pendingSurplusPersist.seq === mySeq) {
+          pendingSurplusPersist = null;
+        }
+        return true;
+      } catch (err) {
+        if (
+          attempt === SURPLUS_PERSIST_MAX_RETRIES ||
+          isShuttingDown ||
+          surplusPersistSeq > mySeq ||
+          (err && typeof err.message === 'string' && err.message.includes('Database has not been initialized'))
+        ) {
+          if (surplusPersistSeq > mySeq) {
+            return true;
+          }
+          console.error(`[GuildWeave Surplus] Failed to persist Bucket 2 PoNR pool after ${attempt} attempts:`, err.message);
           return false;
         }
         await new Promise(resolve => {
@@ -648,7 +738,11 @@ async function flushPendingSurplusPersist() {
   await surplusPersistChain.catch(() => false);
   if (!pendingSurplusPersist) return;
   const { pool, lastAccrual } = pendingSurplusPersist;
-  await persistSurplusState(pool, lastAccrual);
+  if (lastAccrual !== null && lastAccrual > 0) {
+    await persistSurplusState(pool, lastAccrual);
+  } else {
+    await persistSurplusPool(pool);
+  }
 }
 
 /**
@@ -687,8 +781,8 @@ function scheduleNextHeartbeat() {
 /**
  * Asynchronously synchronizes master account subscription telemetry.
  * Leverages shared Promise resolution to prevent cache stampedes.
- * Clears `last_fetched_at` immediately if upstream rejects with HTTP 401 so expired
- * master credentials never admit V5 tasks against stale cached telemetry.
+ * Clears stale cached telemetry and flags `master_token_expired` immediately if upstream
+ * rejects with HTTP 401 so expired credentials never report phantom capacity or admit V5 tasks.
  *
  * @param {object} [options={}] - Execution options.
  * @param {boolean} [options.rescheduleHeartbeat=true] - Whether to reschedule adaptive heartbeat on completion.
@@ -751,7 +845,7 @@ function syncTelemetry({ rescheduleHeartbeat = true } = {}) {
                 resolve();
               } else {
                 if (res.statusCode === 401) {
-                  last_fetched_at = 0;
+                  clearTelemetryToExpired();
                 }
                 reject(new Error(`Upstream returned error status code: ${res.statusCode}`));
               }
@@ -801,6 +895,7 @@ app.use((req, res, next) => {
     get isNegative() { return getTelemetrySnapshot().isNegative; },
     get lastFetched() { return last_fetched_at; },
     get isHardLocked() { return getTelemetrySnapshot().isHardLocked; },
+    get masterTokenExpired() { return master_token_expired; },
     get nominalDailyCompute() { return nominal_daily_v5_compute; },
     get timeUntilNextPercent() { return raw_time_until_next_percent; },
     get activePeriodSeconds() { return active_period_seconds; },
@@ -815,6 +910,7 @@ app.use((req, res, next) => {
     get masterAnlas() { return master_anlas_total; },
     getProjectionSnapshot: (now = Date.now()) => getTelemetrySnapshot(now),
     recordDispatch: (model, isBasePaid = false) => recordV5Dispatch(model, isBasePaid),
+    persistSurplusPool: (poolNcp) => persistSurplusPool(poolNcp),
     triggerSync: () => {
       const config = getRuntimeConfig();
       const now = Date.now();
@@ -828,15 +924,16 @@ app.use((req, res, next) => {
       }
     },
     invalidate: () => {
-      last_fetched_at = 0;
+      clearTelemetryToExpired();
       last_network_attempt_at = Date.now();
     },
     refresh: async () => {
-      last_fetched_at = 0;
-      last_network_attempt_at = 0;
       if (activeFetchPromise) {
         try { await activeFetchPromise; } catch (_) {}
       }
+      last_fetched_at = 0;
+      last_network_attempt_at = 0;
+      master_token_expired = false;
       await syncTelemetry();
     },
     ensureFresh: async () => {
@@ -964,5 +1061,6 @@ module.exports = {
   persistSubscriptionCycleState,
   flushPendingCyclePersist,
   persistSurplusState,
+  persistSurplusPool,
   flushPendingSurplusPersist
 };

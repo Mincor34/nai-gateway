@@ -2,6 +2,7 @@
  * LEVEL 4: AUTHENTICATION ROUTER (routes/authRouter.js)
  * Manages device registration, nicknames, client authorization queries, dual-ledger status
  * serialization, and in-band diagnostic intent signaling.
+ * Masks uninitialized or 401-invalidated telemetry to prevent phantom capacity exposure.
  * Relational Normalization: Integrates canonical users and physical devices tables.
  */
 
@@ -35,6 +36,8 @@ function extractBearerToken(authHeader) {
 
 /**
  * Resolves the cluster operational state label from master battery telemetry and surplus pool.
+ * - 'token_expired': upstream NovelAI rejected master_token with 401
+ * - 'telemetry_offline': cold boot or cleared telemetry awaiting valid upstream sync
  * - 'frozen': subscription inactive or <= V5_CIRCUIT_BREAKER_PERCENT (5.5%)
  * - 'throttled': master capacity <= 15%
  * - 'surplus_active': master capacity > V5_SURPLUS_THRESHOLD_PERCENT (50%) or Bucket 2 pool > 0
@@ -43,9 +46,15 @@ function extractBearerToken(authHeader) {
  * @param {object} telemetrySnap - Resolved telemetry projection snapshot.
  * @param {number} availableSurplusNcp - Spendable Bucket 2 surplus NCP.
  * @param {object} config - Validated configuration manifest.
- * @returns {'frozen'|'throttled'|'surplus_active'|'reserve_mode'}
+ * @returns {'token_expired'|'telemetry_offline'|'frozen'|'throttled'|'surplus_active'|'reserve_mode'}
  */
 function deriveClusterState(telemetrySnap, availableSurplusNcp, config) {
+  if (telemetrySnap.masterTokenExpired) {
+    return 'token_expired';
+  }
+  if (telemetrySnap.lastFetched === 0) {
+    return 'telemetry_offline';
+  }
   if (!telemetrySnap.subscriptionActive || telemetrySnap.isHardLocked) {
     return 'frozen';
   }
@@ -63,10 +72,10 @@ function deriveClusterState(telemetrySnap, availableSurplusNcp, config) {
  * replenishment based on continuous projection and active replenishment period.
  *
  * @param {object} telemetrySnap - Resolved telemetry projection snapshot.
- * @returns {number|null} Milliseconds until next percent, 0 if tank is full, or null if cold-boot.
+ * @returns {number|null} Milliseconds until next percent, 0 if tank is full, or null if cold-boot/expired.
  */
 function computeNextPercentEtaMs(telemetrySnap) {
-  if (!telemetrySnap || telemetrySnap.lastFetched === 0) {
+  if (!telemetrySnap || telemetrySnap.lastFetched === 0 || telemetrySnap.masterTokenExpired) {
     return null;
   }
   if (telemetrySnap.rawProjected >= 100) {
@@ -333,6 +342,7 @@ router.get('/status', async (req, res) => {
         isNegative: req.telemetry?.isNegative ?? false,
         lastFetched: req.telemetry?.lastFetched ?? 0,
         isHardLocked: req.telemetry?.isHardLocked ?? false,
+        masterTokenExpired: req.telemetry?.masterTokenExpired ?? false,
         nominalDailyCompute: req.telemetry?.nominalDailyCompute ?? config.NOMINAL_DAILY_V5_COMPUTE,
         timeUntilNextPercent: req.telemetry?.timeUntilNextPercent ?? null,
         activePeriodSeconds: req.telemetry?.activePeriodSeconds ?? ((86400 * 17.28) / config.NOMINAL_DAILY_V5_COMPUTE),
@@ -342,6 +352,7 @@ router.get('/status', async (req, res) => {
         activeCycleEpoch: req.telemetry?.activeCycleEpoch ?? null
       };
 
+    const isColdOrExpired = telemetrySnap.lastFetched === 0;
     const nextPercentEtaMs = computeNextPercentEtaMs(telemetrySnap);
     const clusterState = deriveClusterState(telemetrySnap, surplusAvailableNcp, config);
 
@@ -352,7 +363,7 @@ router.get('/status', async (req, res) => {
       precise_limit: tierConfig?.preciseLimit === Infinity ? "Unlimited" : (tierConfig?.preciseLimit ?? 0),
       session: allowanceInfo,
       linked_devices: linkedDevices,
-      master_v5_percent: telemetrySnap.percent,
+      master_v5_percent: isColdOrExpired ? null : telemetrySnap.percent,
       debug_intent: debugInfo.has_intent,
       debug_authorized: debugInfo.is_authorized,
       debug_expires_in_ms: debugInfo.expires_in_ms,
@@ -387,18 +398,19 @@ router.get('/status', async (req, res) => {
         surplus_last_accrual_epoch: surplusState.lastAccrual
       },
       telemetry: {
-        master_v5_percent: telemetrySnap.percent,
-        master_v5_raw_percent: telemetrySnap.rawProjected,
-        master_v5_is_negative: telemetrySnap.isNegative,
+        master_v5_percent: isColdOrExpired ? null : telemetrySnap.percent,
+        master_v5_raw_percent: isColdOrExpired ? null : telemetrySnap.rawProjected,
+        master_v5_is_negative: isColdOrExpired ? false : telemetrySnap.isNegative,
         is_hard_locked: telemetrySnap.isHardLocked,
+        master_token_expired: Boolean(telemetrySnap.masterTokenExpired),
         cluster_state: clusterState,
-        time_until_next_percent: telemetrySnap.timeUntilNextPercent,
+        time_until_next_percent: isColdOrExpired ? null : telemetrySnap.timeUntilNextPercent,
         next_percent_eta_ms: nextPercentEtaMs,
         active_period_seconds: telemetrySnap.activePeriodSeconds,
         nominal_daily_compute: telemetrySnap.nominalDailyCompute,
         last_fetched_at: telemetrySnap.lastFetched,
-        subscription_active: telemetrySnap.subscriptionActive,
-        is_grace_period: telemetrySnap.isGracePeriod,
+        subscription_active: telemetrySnap.masterTokenExpired ? false : (isColdOrExpired ? null : telemetrySnap.subscriptionActive),
+        is_grace_period: isColdOrExpired ? false : telemetrySnap.isGracePeriod,
         master_expires_at: telemetrySnap.masterExpiresAt,
         active_cycle_epoch: telemetrySnap.activeCycleEpoch
       },

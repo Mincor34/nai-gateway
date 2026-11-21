@@ -127,6 +127,8 @@
   var V5_COST_MULTIPLIER = 1.5;
   var ANLAS_MAX_PER_IMAGE_CAP = 140;
   var ANLAS_MIN_PER_IMAGE_FLOOR = 2;
+  var MAX_NOVELAI_PIXELS = 3145728;
+  var MAX_NOVELAI_STEPS = 50;
   var V5_HIGH_NCP_COST = 18;
   var V5_MEDIUM_NCP_COST = 10;
   var FIREWALL_MAX_PIXELS = 1048576;
@@ -135,7 +137,7 @@
   function isV5ModelFamily(model) {
     if (typeof model !== "string") return false;
     const trimmed = model.trim();
-    if (/4[-_.]5/i.test(trimmed)) return false;
+    if (/\d[-_.]5/i.test(trimmed)) return false;
     return /(?:^|[-_])v?5(?:[-_]|$)/i.test(trimmed);
   }
   function isV5MediumModel(model) {
@@ -185,7 +187,8 @@
         character_reference_anlas: 0,
         vibe_encoding_anlas: 0,
         vibe_reference_anlas: 0,
-        exceeds_cap: false
+        exceeds_cap: false,
+        cap_reason: null
       };
     }
     const parsedWidth = parseStrictInt(params.width, 1024);
@@ -226,7 +229,15 @@
       }
     }
     const perImageAnlas = Math.max(Math.ceil(w * strengthFactor), ANLAS_MIN_PER_IMAGE_FLOOR);
-    const exceedsCap = perImageAnlas > ANLAS_MAX_PER_IMAGE_CAP;
+    let capReason = null;
+    if (perImageAnlas > ANLAS_MAX_PER_IMAGE_CAP) {
+      capReason = `Per-image cost of ${perImageAnlas} Anlas exceeds maximum cap of ${ANLAS_MAX_PER_IMAGE_CAP} Anlas.`;
+    } else if (area > MAX_NOVELAI_PIXELS) {
+      capReason = `Image resolution area of ${area}px (${width}x${height}) exceeds maximum NovelAI cap of ${MAX_NOVELAI_PIXELS}px.`;
+    } else if (!isV5Medium && rawSteps > MAX_NOVELAI_STEPS) {
+      capReason = `Step count of ${rawSteps} exceeds maximum NovelAI cap of ${MAX_NOVELAI_STEPS} steps.`;
+    }
+    const exceedsCap = capReason !== null;
     const parsedSamples = parseStrictInt(params.n_samples, 1);
     const nSamples = parsedSamples > 0 ? parsedSamples : 1;
     let billableSamples = nSamples;
@@ -240,8 +251,7 @@
     if (rawRefs === void 0 || rawRefs === null) {
       const cachedCount = Array.isArray(params.director_reference_images_cached) ? params.director_reference_images_cached.length : 0;
       const directCount = Array.isArray(params.director_reference_images) ? params.director_reference_images.length : 0;
-      const multiCount = Array.isArray(params.reference_image_multiple) ? params.reference_image_multiple.length : 0;
-      const totalArr = cachedCount + directCount + multiCount;
+      const totalArr = cachedCount + directCount;
       if (totalArr > 0) rawRefs = totalArr;
     }
     const parsedRefs = parseStrictInt(rawRefs, 0);
@@ -253,8 +263,13 @@
       let rawUncached = params.uncached_vibe_count;
       let rawVibeRefs = params.vibe_reference_count;
       if (rawVibeRefs === void 0 || rawVibeRefs === null) {
-        if (Array.isArray(params.vibe_images)) rawVibeRefs = params.vibe_images.length;
-        else if (Array.isArray(params.vibes)) rawVibeRefs = params.vibes.length;
+        if (Array.isArray(params.reference_image_multiple) && params.reference_image_multiple.length > 0) {
+          rawVibeRefs = params.reference_image_multiple.length;
+        } else if (Array.isArray(params.vibe_images)) {
+          rawVibeRefs = params.vibe_images.length;
+        } else if (Array.isArray(params.vibes)) {
+          rawVibeRefs = params.vibes.length;
+        }
       }
       const uncachedVibes = Math.max(0, parseStrictInt(rawUncached, 0));
       const vibeRefs = Math.max(0, parseStrictInt(rawVibeRefs, 0));
@@ -270,7 +285,8 @@
       character_reference_anlas: characterReferenceAnlas,
       vibe_encoding_anlas: vibeEncodingAnlas,
       vibe_reference_anlas: vibeReferenceAnlas,
-      exceeds_cap: exceedsCap
+      exceeds_cap: exceedsCap,
+      cap_reason: capReason
     };
   }
   function evaluateGenerationPolicy(imgParams, state = {}) {
@@ -295,7 +311,7 @@
         ok: false,
         status: 400,
         error: "PARAMETRIC_LIMIT_EXCEEDED",
-        message: `Per-image cost of ${costDetails.per_image} Anlas exceeds maximum cap of ${ANLAS_MAX_PER_IMAGE_CAP} Anlas.`,
+        message: costDetails.cap_reason || `Per-image cost of ${costDetails.per_image} Anlas exceeds maximum cap of ${ANLAS_MAX_PER_IMAGE_CAP} Anlas.`,
         isV5,
         isV5Medium,
         isBasePaid,
@@ -373,7 +389,7 @@
       };
     }
     if (isV5 && !isBasePaid) {
-      if (state.isHardLocked) {
+      if (state.isHardLocked && !state.masterTokenExpired && state.clusterState !== "token_expired") {
         return {
           ok: false,
           status: 503,
@@ -437,6 +453,7 @@
     clusterState: null,
     nextPercentEtaMs: null,
     isHardLocked: false,
+    masterTokenExpired: false,
     subscriptionActive: true,
     isGracePeriod: false,
     lastFetchedAt: 0,
@@ -567,7 +584,7 @@
     if (!trimmedModel) {
       return null;
     }
-    const isNativeV5 = !/4[-_.]5/i.test(trimmedModel) && /(?:^|[\s\-_])v?5(?:[\s\-_]|$)/i.test(trimmedModel);
+    const isNativeV5 = !/\d[-_.]5/i.test(trimmedModel) && /(?:^|[\s\-_])v?5(?![\d.])/i.test(trimmedModel);
     if (!isNativeV5) {
       return "legacy";
     }
@@ -836,8 +853,8 @@
     return `+1% in ${mins.toFixed(1)}m`;
   }
   function resolveClusterStateColor(clusterState) {
-    if (clusterState === "frozen") return "var(--theme-error, #e74c3c)";
-    if (clusterState === "throttled") return "var(--theme-warning, #e67e22)";
+    if (clusterState === "frozen" || clusterState === "token_expired") return "var(--theme-error, #e74c3c)";
+    if (clusterState === "throttled" || clusterState === "telemetry_offline") return "var(--theme-warning, #e67e22)";
     if (clusterState === "reserve_mode") return "var(--theme-warning, #f1c40f)";
     return "var(--theme-success, #2ecc71)";
   }
@@ -855,7 +872,11 @@
     const isMed = isV5MediumModel(activeModel);
     if (v5Label && v5Fill) {
       const pctText = typeof state.masterV5Percent === "number" && Number.isFinite(state.masterV5Percent) ? `${state.masterV5Percent.toFixed(1)}%` : "--%";
-      if (state.subscriptionActive === false && state.lastFetchedAt > 0) {
+      if (state.masterTokenExpired || state.clusterState === "token_expired") {
+        v5Label.textContent = "Master Token Expired (Awaiting Admin)";
+        v5Fill.style.width = "0%";
+        v5Fill.style.backgroundColor = "var(--theme-error, #e74c3c)";
+      } else if (state.subscriptionActive === false && state.lastFetchedAt > 0) {
         v5Label.textContent = "Master Subscription Inactive";
         v5Fill.style.width = "0%";
         v5Fill.style.backgroundColor = "var(--theme-error, #e74c3c)";
@@ -867,7 +888,7 @@
       } else if (state.isUnlimitedV5) {
         v5Label.textContent = `V5 Bank: Exempt (Unlimited) | Tank: ${pctText}`;
         v5Fill.style.width = "100%";
-        v5Fill.style.backgroundColor = "var(--theme-accent, #00bc8c)";
+        v5Fill.style.backgroundColor = resolveClusterStateColor(state.clusterState);
       } else if (typeof state.v5AvailableNcp === "number") {
         const maxNcp = typeof state.v5MaxBankNcp === "number" && state.v5MaxBankNcp > 0 ? state.v5MaxBankNcp : state.v5AvailableNcp;
         const surplusSuffix = state.v5SurplusEligible && typeof state.v5SurplusAvailableNcp === "number" && state.v5SurplusAvailableNcp > 0 ? ` (+${state.v5SurplusAvailableNcp} Surplus)` : "";
@@ -940,7 +961,7 @@
     if (!queueShieldLockActive) {
       if (state.subscriptionActive === false && state.lastFetchedAt > 0) {
         setGenerateLockoutState(true, "Subscription Inactive");
-      } else if (isV5 && !state.bypassEnabled) {
+      } else if (isV5 && !state.bypassEnabled && !state.masterTokenExpired && state.clusterState !== "token_expired") {
         if (state.isHardLocked) {
           setGenerateLockoutState(true, "Battery Recharging");
         } else if (typeof state.v5AvailableNcp === "number" && !state.isUnlimitedV5 && state.lastFetchedAt > 0) {
@@ -997,6 +1018,7 @@
       patch.clusterState = telemetry.cluster_state;
       patch.nextPercentEtaMs = telemetry.next_percent_eta_ms;
       patch.isHardLocked = Boolean(telemetry.is_hard_locked);
+      patch.masterTokenExpired = Boolean(telemetry.master_token_expired) || telemetry.cluster_state === "token_expired";
       patch.subscriptionActive = telemetry.subscription_active !== false;
       patch.isGracePeriod = Boolean(telemetry.is_grace_period);
       patch.lastFetchedAt = telemetry.last_fetched_at || 0;
@@ -1363,8 +1385,8 @@
       if (payload && typeof payload === "object" && !Array.isArray(payload)) {
         const params = payload.parameters && typeof payload.parameters === "object" && !Array.isArray(payload.parameters) ? payload.parameters : payload;
         const rawModel = typeof payload.model === "string" ? payload.model.trim() : typeof params.model === "string" ? params.model.trim() : "";
-        const isV5Medium = !/4[-_.]5/i.test(rawModel) && /(?:^|[-_])v?5(?:[-_]|$)/i.test(rawModel) && /medium/i.test(rawModel);
-        const preciseRefs = (Array.isArray(params.director_reference_images_cached) ? params.director_reference_images_cached.length : 0) + (Array.isArray(params.director_reference_images) ? params.director_reference_images.length : 0) + (Array.isArray(params.reference_image_multiple) ? params.reference_image_multiple.length : 0);
+        const isV5Medium = !/\d[-_.]5/i.test(rawModel) && /(?:^|[-_])v?5(?:[-_]|$)/i.test(rawModel) && /medium/i.test(rawModel);
+        const preciseRefs = (Array.isArray(params.director_reference_images_cached) ? params.director_reference_images_cached.length : 0) + (Array.isArray(params.director_reference_images) ? params.director_reference_images.length : 0);
         const parsedWidth = parseOptionalIntLocal(params.width ?? payload.width);
         const parsedHeight = parseOptionalIntLocal(params.height ?? payload.height);
         const parsedSteps = parseOptionalIntLocal(params.steps ?? payload.steps);
@@ -1376,8 +1398,13 @@
         const parsedUncached = parseOptionalIntLocal(params.uncached_vibe_count ?? payload.uncached_vibe_count, 0);
         let rawVibeRefs = params.vibe_reference_count ?? payload.vibe_reference_count;
         if (rawVibeRefs === void 0 || rawVibeRefs === null) {
-          if (Array.isArray(params.vibe_images)) rawVibeRefs = params.vibe_images.length;
-          else if (Array.isArray(params.vibes)) rawVibeRefs = params.vibes.length;
+          if (Array.isArray(params.reference_image_multiple) && params.reference_image_multiple.length > 0) {
+            rawVibeRefs = params.reference_image_multiple.length;
+          } else if (Array.isArray(params.vibe_images)) {
+            rawVibeRefs = params.vibe_images.length;
+          } else if (Array.isArray(params.vibes)) {
+            rawVibeRefs = params.vibes.length;
+          }
         }
         const parsedVibeRefs = parseOptionalIntLocal(rawVibeRefs, 0);
         const rawSm = params.sm ?? payload.sm;
@@ -1422,7 +1449,7 @@
     envConfig = { ...envConfig, ...config };
     hijackFetch();
   }
-  async function tryResolveProxyResponse(responseDetails, resolveObj, isImageGen, isTextGen) {
+  async function tryResolveProxyResponse(responseDetails, resolveObj, isImageGen, countAsTextGen = false, refreshTelemetry = isImageGen) {
     const status = extractStatusCode(responseDetails);
     if (status === 0) {
       return false;
@@ -1435,10 +1462,10 @@
       console.log("[GuildWeave] Telemetry: Stream successfully acquired. Piping stream response directly to fetch promise.");
       if (isImageGen) {
         GM_setValue("count_image_gens", GM_getValue("count_image_gens", 0) + 1);
-      } else if (isTextGen) {
+      } else if (countAsTextGen) {
         GM_setValue("count_text_gens", GM_getValue("count_text_gens", 0) + 1);
       }
-      if (typeof envConfig.onTelemetryRefresh === "function") {
+      if ((isImageGen || refreshTelemetry) && typeof envConfig.onTelemetryRefresh === "function") {
         setTimeout(() => {
           try {
             envConfig.onTelemetryRefresh();
@@ -1743,7 +1770,7 @@
           onloadstart: async function(responseDetails) {
             console.log(`[${envConfig.logPrefix}] Telemetry: onloadstart fired. ReadyState: ${responseDetails.readyState}, Status: ${extractStatusCode(responseDetails)}`);
             if (hasResolved) return;
-            if (await tryResolveProxyResponse(responseDetails, resolve, true, false)) {
+            if (await tryResolveProxyResponse(responseDetails, resolve, true, false, true)) {
               hasResolved = true;
             }
           },
@@ -1751,7 +1778,7 @@
             console.log(`[${envConfig.logPrefix}] Telemetry: onreadystatechange fired. ReadyState: ${responseDetails.readyState}, ExtractedStatus: ${extractStatusCode(responseDetails)}`);
             if (hasResolved) return;
             if (responseDetails.readyState >= 2) {
-              if (await tryResolveProxyResponse(responseDetails, resolve, true, false)) {
+              if (await tryResolveProxyResponse(responseDetails, resolve, true, false, true)) {
                 hasResolved = true;
               }
             }
@@ -1759,7 +1786,7 @@
           onload: async function(responseDetails) {
             console.log(`[${envConfig.logPrefix}] Telemetry: onload fired. Status: ${extractStatusCode(responseDetails)}. Socket download complete.`);
             if (hasResolved) return;
-            if (await tryResolveProxyResponse(responseDetails, resolve, true, false)) {
+            if (await tryResolveProxyResponse(responseDetails, resolve, true, false, true)) {
               hasResolved = true;
             }
           },
@@ -1790,7 +1817,9 @@
     executeQueueJoin().then(resolveOuter, rejectOuter);
     return outerPromise;
   }
-  async function handleTextGenerationIntercept(url, config) {
+  async function handleTextGenerationIntercept(url, config, defaultMethod = "POST", options = {}) {
+    const { countAsTextGen = true, refreshTelemetry = false } = options;
+    const requestMethod = config.method || defaultMethod;
     const originalUrlObj = new URL(url);
     const subdomain = originalUrlObj.hostname.split(".")[0];
     const proxyUrl = `${envConfig.VPS_HOST}/proxy/${subdomain}${originalUrlObj.pathname}${originalUrlObj.search}`;
@@ -1811,7 +1840,7 @@
     updatedHeaders.set("x-script-version", GM_info.script.version);
     if (GM_getValue("debug_mode", false)) {
       updatedHeaders.set("x-debug-mode", "true");
-      console.log(`[GuildWeave Debug Mode] Outbound text prompt payload:`, config.body);
+      console.log(`[GuildWeave Debug Mode] Outbound text/telemetry payload:`, config.body);
     }
     updatedHeaders.delete("host");
     updatedHeaders.delete("content-length");
@@ -1821,7 +1850,7 @@
     let hasResolved = false;
     return new Promise((resolve, reject) => {
       GM_xmlhttpRequest({
-        method: config.method || "POST",
+        method: requestMethod,
         url: proxyUrl,
         headers: Object.fromEntries(updatedHeaders.entries()),
         data: config.body,
@@ -1829,7 +1858,7 @@
         onloadstart: async function(responseDetails) {
           console.log(`[${envConfig.logPrefix}] Telemetry (Text): onloadstart fired. ReadyState: ${responseDetails.readyState}, Status: ${extractStatusCode(responseDetails)}`);
           if (hasResolved) return;
-          if (await tryResolveProxyResponse(responseDetails, resolve, false, true)) {
+          if (await tryResolveProxyResponse(responseDetails, resolve, false, countAsTextGen, refreshTelemetry)) {
             hasResolved = true;
           }
         },
@@ -1837,7 +1866,7 @@
           console.log(`[${envConfig.logPrefix}] Telemetry (Text): onreadystatechange fired. ReadyState: ${responseDetails.readyState}, Status: ${extractStatusCode(responseDetails)}`);
           if (hasResolved) return;
           if (responseDetails.readyState >= 2) {
-            if (await tryResolveProxyResponse(responseDetails, resolve, false, true)) {
+            if (await tryResolveProxyResponse(responseDetails, resolve, false, countAsTextGen, refreshTelemetry)) {
               hasResolved = true;
             }
           }
@@ -1845,7 +1874,7 @@
         onload: async function(responseDetails) {
           console.log(`[${envConfig.logPrefix}] Telemetry (Text): onload fired. Status: ${extractStatusCode(responseDetails)}. Socket download complete.`);
           if (hasResolved) return;
-          if (await tryResolveProxyResponse(responseDetails, resolve, false, true)) {
+          if (await tryResolveProxyResponse(responseDetails, resolve, false, countAsTextGen, refreshTelemetry)) {
             hasResolved = true;
           }
         },
@@ -1925,16 +1954,25 @@
           });
         }
         if (urlString.includes("/user/subscription")) {
-          return handleTextGenerationIntercept(urlString, config);
+          return handleTextGenerationIntercept(urlString, config, "GET", {
+            countAsTextGen: false,
+            refreshTelemetry: false
+          });
         }
         if (urlString.includes("/ai/generate-image") && !urlString.includes("/suggest-tags")) {
           return handleGenerationIntercept(urlString, config);
         }
         if (urlString.includes("/ai/generate-stream") || urlString.includes("/oa/v1/completions")) {
-          return handleTextGenerationIntercept(urlString, config);
+          return handleTextGenerationIntercept(urlString, config, "POST", {
+            countAsTextGen: true,
+            refreshTelemetry: false
+          });
         }
         if (urlString.includes("/ai/encode-vibe")) {
-          return handleTextGenerationIntercept(urlString, config);
+          return handleTextGenerationIntercept(urlString, config, "POST", {
+            countAsTextGen: false,
+            refreshTelemetry: true
+          });
         }
       }
       return originalFetch(...args);
@@ -2296,9 +2334,15 @@
             }
             const batteryEl = container.querySelector("#guest-v5-battery");
             if (batteryEl && data.telemetry) {
-              const pct = typeof data.telemetry.master_v5_percent === "number" ? `${data.telemetry.master_v5_percent.toFixed(1)}%` : "--%";
-              const eta = typeof data.telemetry.next_percent_eta_ms === "number" && data.telemetry.next_percent_eta_ms > 0 ? ` (+1% in ${(data.telemetry.next_percent_eta_ms / 6e4).toFixed(1)}m)` : "";
-              batteryEl.textContent = `${pct} [${data.telemetry.cluster_state || "ok"}]${eta}`;
+              if (data.telemetry.master_token_expired) {
+                batteryEl.innerHTML = `<span style="color:var(--theme-error, #e74c3c);">TOKEN EXPIRED</span>`;
+              } else if (data.telemetry.last_fetched_at === 0) {
+                batteryEl.innerHTML = `<span style="color:var(--theme-warning, #f39c12);">OFFLINE</span>`;
+              } else {
+                const pct = typeof data.telemetry.master_v5_percent === "number" ? `${data.telemetry.master_v5_percent.toFixed(1)}%` : "--%";
+                const eta = typeof data.telemetry.next_percent_eta_ms === "number" && data.telemetry.next_percent_eta_ms > 0 ? ` (+1% in ${(data.telemetry.next_percent_eta_ms / 6e4).toFixed(1)}m)` : "";
+                batteryEl.textContent = `${pct} [${data.telemetry.cluster_state || "ok"}]${eta}`;
+              }
             }
             const periodEl = container.querySelector("#guest-period-usage");
             if (periodEl && data.subscription_period) {

@@ -3,7 +3,7 @@
  * Coordinates single-concurrency Channel A locks, FIFO queue positions, and ACS-1
  * pre-flight V5 compute gating / reservation holds.
  * Relational Normalization: Enforces concurrency, allowances, billing-cycle Anlas spend gates,
- * master solvency checks, and two-bucket V5 NCP reservations on canonical user_id.
+ * master solvency checks, expired-token shielding, and two-bucket V5 NCP reservations on canonical user_id.
  */
 
 'use strict';
@@ -280,6 +280,13 @@ router.post('/join', async (req, res) => {
         await req.telemetry.ensureFresh();
       } catch (telemetryErr) {
         console.error('[GuildWeave Gatekeeper] On-demand telemetry sync failed at queue join:', telemetryErr.message);
+        if (req.telemetry.masterTokenExpired) {
+          return res.status(503).json({
+            statusCode: 503,
+            error: 'MASTER_TOKEN_EXPIRED',
+            message: 'Master NovelAI session token was rejected upstream (401). Ask the administrator to push a fresh token.'
+          });
+        }
         if (req.telemetry.lastFetched === 0) {
           return res.status(503).json({
             statusCode: 503,
@@ -287,6 +294,14 @@ router.post('/join', async (req, res) => {
             message: 'Unable to verify master account capacity with upstream.'
           });
         }
+      }
+
+      if (req.telemetry.masterTokenExpired) {
+        return res.status(503).json({
+          statusCode: 503,
+          error: 'MASTER_TOKEN_EXPIRED',
+          message: 'Master NovelAI session token was rejected upstream (401). Ask the administrator to push a fresh token.'
+        });
       }
 
       // Fail closed if ensureFresh() resolved without populating telemetry (e.g., master_token unconfigured)
@@ -297,6 +312,16 @@ router.post('/join', async (req, res) => {
           message: 'Master subscription telemetry has not been initialized.'
         });
       }
+    }
+
+    // Master Token Expiry Gate (protects legacy free requests from entering queue with dead credentials)
+    if (req.telemetry && req.telemetry.masterTokenExpired) {
+      console.warn(`[GuildWeave Gatekeeper] Queue entry blocked for browser "${browser_id}": Master token expired upstream.`);
+      return res.status(503).json({
+        statusCode: 503,
+        error: 'MASTER_TOKEN_EXPIRED',
+        message: 'Master NovelAI session token was rejected upstream (401). Ask the administrator to push a fresh token.'
+      });
     }
 
     // Master Opus Subscription Active Gate (applies to V5, base-paid, and legacy requests once telemetry exists)
@@ -400,6 +425,14 @@ router.post('/join', async (req, res) => {
         statusCode: 409,
         error: 'DUPLICATE_REQUEST_ID',
         message: `Overlapping req_id "${req_id}" detected in Channel A queue.`
+      });
+    }
+
+    if (req.telemetry && req.telemetry.masterTokenExpired) {
+      return res.status(503).json({
+        statusCode: 503,
+        error: 'MASTER_TOKEN_EXPIRED',
+        message: 'Master NovelAI session token was rejected upstream (401). Ask the administrator to push a fresh token.'
       });
     }
 

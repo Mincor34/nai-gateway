@@ -3,6 +3,8 @@
  * Isolates all privileged control panel, Discord bot, and management interactions.
  * Exposes dual-ledger Anlas/V5 NCP telemetry, Cluster Surplus state, subscription-period
  * aggregates, and atomic balance adjustment / debt reconciliation controls.
+ * Supports canonical user_id, discord_id, and browser_id resolution across governance endpoints
+ * (including pruned unlinked user records lacking active rows in devices).
  * Relational Normalization: Operates on canonical users as parents and devices as children.
  */
 
@@ -58,11 +60,16 @@ async function resolveTargetUserId(body) {
     if (typeof body.browser_id !== 'string' || body.browser_id.trim().length === 0) {
       return { ok: false, status: 400, error: 'browser_id must be a non-empty string.' };
     }
-    const dev = await get('SELECT user_id, discord_id FROM devices WHERE browser_id = ?', [body.browser_id.trim()]);
-    if (!dev) {
-      return { ok: false, status: 404, error: 'Target device not found.' };
+    const cleanBrowserId = body.browser_id.trim();
+    const dev = await get('SELECT user_id, discord_id FROM devices WHERE browser_id = ?', [cleanBrowserId]);
+    if (dev) {
+      return { ok: true, userId: dev.user_id || dev.discord_id || cleanBrowserId };
     }
-    return { ok: true, userId: dev.user_id || dev.discord_id || body.browser_id.trim() };
+    const userRow = await get('SELECT user_id FROM users WHERE user_id = ?', [cleanBrowserId]);
+    if (userRow) {
+      return { ok: true, userId: userRow.user_id };
+    }
+    return { ok: false, status: 404, error: 'Target device not found.' };
   }
 
   return { ok: false, status: 400, error: 'Missing target identifier (user_id, discord_id, or browser_id).' };
@@ -239,9 +246,9 @@ router.post('/mark-ban-notified', async (req, res) => {
 router.post('/approve', async (req, res) => {
   const config = getConfig();
   const body = (req.body && typeof req.body === 'object' && !Array.isArray(req.body)) ? req.body : {};
-  const { browser_id, discord_id, priority_tier } = body;
-  if (!isOptionalNonEmptyString(discord_id) || !isOptionalNonEmptyString(browser_id)) {
-    return res.status(400).json({ error: 'Invalid discord_id or browser_id parameter.' });
+  const { browser_id, discord_id, user_id, priority_tier } = body;
+  if (!isOptionalNonEmptyString(user_id) || !isOptionalNonEmptyString(discord_id) || !isOptionalNonEmptyString(browser_id)) {
+    return res.status(400).json({ error: 'Invalid user_id, discord_id, or browser_id parameter.' });
   }
   const targetTier = (priority_tier === undefined || priority_tier === null || priority_tier === '')
     ? 'Normal'
@@ -250,18 +257,34 @@ router.post('/approve', async (req, res) => {
     return res.status(400).json({ error: `Invalid priority_tier "${String(targetTier)}".` });
   }
 
+  const canonicalUserId = (user_id && user_id.trim()) || (discord_id && discord_id.trim()) || null;
+  const cleanBrowserId = browser_id ? browser_id.trim() : null;
+  if (!canonicalUserId && !cleanBrowserId) {
+    return res.status(400).json({ error: 'Missing target identifier (user_id, discord_id, or browser_id).' });
+  }
+  if (
+    (canonicalUserId && canonicalUserId.toLowerCase() === 'admin') ||
+    (cleanBrowserId && cleanBrowserId.toLowerCase() === 'admin')
+  ) {
+    return res.status(400).json({ error: 'Cannot approve synthetic admin principal.' });
+  }
+
   try {
-    if (discord_id) {
-      await run('UPDATE users SET priority_tier = ? WHERE user_id = ?', [targetTier, discord_id]);
-      await run('UPDATE devices SET approved = 1 WHERE user_id = ?', [discord_id]);
-      console.log(`[GuildWeave Admin] Approved Discord Account: "${discord_id}". Priority: "${targetTier}"`);
-    } else if (browser_id) {
-      const dev = await get('SELECT user_id FROM devices WHERE browser_id = ?', [browser_id]);
+    if (canonicalUserId) {
+      await run('UPDATE users SET priority_tier = ? WHERE user_id = ?', [targetTier, canonicalUserId]);
+      await run('UPDATE devices SET approved = 1 WHERE user_id = ?', [canonicalUserId]);
+      console.log(`[GuildWeave Admin] Approved Canonical Account: "${canonicalUserId}". Priority: "${targetTier}"`);
+    } else if (cleanBrowserId) {
+      const dev = await get('SELECT user_id FROM devices WHERE browser_id = ?', [cleanBrowserId]);
       if (dev) {
         await run('UPDATE users SET priority_tier = ? WHERE user_id = ?', [targetTier, dev.user_id]);
+        await run('UPDATE devices SET approved = 1 WHERE browser_id = ?', [cleanBrowserId]);
+        console.log(`[GuildWeave Admin] Approved Browser: "${cleanBrowserId}" (User: "${dev.user_id}"). Priority: "${targetTier}"`);
+      } else {
+        await run('UPDATE users SET priority_tier = ? WHERE user_id = ?', [targetTier, cleanBrowserId]);
+        await run('UPDATE devices SET approved = 1 WHERE user_id = ? OR browser_id = ?', [cleanBrowserId, cleanBrowserId]);
+        console.log(`[GuildWeave Admin] Updated tier for pruned unlinked user: "${cleanBrowserId}". Priority: "${targetTier}"`);
       }
-      await run('UPDATE devices SET approved = 1 WHERE browser_id = ?', [browser_id]);
-      console.log(`[GuildWeave Admin] Approved Unlinked Browser: "${browser_id}". Priority: "${targetTier}"`);
     }
     res.json({ success: true });
   } catch (err) { res.status(500).json({ error: err.message }); }
@@ -269,17 +292,30 @@ router.post('/approve', async (req, res) => {
 
 router.post('/revoke', async (req, res) => {
   const body = (req.body && typeof req.body === 'object' && !Array.isArray(req.body)) ? req.body : {};
-  const { browser_id, discord_id } = body;
-  if (!isOptionalNonEmptyString(discord_id) || !isOptionalNonEmptyString(browser_id)) {
-    return res.status(400).json({ error: 'Invalid discord_id or browser_id parameter.' });
+  const { browser_id, discord_id, user_id } = body;
+  if (!isOptionalNonEmptyString(user_id) || !isOptionalNonEmptyString(discord_id) || !isOptionalNonEmptyString(browser_id)) {
+    return res.status(400).json({ error: 'Invalid user_id, discord_id, or browser_id parameter.' });
   }
+
+  const canonicalUserId = (user_id && user_id.trim()) || (discord_id && discord_id.trim()) || null;
+  const cleanBrowserId = browser_id ? browser_id.trim() : null;
+  if (!canonicalUserId && !cleanBrowserId) {
+    return res.status(400).json({ error: 'Missing target identifier (user_id, discord_id, or browser_id).' });
+  }
+  if (
+    (canonicalUserId && canonicalUserId.toLowerCase() === 'admin') ||
+    (cleanBrowserId && cleanBrowserId.toLowerCase() === 'admin')
+  ) {
+    return res.status(400).json({ error: 'Cannot revoke synthetic admin principal.' });
+  }
+
   try {
-    if (discord_id) {
-      await run('UPDATE devices SET approved = 0 WHERE user_id = ?', [discord_id]);
-      console.log(`[GuildWeave Admin] Revoked access for Discord Account: "${discord_id}"`);
-    } else if (browser_id) {
-      await run('UPDATE devices SET approved = 0 WHERE browser_id = ?', [browser_id]);
-      console.log(`[GuildWeave Admin] Revoked access for Unlinked Browser: "${browser_id}"`);
+    if (canonicalUserId) {
+      await run('UPDATE devices SET approved = 0 WHERE user_id = ?', [canonicalUserId]);
+      console.log(`[GuildWeave Admin] Revoked access for Canonical Account: "${canonicalUserId}"`);
+    } else if (cleanBrowserId) {
+      await run('UPDATE devices SET approved = 0 WHERE browser_id = ? OR user_id = ?', [cleanBrowserId, cleanBrowserId]);
+      console.log(`[GuildWeave Admin] Revoked access for Unlinked Browser: "${cleanBrowserId}"`);
     }
     res.json({ success: true });
   } catch (err) { res.status(500).json({ error: err.message }); }
@@ -287,30 +323,50 @@ router.post('/revoke', async (req, res) => {
 
 router.post('/ban', async (req, res) => {
   const body = (req.body && typeof req.body === 'object' && !Array.isArray(req.body)) ? req.body : {};
-  const { discord_id, browser_id, reason } = body;
-  if (!isOptionalNonEmptyString(discord_id) || !isOptionalNonEmptyString(browser_id)) {
-    return res.status(400).json({ error: 'Invalid discord_id or browser_id parameter.' });
+  const { discord_id, user_id, browser_id, reason } = body;
+  if (!isOptionalNonEmptyString(user_id) || !isOptionalNonEmptyString(discord_id) || !isOptionalNonEmptyString(browser_id)) {
+    return res.status(400).json({ error: 'Invalid user_id, discord_id, or browser_id parameter.' });
   }
   if (reason !== undefined && reason !== null && typeof reason !== 'string') {
     return res.status(400).json({ error: 'reason must be a string when provided.' });
   }
+  const cleanBrowserId = browser_id ? browser_id.trim() : null;
+  let targetUserId = (user_id && user_id.trim()) || (discord_id && discord_id.trim()) || null;
+  if (!targetUserId && !cleanBrowserId) {
+    return res.status(400).json({ error: 'Missing target identifier (user_id, discord_id, or browser_id).' });
+  }
+  if (
+    (targetUserId && targetUserId.toLowerCase() === 'admin') ||
+    (cleanBrowserId && cleanBrowserId.toLowerCase() === 'admin')
+  ) {
+    return res.status(400).json({ error: 'Cannot ban synthetic admin principal.' });
+  }
+
   try {
     const banReason = reason || "Banned via Admin Console";
-    let targetUserId = discord_id;
 
-    if (!targetUserId && browser_id) {
-      const dev = await get('SELECT user_id FROM devices WHERE browser_id = ?', [browser_id]);
-      if (dev) targetUserId = dev.user_id;
+    if (!targetUserId && cleanBrowserId) {
+      const dev = await get('SELECT user_id FROM devices WHERE browser_id = ?', [cleanBrowserId]);
+      if (dev) {
+        targetUserId = dev.user_id;
+      } else {
+        const userRow = await get('SELECT user_id FROM users WHERE user_id = ?', [cleanBrowserId]);
+        if (userRow) targetUserId = userRow.user_id;
+      }
+    }
+
+    if (targetUserId && targetUserId.toLowerCase() === 'admin') {
+      return res.status(400).json({ error: 'Cannot ban synthetic admin principal.' });
     }
 
     if (targetUserId) {
       await run('UPDATE users SET banned = 1, ban_reason = ?, ban_notified = 0 WHERE user_id = ?', [banReason, targetUserId]);
-      await run('UPDATE devices SET banned = 1 WHERE user_id = ? OR discord_id = ? OR browser_id = ?', [targetUserId, targetUserId, browser_id || null]);
+      await run('UPDATE devices SET banned = 1 WHERE user_id = ? OR discord_id = ? OR browser_id = ?', [targetUserId, targetUserId, cleanBrowserId]);
       console.log(`[GuildWeave Admin] Banned Canonical User: "${targetUserId}"`);
       queueManager.evict({
         user_id: targetUserId,
-        discord_id: discord_id || null,
-        browser_id: browser_id || null
+        discord_id: discord_id ? discord_id.trim() : (!targetUserId.startsWith('b_') ? targetUserId : null),
+        browser_id: cleanBrowserId
       });
     }
     res.json({ success: true });
@@ -321,24 +377,42 @@ router.post('/ban', async (req, res) => {
 
 router.post('/unban', async (req, res) => {
   const body = (req.body && typeof req.body === 'object' && !Array.isArray(req.body)) ? req.body : {};
-  const { discord_id, browser_id } = body;
-  if (!isOptionalNonEmptyString(discord_id) || !isOptionalNonEmptyString(browser_id)) {
-    return res.status(400).json({ error: 'Invalid discord_id or browser_id parameter.' });
+  const { discord_id, user_id, browser_id } = body;
+  if (!isOptionalNonEmptyString(user_id) || !isOptionalNonEmptyString(discord_id) || !isOptionalNonEmptyString(browser_id)) {
+    return res.status(400).json({ error: 'Invalid user_id, discord_id, or browser_id parameter.' });
   }
+
+  let targetUserId = (user_id && user_id.trim()) || (discord_id && discord_id.trim()) || null;
+  let linkedDiscordId = discord_id ? discord_id.trim() : null;
+  const cleanBrowserId = browser_id ? browser_id.trim() : null;
+  if (!targetUserId && !cleanBrowserId) {
+    return res.status(400).json({ error: 'Missing target identifier (user_id, discord_id, or browser_id).' });
+  }
+  if (
+    (targetUserId && targetUserId.toLowerCase() === 'admin') ||
+    (cleanBrowserId && cleanBrowserId.toLowerCase() === 'admin')
+  ) {
+    return res.status(400).json({ error: 'Cannot unban synthetic admin principal.' });
+  }
+
   try {
-    let targetUserId = discord_id;
-    let linkedDiscordId = discord_id || null;
-    if (!targetUserId && browser_id) {
-      const dev = await get('SELECT user_id, discord_id FROM devices WHERE browser_id = ?', [browser_id]);
+    if (!targetUserId && cleanBrowserId) {
+      const dev = await get('SELECT user_id, discord_id FROM devices WHERE browser_id = ?', [cleanBrowserId]);
       if (dev) {
         targetUserId = dev.user_id;
         linkedDiscordId = dev.discord_id || (dev.user_id && !dev.user_id.startsWith('b_') ? dev.user_id : null);
+      } else {
+        const userRow = await get('SELECT user_id FROM users WHERE user_id = ?', [cleanBrowserId]);
+        if (userRow) {
+          targetUserId = userRow.user_id;
+          linkedDiscordId = !userRow.user_id.startsWith('b_') ? userRow.user_id : null;
+        }
       }
     }
 
     if (targetUserId) {
       await run('UPDATE users SET banned = 0, ban_reason = NULL, ban_notified = 0 WHERE user_id = ?', [targetUserId]);
-      await run('UPDATE devices SET banned = 0 WHERE user_id = ? OR discord_id = ? OR browser_id = ?', [targetUserId, targetUserId, browser_id || null]);
+      await run('UPDATE devices SET banned = 0 WHERE user_id = ? OR discord_id = ? OR browser_id = ?', [targetUserId, targetUserId, cleanBrowserId]);
       if (linkedDiscordId) {
         await run('DELETE FROM banned_discords WHERE discord_id = ?', [linkedDiscordId]);
       }
@@ -552,7 +626,7 @@ router.post('/update-token', async (req, res) => {
     await run('INSERT OR REPLACE INTO config (key, value) VALUES (?, ?)', ['master_token', masterToken]);
     console.log('[GuildWeave Admin] Pushed fresh master Opus session token to configuration schema.');
 
-    // Immediately re-sync master subscription telemetry so non-Opus lockouts clear without restarting PM2
+    // Immediately re-sync master subscription telemetry so non-Opus/401 lockouts clear without restarting PM2
     if (req.telemetry && typeof req.telemetry.refresh === 'function') {
       try {
         await req.telemetry.refresh();
@@ -721,6 +795,7 @@ router.get('/global-stats', async (req, res) => {
         isNegative: req.telemetry?.isNegative ?? false,
         lastFetched: req.telemetry?.lastFetched ?? 0,
         isHardLocked: req.telemetry?.isHardLocked ?? false,
+        masterTokenExpired: req.telemetry?.masterTokenExpired ?? false,
         nominalDailyCompute: req.telemetry?.nominalDailyCompute ?? config.NOMINAL_DAILY_V5_COMPUTE,
         timeUntilNextPercent: req.telemetry?.timeUntilNextPercent ?? null,
         activePeriodSeconds: req.telemetry?.activePeriodSeconds ?? ((86400 * 17.28) / config.NOMINAL_DAILY_V5_COMPUTE),
@@ -730,6 +805,8 @@ router.get('/global-stats', async (req, res) => {
         activeCycleEpoch: req.telemetry?.activeCycleEpoch ?? null,
         masterAnlas: req.telemetry?.masterAnlas ?? null
       };
+
+    const isColdOrExpired = telemetrySnap.lastFetched === 0;
 
     res.json({
       total_devices: devicesCount.count,
@@ -751,16 +828,17 @@ router.get('/global-stats', async (req, res) => {
       v5_surplus_available: surplusAvailable,
       v5_surplus_last_accrual: surplusState.lastAccrual,
       telemetry: {
-        master_v5_percent: telemetrySnap.percent,
-        master_v5_raw_percent: telemetrySnap.rawProjected,
-        master_v5_is_negative: telemetrySnap.isNegative,
+        master_v5_percent: isColdOrExpired ? null : telemetrySnap.percent,
+        master_v5_raw_percent: isColdOrExpired ? null : telemetrySnap.rawProjected,
+        master_v5_is_negative: isColdOrExpired ? false : telemetrySnap.isNegative,
         is_hard_locked: telemetrySnap.isHardLocked,
-        time_until_next_percent: telemetrySnap.timeUntilNextPercent,
+        master_token_expired: Boolean(telemetrySnap.masterTokenExpired),
+        time_until_next_percent: isColdOrExpired ? null : telemetrySnap.timeUntilNextPercent,
         active_period_seconds: telemetrySnap.activePeriodSeconds,
         nominal_daily_compute: telemetrySnap.nominalDailyCompute,
         last_fetched_at: telemetrySnap.lastFetched,
-        subscription_active: telemetrySnap.subscriptionActive,
-        is_grace_period: telemetrySnap.isGracePeriod,
+        subscription_active: telemetrySnap.masterTokenExpired ? false : (isColdOrExpired ? null : telemetrySnap.subscriptionActive),
+        is_grace_period: isColdOrExpired ? false : telemetrySnap.isGracePeriod,
         master_expires_at: telemetrySnap.masterExpiresAt,
         active_cycle_epoch: telemetrySnap.activeCycleEpoch,
         master_anlas: telemetrySnap.masterAnlas

@@ -4,9 +4,9 @@
  *
  * Implements a high-security control and telemetry layout on top of the NovelAI Single Page App (SPA).
  * Intercepts outbound generation requests, manages dynamic FIFO queuing, executes secure token swaps,
- * exposes dual-ledger Anlas/V5 NCP balances, subscription-period metrics, balance adjustment
- * (`POST /admin/adjust-balance`), debt forgiveness (`POST /admin/reconcile-debt`), and coordinates
- * the bilateral diagnostic debug authorization gate.
+ * exposes dual-ledger Anlas/V5 NCP balances, subscription-period metrics, expired/offline token states,
+ * immediate post-push telemetry refresh, balance adjustment (`POST /admin/adjust-balance`),
+ * debt forgiveness (`POST /admin/reconcile-debt`), and coordinates the bilateral diagnostic debug gate.
  */
 
 'use strict';
@@ -461,8 +461,13 @@ if (!approved || !VPS_HOST || !deviceSecret) {
                         headers: { "Content-Type": "application/json", "Authorization": `Bearer ${deviceSecret}` },
                         data: JSON.stringify({ master_token: tk })
                     });
-                    if (res.status === 200) alert("Master Token saved securely.");
-                    else alert("Token registration denied.");
+                    if (res.status === 200) {
+                        alert("Master Token saved securely.");
+                        pollAdminTelemetryState();
+                        renderGovernanceTab(contentHost, parentContainer, onClose);
+                    } else {
+                        alert("Token registration denied.");
+                    }
                 } catch (e) {
                     alert("Communication execution failed.");
                 }
@@ -501,7 +506,13 @@ if (!approved || !VPS_HOST || !deviceSecret) {
                             const pctStr = typeof stats.telemetry.master_v5_percent === 'number'
                                 ? `${stats.telemetry.master_v5_percent.toFixed(1)}%`
                                 : '--%';
-                            if (stats.telemetry.subscription_active === false) {
+                            if (stats.telemetry.master_token_expired) {
+                                batEl.style.color = 'var(--theme-error, #e74c3c)';
+                                batEl.textContent = '[TOKEN EXPIRED]';
+                            } else if (stats.telemetry.last_fetched_at === 0) {
+                                batEl.style.color = 'var(--theme-warning, #f39c12)';
+                                batEl.textContent = '[OFFLINE]';
+                            } else if (stats.telemetry.subscription_active === false) {
                                 batEl.style.color = 'var(--theme-error, #e74c3c)';
                                 batEl.textContent = `${pctStr} [INACTIVE]`;
                             } else if (stats.telemetry.is_grace_period) {
@@ -517,8 +528,12 @@ if (!approved || !VPS_HOST || !deviceSecret) {
                             surEl.textContent = `${stats.v5_surplus_available}/${stats.v5_surplus_pool} NCP`;
                         }
                         const anlasStatEl = contentHost.querySelector("#admin-stat-anlas");
-                        if (anlasStatEl && stats.telemetry && stats.telemetry.master_anlas !== null && stats.telemetry.master_anlas !== undefined) {
-                            anlasStatEl.textContent = `${stats.telemetry.master_anlas}`;
+                        if (anlasStatEl && stats.telemetry) {
+                            if (stats.telemetry.master_anlas !== null && stats.telemetry.master_anlas !== undefined) {
+                                anlasStatEl.textContent = `${stats.telemetry.master_anlas}`;
+                            } else {
+                                anlasStatEl.textContent = '--';
+                            }
                         }
                     }
                 }).catch(() => {});
@@ -764,7 +779,7 @@ if (!approved || !VPS_HOST || !deviceSecret) {
                         const tierSelect = contentHost.querySelector(`#tier-select-${key}`);
                         const tier = tierSelect ? tierSelect.value : 'Normal';
                         
-                        const payload = isDiscord ? { discord_id: key, priority_tier: tier } : { browser_id: key, priority_tier: tier };
+                        const payload = isDiscord ? { discord_id: key, priority_tier: tier } : { user_id: key, priority_tier: tier };
                         const actionRes = await backgroundRequest({
                             method: "POST",
                             url: `${VPS_HOST}/admin/approve`,
@@ -782,7 +797,7 @@ if (!approved || !VPS_HOST || !deviceSecret) {
                         const isDiscord = target.getAttribute("data-is-discord") === "true";
                         if (!confirm(`Are you sure you want to revoke authorization for ${key}?`)) return;
 
-                        const payload = isDiscord ? { discord_id: key } : { browser_id: key };
+                        const payload = isDiscord ? { discord_id: key } : { user_id: key };
                         const actionRes = await backgroundRequest({
                             method: "POST",
                             url: `${VPS_HOST}/admin/revoke`,
@@ -801,7 +816,7 @@ if (!approved || !VPS_HOST || !deviceSecret) {
                         const reason = prompt("Enter a reason for banning this client:");
                         if (reason === null) return;
 
-                        const payload = isDiscord ? { discord_id: key, reason } : { browser_id: key, reason };
+                        const payload = isDiscord ? { discord_id: key, reason } : { user_id: key, reason };
                         const actionRes = await backgroundRequest({
                             method: "POST",
                             url: `${VPS_HOST}/admin/ban`,
@@ -817,7 +832,7 @@ if (!approved || !VPS_HOST || !deviceSecret) {
                         const target = e.currentTarget;
                         const key = target.getAttribute("data-key");
                         const isDiscord = target.getAttribute("data-is-discord") === "true";
-                        const payload = isDiscord ? { discord_id: key } : { browser_id: key };
+                        const payload = isDiscord ? { discord_id: key } : { user_id: key };
                         const actionRes = await backgroundRequest({
                             method: "POST",
                             url: `${VPS_HOST}/admin/unban`,
@@ -949,9 +964,17 @@ if (!approved || !VPS_HOST || !deviceSecret) {
                     const refEl = contentHost.querySelector('#operator-precise-limit');
                     if (refEl) refEl.textContent = data.precise_limit === "Unlimited" ? "Unlimited" : `${data.precise_limit} Refs`;
                     const batEl = contentHost.querySelector('#operator-v5-battery');
-                    if (batEl && data.telemetry && typeof data.telemetry.master_v5_percent === 'number') {
-                        const subSuffix = data.telemetry.subscription_active === false ? ' [INACTIVE]' : '';
-                        batEl.textContent = `${data.telemetry.master_v5_percent.toFixed(1)}% [${data.telemetry.cluster_state || 'ok'}]${subSuffix}`;
+                    if (batEl && data.telemetry) {
+                        if (data.telemetry.master_token_expired) {
+                            batEl.style.color = 'var(--theme-error, #e74c3c)';
+                            batEl.textContent = '[TOKEN EXPIRED]';
+                        } else if (data.telemetry.last_fetched_at === 0) {
+                            batEl.style.color = 'var(--theme-warning, #f39c12)';
+                            batEl.textContent = '[OFFLINE]';
+                        } else if (typeof data.telemetry.master_v5_percent === 'number') {
+                            const subSuffix = data.telemetry.subscription_active === false ? ' [INACTIVE]' : '';
+                            batEl.textContent = `${data.telemetry.master_v5_percent.toFixed(1)}% [${data.telemetry.cluster_state || 'ok'}]${subSuffix}`;
+                        }
                     }
                     const surEl = contentHost.querySelector('#operator-v5-surplus');
                     if (surEl && data.v5) {

@@ -4,9 +4,10 @@
  * DESIGN PRINCIPLES:
  * 1. Pure Browser Type Discrimination: Validates FormData, strings, Blobs, Uint8Arrays, and ArrayBuffers.
  *    Strictly devoid of Node.js host dependencies.
- * 2. Character Reference & Vibe Demuxing: Aggregates reference images across legacy and modern schemas
- *    (`director_reference_images_cached`, `director_reference_images`, `reference_image_multiple`),
- *    matching server-side `auditEngine.extractParametersFromRawBody` 1-to-1 to prevent Stage 5 mismatches,
+ * 2. Character Reference & Vibe Demuxing: Segregates Character References
+ *    (`director_reference_images_cached`, `director_reference_images`) from Vibe Transfer
+ *    (`reference_image_multiple`, `vibe_images`, `vibes`), matching server-side
+ *    `auditEngine.extractParametersFromRawBody` 1-to-1 to prevent Stage 5 mismatches,
  *    extracts SMEA (`sm`, `sm_dyn`), Img2Img/Inpaint strengths, FormData image/mask presence,
  *    and preserves exact body step integers for Stage 5 anti-spoofing reconciliation.
  * 3. Graceful Failure: Corrupted, non-UTF8, or truncated JSON streams return `null` without uncaught exceptions,
@@ -101,15 +102,14 @@ export async function extractImageParams(body) {
             const rawModel = typeof payload.model === 'string'
                 ? payload.model.trim()
                 : (typeof params.model === 'string' ? params.model.trim() : "");
-            const isV5Medium = !/4[-_.]5/i.test(rawModel) &&
+            const isV5Medium = !/\d[-_.]5/i.test(rawModel) &&
                 /(?:^|[-_])v?5(?:[-_]|$)/i.test(rawModel) &&
                 /medium/i.test(rawModel);
 
             // Must match auditEngine.extractParametersFromRawBody 1-to-1 so X-Precise-Refs never diverges at Stage 5
             const preciseRefs =
                 (Array.isArray(params.director_reference_images_cached) ? params.director_reference_images_cached.length : 0) +
-                (Array.isArray(params.director_reference_images) ? params.director_reference_images.length : 0) +
-                (Array.isArray(params.reference_image_multiple) ? params.reference_image_multiple.length : 0);
+                (Array.isArray(params.director_reference_images) ? params.director_reference_images.length : 0);
 
             const parsedWidth = parseOptionalIntLocal(params.width ?? payload.width);
             const parsedHeight = parseOptionalIntLocal(params.height ?? payload.height);
@@ -125,8 +125,13 @@ export async function extractImageParams(body) {
             const parsedUncached = parseOptionalIntLocal(params.uncached_vibe_count ?? payload.uncached_vibe_count, 0);
             let rawVibeRefs = params.vibe_reference_count ?? payload.vibe_reference_count;
             if (rawVibeRefs === undefined || rawVibeRefs === null) {
-                if (Array.isArray(params.vibe_images)) rawVibeRefs = params.vibe_images.length;
-                else if (Array.isArray(params.vibes)) rawVibeRefs = params.vibes.length;
+                if (Array.isArray(params.reference_image_multiple) && params.reference_image_multiple.length > 0) {
+                    rawVibeRefs = params.reference_image_multiple.length;
+                } else if (Array.isArray(params.vibe_images)) {
+                    rawVibeRefs = params.vibe_images.length;
+                } else if (Array.isArray(params.vibes)) {
+                    rawVibeRefs = params.vibes.length;
+                }
             }
             const parsedVibeRefs = parseOptionalIntLocal(rawVibeRefs, 0);
 

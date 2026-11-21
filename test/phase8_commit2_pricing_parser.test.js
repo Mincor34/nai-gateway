@@ -2,7 +2,7 @@
  * PHASE 8 COMMIT 2 VERIFICATION HARNESS (test/phase8_commit2_pricing_parser.test.js)
  *
  * Exhaustively exercises:
- * 1. Authoritative Anlas Pricing Engine (Module 643656 Parity):
+ * 1. Authoritative Anlas Pricing Engine (Module 643656 & Module 875333 Parity):
  *    - Baseline Opus Lightweight Bonus (1024x1024, <=28 steps, 1 sample -> 0 Anlas).
  *    - Opus Lightweight Bonus Multi-sample (1024x1024, 28 steps, 2 samples -> 20 Anlas, 1 sample free).
  *    - High-resolution Opus generation (>1MP -> full sample billing at 60 Anlas on V4.5).
@@ -19,21 +19,22 @@
  *      * Auxiliary step parameter override immunity (1536x2048, 50 steps, 1 sample -> 44 Anlas).
  *    - `usageNegative: true` Opus Lightweight Bonus revocation on V5 multi-sample (`1024x1024, 2 samples` -> 52 High / 30 Medium)
  *      without revoking V4.5 Opus discount.
- *    - Character Reference surcharges (5 Anlas per reference per requested sample).
+ *    - Character Reference surcharges (`director_reference_images*` -> 5 Anlas per reference per requested sample).
  *    - Structured Reference array fallback extraction in pricing calculations.
  *    - SMEA & SMEA-DYN multipliers (1.2x and 1.4x, including V5 1.5x interaction).
  *    - Img2Img & Inpaint strength scaling (with minimum 2 Anlas floor and NaN resilience).
  *    - Arbitrage Denial Invariant: Passing strength without an image defaults strictly to 1.0 (20 Anlas).
  *    - Inpainting Isolation Invariant: Mask presence evaluates inpaintImg2ImgStrength exclusively without strength fallback.
  *    - Multipart Img2Img/Inpaint Detection: Verifies binary name="image" and name="mask" parts apply strength scaling.
- *    - Vibe transfer surcharges on V4/V4.5 (2 Anlas per uncached encode, 2 Anlas per ref beyond 4).
- *    - Vibe immunity on V5 (vibe surcharges strictly 0 across all V5 identifier variants).
- *    - Hard per-image cap at 140 Anlas (structured exception thrown, including V5 1536x2048 @ 50 steps = 150 > 140).
+ *    - Vibe transfer surcharges on V4/V4.5 (`reference_image_multiple`, 2 Anlas per uncached encode, 2 Anlas per ref beyond 4).
+ *    - Vibe immunity on V5 (vibe surcharges strictly 0 across all V5 identifier variants, including `reference_image_multiple`).
+ *    - Hard per-image cap at 140 Anlas (structured exception thrown, including V5 1536x2048 @ 50 steps = 150 > 140)
+ *      plus hard 3MP (`3145728px`) area cap and non-Medium `50`-step cap closing `strength: 0` cap evasion.
  *    - Hell Path: Array and Object coercive type injections (e.g. strength: [], width: [1024]).
  *    - Model decoupling sanity: Rejection of V4.5 models attempting to spoof V5 Medium identity.
  * 2. Zero-Copy Binary Buffer Parser:
  *    - Happy Path: application/json buffer extraction.
- *    - Happy Path: multipart/form-data buffer extraction with binary image part.
+ *    - Happy Path: multipart/form-data buffer extraction with binary image part and Character Ref vs Vibe Transfer segregation.
  *    - Hell Path: RFC 2046 Line-Start Invariant:
  *      * Mid-line `--boundary` collision within binary payload is ignored without speculative header scans.
  *    - Hell Path: RFC 2046 Transport Padding:
@@ -62,7 +63,7 @@
  * 3. Telemetry Formatter Invariants:
  *    - Asserts formatPayloadForLogging preserves prompts >= 1,000 characters without destructive truncation,
  *      including comma-separated Danbooru tag strings lacking whitespace characters and camelCase negativePrompt keys.
- *    - Asserts formatPayloadForLogging truncates raw Base64 arrays (reference_image_multiple) without leaking megabytes.
+ *    - Asserts formatPayloadForLogging truncates raw Base64 arrays (director_reference_images) without leaking megabytes.
  * 4. Invariant Verification:
  *    - Float Invariant Defense: Proves float dimensions (4096.5) truncate cleanly and do not bypass pixel limit audit checks.
  *    - Astronomical Integer Invariant: Proves numbers > MAX_SAFE_INTEGER clamp to MAX_SAFE_INTEGER and trigger immediate bans.
@@ -315,7 +316,7 @@ test("Phase 8 Commit 2: Anlas Pricing Engine & Zero-Copy Binary Buffer Parser", 
     assert.strictEqual(costV45Medium, 20, "V4.5 model must not be spoofed into V5 Medium formula");
   });
 
-  await t.test("Pricing Engine: Character Reference Surcharges & Array Fallback", () => {
+  await t.test("Pricing Engine: Character Reference Surcharges (director_reference_images*) & Vibe Segregation", () => {
     const cost1Ref = calculateAnlasCost({
       width: 1024,
       height: 1024,
@@ -353,11 +354,36 @@ test("Phase 8 Commit 2: Anlas Pricing Engine & Zero-Copy Binary Buffer Parser", 
       height: 1024,
       steps: 28,
       n_samples: 1,
-      reference_image_multiple: ["refA", "refB"],
+      director_reference_images: ["refA", "refB"],
       director_reference_images_cached: ["refC"],
       model: "nai-diffusion-4-5-full"
     }, { isOpus: true });
-    assert.strictEqual(costArrayFallback, 15, "Pricing engine must evaluate references directly from arrays if precise_ref_count is omitted");
+    assert.strictEqual(costArrayFallback, 15, "Pricing engine must sum director_reference_images* at 5 Anlas each when precise_ref_count is omitted");
+
+    // Pre-encoded V4.5 Vibe Transfer (`reference_image_multiple`) must NOT be billed as 5-Anlas Character Reference
+    const vibe2Cost = calculateAnlasCostDetails({
+      width: 1024,
+      height: 1024,
+      steps: 28,
+      n_samples: 1,
+      reference_image_multiple: ["vibe1", "vibe2"],
+      model: "nai-diffusion-4-5-full"
+    }, { isOpus: true });
+    assert.strictEqual(vibe2Cost.character_reference_anlas, 0);
+    assert.strictEqual(vibe2Cost.vibe_reference_anlas, 0);
+    assert.strictEqual(vibe2Cost.total, 0, "1-4 pre-encoded V4.5 Vibe Transfers must cost 0 Anlas");
+
+    const vibe6Cost = calculateAnlasCostDetails({
+      width: 1024,
+      height: 1024,
+      steps: 28,
+      n_samples: 1,
+      reference_image_multiple: ["v1", "v2", "v3", "v4", "v5", "v6"],
+      model: "nai-diffusion-4-5-full"
+    }, { isOpus: true });
+    assert.strictEqual(vibe6Cost.character_reference_anlas, 0);
+    assert.strictEqual(vibe6Cost.vibe_reference_anlas, 4, "6 V4.5 Vibe Transfers must cost (6 - 4) * 2 = 4 Anlas");
+    assert.strictEqual(vibe6Cost.total, 4);
   });
 
   await t.test("Pricing Engine: SMEA and SMEA-DYN Multipliers (V4 & V5 1.5x Interaction)", () => {
@@ -546,6 +572,7 @@ test("Phase 8 Commit 2: Anlas Pricing Engine & Zero-Copy Binary Buffer Parser", 
         n_samples: 1,
         uncached_vibe_count: 2,
         vibe_reference_count: 6,
+        reference_image_multiple: ["v1", "v2", "v3", "v4", "v5", "v6"],
         model: modelId
       }, { isOpus: true });
 
@@ -555,7 +582,7 @@ test("Phase 8 Commit 2: Anlas Pricing Engine & Zero-Copy Binary Buffer Parser", 
     }
   });
 
-  await t.test("Pricing Engine: Hard Per-Image Cap Enforcement (including V5 1.5x Cap)", () => {
+  await t.test("Pricing Engine: Hard Per-Image, 3MP Area, and 50-Step Cap Enforcement (Closes strength: 0 Bypass)", () => {
     assert.throws(
       () => calculateAnlasCost({
         width: 3000,
@@ -578,6 +605,48 @@ test("Phase 8 Commit 2: Anlas Pricing Engine & Zero-Copy Binary Buffer Parser", 
       }),
       /exceeds maximum cap of 140 Anlas/i,
       "V5 1536x2048 @ 50 steps (100 * 1.5 = 150) must trip 140 Anlas cap"
+    );
+
+    // Hell Path: strength: 0 on 100000x100000 or steps: 100000 must NOT bypass cap at 2 Anlas
+    assert.throws(
+      () => calculateAnlasCost({
+        width: 100000,
+        height: 100000,
+        steps: 28,
+        n_samples: 1,
+        has_image: true,
+        strength: 0,
+        model: "nai-diffusion-4-5-full"
+      }),
+      /exceeds maximum NovelAI cap of 3145728px/i,
+      "strength: 0 must NOT bypass 3MP NovelAI resolution cap"
+    );
+
+    assert.throws(
+      () => calculateAnlasCost({
+        width: 1024,
+        height: 1024,
+        steps: 100000,
+        n_samples: 1,
+        has_image: true,
+        strength: 0,
+        model: "nai-diffusion-5-full"
+      }),
+      /exceeds maximum NovelAI cap of 50 steps/i,
+      "strength: 0 must NOT bypass 50-step NovelAI cap on non-Medium models"
+    );
+
+    assert.doesNotThrow(
+      () => calculateAnlasCost({
+        width: 1024,
+        height: 1024,
+        steps: 28,
+        n_samples: 1,
+        has_image: true,
+        strength: 0,
+        model: "nai-diffusion-4-5-full"
+      }, { isOpus: false }),
+      "Valid <=3MP strength: 0 img2img must remain allowed at 2-Anlas floor"
     );
   });
 
@@ -661,12 +730,13 @@ test("Phase 8 Commit 2: Anlas Pricing Engine & Zero-Copy Binary Buffer Parser", 
     assert.strictEqual(extracted.precise_ref_count, 0);
   });
 
-  await t.test("Binary Parser: Clean multipart/form-data extraction", () => {
+  await t.test("Binary Parser: Clean multipart/form-data extraction with Character Refs vs Vibe Transfer", () => {
     const jsonBlob = JSON.stringify({
       model: "nai-diffusion-4-5-full",
       parameters: {
         width: 1024, height: 1024, steps: 20, n_samples: 1,
-        reference_image_multiple: ["ref1", "ref2"]
+        director_reference_images: ["char1", "char2"],
+        reference_image_multiple: ["vibe1"]
       }
     });
 
@@ -692,6 +762,7 @@ Content-Type: image/png\r
     assert.strictEqual(extracted.steps, 20);
     assert.strictEqual(extracted.model, "nai-diffusion-4-5-full");
     assert.strictEqual(extracted.precise_ref_count, 2);
+    assert.strictEqual(extracted.vibe_reference_count, 1);
     assert.strictEqual(extracted.has_image, true);
   });
 
@@ -860,7 +931,7 @@ Content-Type: image/png\r
         height: 1024,
         steps: 28,
         n_samples: 1,
-        reference_image_multiple: [base64Ref1, base64Ref2]
+        director_reference_images: [base64Ref1, base64Ref2]
       }
     });
 

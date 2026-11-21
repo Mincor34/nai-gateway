@@ -7,22 +7,30 @@
  *    - Compiles bundles via `scripts/build-userscripts.js`.
  *    - Asserts zero `require(`, `process`, or `Buffer` references or leaks in compiled artifacts.
  *    - Verifies Tampermonkey metadata blocks, IIFE boundaries, and zero Node globals inside VM.
- * 2. Pricing & Stage 5 Parity (Module 643656):
+ * 2. Pricing & Stage 5 Parity (Module 643656 & Module 875333):
  *    - Verifies client-side `pricing.js` matches `auditEngine.js` across baseline Opus, multi-sample,
  *      V5 Full `1.5x` (`1536x2048` -> `90` Anlas, `1024x1024 @ 29` -> `32`, `1472x1472 @ 28` -> `63`),
  *      V5 Medium un-ceiled `/ 1.75` + `1.5x` (`1024x1024, 2 samples` -> `15`, `4 samples` -> `45`,
  *      `1472x1472, 1 sample` -> `31`, `1536x2048, 1 sample` -> `44`), `usageNegative` V5 discount
- *      suppression (`30` / `52`), SMEA/SMEA-DYN, Img2Img/Inpaint strength, character refs,
- *      V4 vibe transfer vs. V5 vibe immunity, and >140 Anlas cap.
+ *      suppression (`30` / `52`), SMEA/SMEA-DYN, Img2Img/Inpaint strength, Character Refs
+ *      (`director_reference_images*`), V4.5 Vibe Transfer (`reference_image_multiple`),
+ *      `>140` Anlas cap, `strength: 0` 3MP/50-step hard limits, and `.5` non-V5 parity (`3-5`, `1-5`).
  *    - Verifies Stage 5 `X-Gen-Steps` invariant: exact body integer forwarded (`25` stays `25`;
  *      absent steps default to `14` on Medium and `28` otherwise) while pricing V5 Medium via Module 643656.
- *    - Verifies `params.js` ignores non-array `reference_count` so `X-Precise-Refs` never diverges from Stage 5.
- * 3. Happy Path: Dual Meters, Cluster States, Native Selection Cost Display, Canary Scraper & Bypass Headers:
+ *    - Verifies `params.js` matches `auditEngine.extractParametersFromRawBody` 1-to-1, routing
+ *      `reference_image_multiple` into `vibe_reference_count` and counting strictly Character References
+ *      in `precise_refs` so `X-Precise-Refs` never diverges from Stage 5.
+ * 3. Happy Path: Dual Meters, Cluster States, Native Selection Cost Display, Canary Scraper,
+ *    /user/subscription GET Routing, /ai/encode-vibe Counter Isolation & Bypass Headers:
  *    - Polls `/auth/status` with full Commit 9 payload and verifies `#gw-v5-bar` mounts above
  *      `#gw-allowance-bar` while preserving `allowanceBar.nextElementSibling === genBtn`.
  *    - Verifies `#gw-effort-select` is absent (relies strictly on NovelAI's native `.image-gen-model-mode-row`).
+ *    - Verifies `/user/subscription` without explicit `config.method` defaults to `GET`, leaves
+ *      `count_text_gens` untouched, and suppresses unprompted `/auth/status` polling.
+ *    - Verifies `/ai/encode-vibe` uses `POST`, leaves `count_text_gens` at 0, and triggers HUD telemetry refresh.
  *    - Verifies nested sample-count spans (`<span>Generate <span>1</span> Image</span>`) never hijack
  *      `X-Scraped-Anlas` or trigger false canary drift warnings when cost is `90` (`90 Anlas`).
+ *    - Verifies V4.5 pre-encoded Vibe Transfer (`reference_image_multiple` 2 vibes) declares 0 Anlas and 0 refs.
  *    - Verifies `master_v5_is_negative: true` propagates into `X-Declared-Anlas: 30` on `1024x1024, 2 samples` Medium.
  *    - Verifies live countdown ETA (`+1% in Xm`), cluster state colors, personal NCP (`180/540 NCP`),
  *      surplus pool, zero-rollover Anlas display, native NCP cost badge, and Guest Settings modal fields.
@@ -37,12 +45,13 @@
  *      immediately without requiring `MutationObserver` attribute mutations.
  *    - Arming `Anlas Bypass` on `1024x1024, 1 sample, 25 steps` retains the deadband alert across
  *      subsequent `MutationObserver` ticks until steps move out of `24..28` or Effort switches to `Medium`.
- *    - Standard `react-select` nested input wrapper (`<div><div>V5 Full</div><div><input aria-label="Select the Model"></div></div>`)
+ *    - Standard `react-select` nested input wrapper (`<div><div>NAI Diffusion V5New</div><div><input aria-label="Select the Model"></div></div>`)
  *      without `-singleValue` class resolves `V5 Full` cleanly.
+ *    - Verifies `strength: 0` on `100000x100000` or `steps: 100000` is blocked client-side (`400`) with zero network calls.
  *    - Switching native `.image-gen-model-mode-row` Effort between `Medium` and `High` (and Model
- *      to `V4.5 Full`, `NAI Diffusion 3.5`, or `SD 1.5`) dynamically updates `#gw-v5-cost` (`Cost: 10 NCP (Med)`,
- *      `Cost: 18 NCP (High)`, `Legacy (0 NCP)`), updates step slider max bounds (`23` vs `28`),
- *      clears deadband alerts, and never misclassifies `3.5` / `1.5` as V5.
+ *      to `V4.5 Full`, `NAI Diffusion 3.5`, `SD 1.5`, or `Model V50`) dynamically updates `#gw-v5-cost`
+ *      (`Cost: 10 NCP (Med)`, `Cost: 18 NCP (High)`, `Legacy (0 NCP)`), updates step slider max bounds
+ *      (`23` vs `28`), clears deadband alerts, and never misclassifies `3.5` / `1.5` / `V50` as V5.
  *    - `FormData` with a `Blob` `request` part passes through untouched with matching `X-Gen-Model: V5-medium`.
  *    - High-res / >28 steps with bypass DISARMED is blocked client-side (`400`) with zero network calls.
  *    - Free-tier parameters (`1024x1024, 1 sample, 23 steps`) even with bypass toggle armed still
@@ -57,19 +66,24 @@
  *      and clearing debt restores normal modal bypass hint text.
  *    - Asserts Anlas-consuming bypass request is blocked (`403`) with zero network calls while
  *      free Opus/V5 generation (`1024x1024, 23 steps, 1 sample`) succeeds.
- * 6. Hell Path: V5 Capacity Depletion, 5.5% Circuit Breaker, Native Effort Shield Sync & Server Error HUD Propagation:
+ * 6. Hell Path: V5 Capacity Depletion, 5.5% Circuit Breaker, Token-Expired Immediate Recovery, Native Effort Shield Sync & Server Error HUD Propagation:
  *    - Feeds `/auth/status` with `is_hard_locked: true` or depleted NCP; asserts HUD locks V5
  *      (`Battery Recharging` / `V5 Quota Depleted`) immediately across both Guest and Admin.
+ *    - Feeds `/auth/status` with `master_token_expired: true` AND `is_hard_locked: true`; asserts HUD
+ *      displays `Master Token Expired (Awaiting Admin)` without locking Generate button AND does NOT
+ *      falsely reject V5 clicks locally as `V5_BATTERY_CRITICAL` ("Battery Recharging"), allowing
+ *      immediate post-token-push recovery or propagating `503 MASTER_TOKEN_EXPIRED` from server.
  *    - Toggling `#gw-bypass-toggle` or switching native Effort from `High` (`18 NCP`) to `Medium`
  *      (`10 NCP`) with `12 NCP` banked clears `#gw-button-shield` immediately without requiring a fetch.
- *    - Allows legacy V4.5 and Anlas base-paid V5 (`1536x2048` with bypass armed) while blocking free V5.
+ *    - Allows legacy V4.5 while blocking free V5 during battery recharging.
  *    - Simulates `/queue/join` returning `403 ALLOWANCE_EXHAUSTED` and `429 V5_CAPACITY_DEPLETED`, plus
- *      `/proxy/image/*` returning `503 MASTER_SUBSCRIPTION_INACTIVE`; asserts exact status, `#gw-hud-alert`
- *      update, and telemetry refresh.
- * 7. Happy Path & Hell Path: Admin Governance Dual-Ledger Controls, Operator Cycle Telemetry & Strict Prompt Validation:
- *    - Verifies Admin panel renders dual-ledger fields, `[INACTIVE]` subscription alerts, Operator Settings
- *      `Cycle Consumed` (`#operator-period-usage`), sends `{ user_id: ... }` for unlinked principals,
- *      rejects malformed deltas (`"12.5"`, `"50abc"`) without dispatching requests, and dispatches
+ *      `/proxy/image/*` returning `503 MASTER_SUBSCRIPTION_INACTIVE` and `503 MASTER_TOKEN_EXPIRED`;
+ *      asserts exact status, `#gw-hud-alert` update, and telemetry refresh.
+ * 7. Happy Path & Hell Path: Admin Governance Dual-Ledger Controls, Unlinked `user_id` Actions, Post-Push Refresh, Operator Cycle Telemetry & Strict Prompt Validation:
+ *    - Verifies Admin panel renders dual-ledger fields, `[TOKEN EXPIRED]` / `[INACTIVE]` subscription alerts,
+ *      Operator Settings `Cycle Consumed` (`#operator-period-usage`), sends `{ user_id: ... }` for unlinked principals
+ *      across approve/revoke/ban/unban, verifies `<select>` setter syncs `<option>` selections, rejects
+ *      malformed deltas (`"12.5"`, `"50abc"`) without dispatching requests, and dispatches
  *      `POST /admin/adjust-balance` and `POST /admin/reconcile-debt`.
  */
 
@@ -136,23 +150,51 @@ function createBrowserSandbox(initialStorage = {}, scriptSource = null) {
   }
 
   function matchesSelector(el, sel) {
-    if (sel.startsWith('#')) return el.id === sel.slice(1);
-    if (sel.startsWith('.')) {
-      const cls = sel.slice(1);
-      return (el.getAttribute('class') || '').split(/\s+/).includes(cls);
-    }
-    const attrIdx = sel.indexOf('[');
-    if (attrIdx !== -1 && sel.includes('=')) {
-      const tagPrefix = sel.slice(0, attrIdx).trim();
-      if (tagPrefix && el.tagName.toLowerCase() !== tagPrefix.toLowerCase()) {
-        return false;
+    if (!sel || typeof sel !== 'string') return false;
+    const trimmed = sel.trim();
+    if (!trimmed) return false;
+
+    // Check attributes first if present: e.g. [data-sort="reqs"] or .sort-trigger[data-sort="reqs"]
+    const attrRegex = /\[([a-zA-Z0-9\-_:]+)(?:=(?:"([^"]*)"|'([^']*)'|([^\]]+)))?\]/g;
+    let attrMatch;
+    let hasAttrCheck = false;
+    while ((attrMatch = attrRegex.exec(trimmed)) !== null) {
+      hasAttrCheck = true;
+      const attrName = attrMatch[1];
+      const expectedVal = attrMatch[2] !== undefined ? attrMatch[2]
+        : (attrMatch[3] !== undefined ? attrMatch[3]
+          : (attrMatch[4] !== undefined ? attrMatch[4] : null));
+      const actualVal = el.getAttribute(attrName);
+      if (expectedVal === null) {
+        if (actualVal === null || actualVal === undefined) return false;
+      } else {
+        if (actualVal !== expectedVal) return false;
       }
-      const match = sel.match(/\[([a-zA-Z0-9\-_:]+)=(?:"([^"]*)"|'([^']*)'|([^\]]+))\]/);
-      if (match) {
-        return el.getAttribute(match[1]) === (match[2] || match[3] || match[4] || '');
-      }
     }
-    return el.tagName.toLowerCase() === sel.toLowerCase();
+
+    // Strip bracketed attribute selectors to evaluate base tag/id/class prefix
+    const baseSelector = trimmed.replace(attrRegex, '').trim();
+    if (!baseSelector) {
+      return hasAttrCheck;
+    }
+
+    if (baseSelector.startsWith('#')) {
+      return el.id === baseSelector.slice(1);
+    }
+    if (baseSelector.startsWith('.')) {
+      const cls = baseSelector.slice(1);
+      const classes = (el.getAttribute('class') || '').split(/\s+/);
+      return classes.includes(cls);
+    }
+    if (baseSelector.includes('.')) {
+      const parts = baseSelector.split('.');
+      const tag = parts[0];
+      const cls = parts[1];
+      if (tag && el.tagName.toLowerCase() !== tag.toLowerCase()) return false;
+      const classes = (el.getAttribute('class') || '').split(/\s+/);
+      return classes.includes(cls);
+    }
+    return el.tagName.toLowerCase() === baseSelector.toLowerCase();
   }
 
   function findSelector(root, sel, singleOnly, results = []) {
@@ -214,6 +256,7 @@ function createBrowserSandbox(initialStorage = {}, scriptSource = null) {
           if (attrName.toLowerCase() === 'style') childEl.style.cssText = attrVal;
           if (attrName === 'value') childEl.value = attrVal;
           if (attrName === 'checked') childEl.checked = true;
+          if (attrName === 'selected') childEl.selected = true;
           if (attrName === 'disabled') childEl.disabled = true;
         }
 
@@ -232,6 +275,7 @@ function createBrowserSandbox(initialStorage = {}, scriptSource = null) {
     let _id = '';
     let _innerHTML = '';
     let _children = [];
+    let _value = '';
     const attributes = new Map();
     const listeners = new Map();
 
@@ -261,7 +305,7 @@ function createBrowserSandbox(initialStorage = {}, scriptSource = null) {
       style,
       attributes,
       disabled: false,
-      value: '',
+      selected: false,
       checked: false,
       onclick: null,
       onchange: null,
@@ -278,6 +322,30 @@ function createBrowserSandbox(initialStorage = {}, scriptSource = null) {
 
       get className() { return attributes.get('class') || ''; },
       set className(val) { attributes.set('class', String(val || '')); },
+
+      get value() {
+        if (el.tagName === 'SELECT') {
+          const selectedOption = _children.find(c => c.tagName === 'OPTION' && (c.selected || c.getAttribute('selected') !== null));
+          if (selectedOption) return selectedOption.value;
+          const firstOption = _children.find(c => c.tagName === 'OPTION');
+          if (firstOption) return firstOption.value;
+        }
+        return _value;
+      },
+      set value(val) {
+        const nextVal = String(val !== undefined && val !== null ? val : '');
+        _value = nextVal;
+        if (el.tagName === 'SELECT') {
+          for (const opt of _children) {
+            if (opt.tagName === 'OPTION') {
+              const isMatch = opt.value === nextVal;
+              opt.selected = isMatch;
+              if (isMatch) opt.attributes.set('selected', '');
+              else opt.attributes.delete('selected');
+            }
+          }
+        }
+      },
 
       get textContent() {
         if (_children.length > 0) {
@@ -350,6 +418,7 @@ function createBrowserSandbox(initialStorage = {}, scriptSource = null) {
         attributes.set(k, strVal);
         if (k.toLowerCase() === 'id') el.id = strVal;
         if (k.toLowerCase() === 'class') attributes.set('class', strVal);
+        if (k.toLowerCase() === 'selected') el.selected = true;
       },
 
       getAttribute(k) {
@@ -553,10 +622,15 @@ test('Phase 8 Commit 10: Client UserScript Runtime, Dynamic Design Engine & Prod
   // ---------------------------------------------------------------------------
   // 2. PRICING ENGINE & PARAMS PARITY WITH SERVER `auditEngine.js`
   // ---------------------------------------------------------------------------
-  await t.test('Pricing Parity: Client pricing.js and params.js match auditEngine.js (Module 643656)', async () => {
+  await t.test('Pricing Parity: Client pricing.js and params.js match auditEngine.js (Module 643656 & Vibe Segregation)', async () => {
     const vectors = [
       { width: 1024, height: 1024, steps: 28, n_samples: 1, model: 'nai-diffusion-4-5-full' },
       { width: 1024, height: 1024, steps: 28, n_samples: 2, model: 'nai-diffusion-4-5-full' },
+      { width: 1024, height: 1024, steps: 28, n_samples: 1, reference_image_multiple: ['v1', 'v2'], model: 'nai-diffusion-4-5-full' },
+      { width: 1024, height: 1024, steps: 28, n_samples: 1, reference_image_multiple: ['v1', 'v2', 'v3', 'v4', 'v5', 'v6'], model: 'nai-diffusion-4-5-full' },
+      { width: 1024, height: 1024, steps: 28, n_samples: 1, director_reference_images: ['char1'], model: 'nai-diffusion-4-5-full' },
+      { width: 1024, height: 1024, steps: 28, n_samples: 2, model: 'nai-diffusion-3-5' },
+      { width: 1024, height: 1024, steps: 28, n_samples: 2, model: 'sd-1-5' },
       { width: 832, height: 1216, steps: 29, n_samples: 1, model: 'nai-diffusion-5-full' },
       { width: 1024, height: 1024, steps: 29, n_samples: 1, model: 'nai-diffusion-5-full' },
       { width: 1024, height: 1024, steps: 35, n_samples: 1, model: 'nai-diffusion-5-full' },
@@ -583,6 +657,11 @@ test('Phase 8 Commit 10: Client UserScript Runtime, Dynamic Design Engine & Prod
       assert.strictEqual(clientCost, serverCost, `Client/server price mismatch for ${JSON.stringify(vec)}`);
     }
 
+    assert.strictEqual(auditEngine.isV5ModelFamily('nai-diffusion-3-5'), false);
+    assert.strictEqual(auditEngine.isV5ModelFamily('sd-1-5'), false);
+    assert.strictEqual(pricingMod.isV5ModelFamily('nai-diffusion-3-5'), false);
+    assert.strictEqual(pricingMod.isV5ModelFamily('sd-1-5'), false);
+
     assert.strictEqual(pricingMod.calculateAnlasCost({ width: 1024, height: 1024, n_samples: 2, model: 'nai-diffusion-5-full-medium' }), 15);
     assert.strictEqual(pricingMod.calculateAnlasCost({ width: 1472, height: 1472, n_samples: 1, model: 'nai-diffusion-5-full-medium' }), 31);
     assert.strictEqual(pricingMod.calculateAnlasCost({ width: 1536, height: 2048, n_samples: 1, model: 'nai-diffusion-5-full-medium' }), 44);
@@ -599,24 +678,44 @@ test('Phase 8 Commit 10: Client UserScript Runtime, Dynamic Design Engine & Prod
       () => pricingMod.calculateAnlasCost({ width: 1536, height: 2048, steps: 50, n_samples: 1, model: 'nai-diffusion-5-full' }),
       /140 Anlas/
     );
+    assert.throws(
+      () => pricingMod.calculateAnlasCost({ width: 100000, height: 100000, steps: 28, n_samples: 1, has_image: true, strength: 0, model: 'nai-diffusion-4-5-full' }),
+      /3145728px/
+    );
+    assert.throws(
+      () => pricingMod.calculateAnlasCost({ width: 1024, height: 1024, steps: 100000, n_samples: 1, has_image: true, strength: 0, model: 'nai-diffusion-5-full' }),
+      /50 steps/
+    );
 
-    // Stage 5 Parity: params.js must ignore non-array scalar reference_count just like auditEngine.extractParametersFromRawBody
     const { extractImageParams } = await import('../src/userscripts/shared/params.js');
     const scalarPayload = JSON.stringify({
       model: 'nai-diffusion-4-5-full',
-      parameters: { width: 1024, height: 1024, steps: 28, n_samples: 1, reference_count: 3 }
+      parameters: {
+        width: 1024, height: 1024, steps: 28, n_samples: 1,
+        reference_count: 3,
+        reference_image_multiple: ['vibe1', 'vibe2'],
+        director_reference_images: ['char1']
+      }
     });
     const clientExtracted = await extractImageParams(scalarPayload);
     const serverExtracted = auditEngine.extractParametersFromRawBody(Buffer.from(scalarPayload));
     assert.strictEqual(clientExtracted.precise_refs, serverExtracted.precise_ref_count);
-    assert.strictEqual(clientExtracted.precise_refs, 0);
+    assert.strictEqual(clientExtracted.precise_refs, 1, 'Must count director_reference_images (1), not reference_image_multiple');
+    assert.strictEqual(clientExtracted.vibe_reference_count, serverExtracted.vibe_reference_count);
+    assert.strictEqual(clientExtracted.vibe_reference_count, 2);
+
+    const legacyMedPayload = JSON.stringify({
+      model: 'nai-diffusion-3-5-medium',
+      parameters: { width: 1024, height: 1024, n_samples: 1 }
+    });
+    assert.strictEqual((await extractImageParams(legacyMedPayload)).steps, 28, 'nai-diffusion-3-5-medium must not match V5 Medium default 14 steps');
   });
 
   // ---------------------------------------------------------------------------
-  // 3. HAPPY PATH: DUAL METERS, NATIVE SELECTION COST, CANARY SCRAPER & BYPASS HEADERS
+  // 3. HAPPY PATH: DUAL METERS, /user/subscription GET, ENCODE-VIBE ISOLATION, CANARY & HEADERS
   // ---------------------------------------------------------------------------
-  await t.test('Happy Path: Renders dual meters, native NCP cost, accurate canary scraping, bypass headers, usageNegative & Stage 5 step parity', async () => {
-    const { context, networkCalls, triggerIntervalAtMs, triggerObserverSync } = createBrowserSandbox({
+  await t.test('Happy Path: Renders dual meters, preserves GET /user/subscription & counter isolation, scrapes canary & bypass headers', async () => {
+    const { context, storage, networkCalls, triggerIntervalAtMs, triggerObserverSync } = createBrowserSandbox({
       approved: true,
       vps_host: 'https://vps.example.duckdns.org',
       device_secret: 'sec_guest_10',
@@ -649,6 +748,46 @@ test('Phase 8 Commit 10: Client UserScript Runtime, Dynamic Design Engine & Prod
     // No redundant #gw-effort-select dropdown should exist
     assert.strictEqual(context.document.getElementById('gw-effort-select'), null, 'Must not inject redundant #gw-effort-select');
 
+    // /user/subscription without explicit config.method MUST default to GET, leave count_text_gens untouched,
+    // and NOT fire spurious /auth/status telemetry refreshes
+    const subPromise = vm.runInContext(`
+      unsafeWindow.fetch('https://image.novelai.net/user/subscription', {
+        headers: { 'Authorization': 'Bearer guest_jwt' }
+      })
+    `, context);
+    await new Promise(r => setTimeout(r, 20));
+    assert.strictEqual(networkCalls.length, 1);
+    assert.strictEqual(networkCalls[0].method, 'GET', '/user/subscription must default to GET when config.method is omitted');
+    assert.strictEqual(networkCalls[0].url, 'https://vps.example.duckdns.org/proxy/image/user/subscription');
+    networkCalls[0].onloadstart({
+      status: 200,
+      response: new ReadableStream({ start(c) { c.enqueue(new TextEncoder().encode('{"tier":3}')); c.close(); } }),
+      responseHeaders: 'HTTP/1.1 200 OK\r\nContent-Type: application/json'
+    });
+    const subResp = await subPromise;
+    assert.strictEqual(subResp.status, 200);
+    assert.strictEqual(storage.get('count_text_gens') || 0, 0, '/user/subscription must NOT increment count_text_gens');
+    assert.strictEqual(networkCalls.some(c => c.url.includes('/auth/status')), false, '/user/subscription must NOT trigger extra /auth/status poll');
+
+    // /ai/encode-vibe MUST use POST, leave count_text_gens at 0, and trigger telemetry refresh on 200 OK
+    networkCalls.length = 0;
+    const vibePromise = vm.runInContext(`
+      unsafeWindow.fetch('https://image.novelai.net/ai/encode-vibe', {
+        body: JSON.stringify({ image: 'base64vibe' })
+      })
+    `, context);
+    await new Promise(r => setTimeout(r, 20));
+    assert.strictEqual(networkCalls[0].method, 'POST');
+    networkCalls[0].onloadstart({
+      status: 200,
+      response: new ReadableStream({ start(c) { c.enqueue(new TextEncoder().encode('encoded_vibe')); c.close(); } }),
+      responseHeaders: 'HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream'
+    });
+    await vibePromise;
+    assert.strictEqual(storage.get('count_text_gens') || 0, 0, '/ai/encode-vibe must NOT increment count_text_gens');
+    assert.ok(networkCalls.some(c => c.url.includes('/auth/status')), '/ai/encode-vibe 200 OK must refresh HUD telemetry');
+
+    networkCalls.length = 0;
     triggerIntervalAtMs(10000);
     await new Promise(r => setTimeout(r, 20));
 
@@ -845,7 +984,34 @@ test('Phase 8 Commit 10: Client UserScript Runtime, Dynamic Design Engine & Prod
     });
     await medExplicitPromise;
 
-    // 4. master_v5_is_negative: true revokes Opus 1-sample discount -> X-Declared-Anlas: 30 on 1024x1024, 2 samples Medium
+    // 4. V4.5 Vibe Transfer (`reference_image_multiple` 2 vibes) reports X-Declared-Anlas: 0 & X-Precise-Refs: 0
+    networkCalls.length = 0;
+    const vibe45Promise = vm.runInContext(`
+      unsafeWindow.fetch('https://image.novelai.net/ai/generate-image-stream', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          model: 'nai-diffusion-4-5-full',
+          parameters: { width: 1024, height: 1024, steps: 28, n_samples: 1, reference_image_multiple: ['v1', 'v2'] }
+        })
+      })
+    `, context);
+    await new Promise(r => setTimeout(r, 20));
+    assert.strictEqual(JSON.parse(networkCalls[0].data).declared_anlas, 0, '2 V4.5 Vibe Transfers must declare 0 Anlas');
+    networkCalls[0].onload({ status: 200, responseText: '{"success":true}' });
+    await new Promise(r => setTimeout(r, 1050));
+    networkCalls[1].onload({ status: 200, responseText: '{"status":"your_turn"}' });
+    await new Promise(r => setTimeout(r, 20));
+    assert.strictEqual(networkCalls[2].headers['x-precise-refs'], '0');
+    assert.strictEqual(networkCalls[2].headers['x-declared-anlas'], '0');
+    networkCalls[2].onloadstart({
+      status: 200,
+      response: new ReadableStream({ start(c) { c.close(); } }),
+      responseHeaders: 'HTTP/1.1 200 OK\r\nContent-Type: application/x-msgpack'
+    });
+    await vibe45Promise;
+
+    // 5. master_v5_is_negative: true revokes Opus 1-sample discount -> X-Declared-Anlas: 30
     networkCalls.length = 0;
     triggerIntervalAtMs(10000);
     await new Promise(r => setTimeout(r, 20));
@@ -885,7 +1051,7 @@ test('Phase 8 Commit 10: Client UserScript Runtime, Dynamic Design Engine & Prod
     });
     await negMultiPromise;
 
-    // 5. Guest Settings Modal renders dual-ledger fields & bypass toggle
+    // 6. Guest Settings Modal renders dual-ledger fields & bypass toggle
     const badge = context.document.getElementById('gw-nav-badge');
     badge.onclick({ preventDefault: () => {}, stopPropagation: () => {} });
     const modal = context.document.getElementById('vps-settings-modal');
@@ -896,9 +1062,9 @@ test('Phase 8 Commit 10: Client UserScript Runtime, Dynamic Design Engine & Prod
   });
 
   // ---------------------------------------------------------------------------
-  // 4. HELL PATH: CLIENT DEADBAND GUARD, LIVE INPUT EVENTS, LEGACY-5 IMMUNITY & FORMDATA
+  // 4. HELL PATH: CLIENT DEADBAND GUARD, LIVE INPUT EVENTS, BADGE TEXT & FORMDATA
   // ---------------------------------------------------------------------------
-  await t.test('Hell Path: Blocks V5 High deadband, retains bypass-armed deadband alerts across mutations, catches react-select wrappers & passes FormData/Blob', async () => {
+  await t.test('Hell Path: Blocks V5 High deadband, detects V5New badge, ignores V50/3.5, blocks strength=0 evasion & passes FormData/Blob', async () => {
     const { context, networkCalls, triggerObserverSync } = createBrowserSandbox({
       approved: true,
       vps_host: 'https://vps.example.duckdns.org',
@@ -910,7 +1076,7 @@ test('Phase 8 Commit 10: Client UserScript Runtime, Dynamic Design Engine & Prod
     // Uses standard react-select nested input wrapper WITHOUT -singleValue class to verify parent sibling traversal
     context.document.body.innerHTML = `
       <div class="image-gen-model-mode-row">
-        <div><span>Model</span><div class="css-val-container"><div id="native-model-val" class="hashed-val">V5 Full</div><div class="hashed-input-wrap"><input aria-label="Select the Model" value="" /></div></div></div>
+        <div><span>Model</span><div class="css-val-container"><div id="native-model-val" class="hashed-val">NAI Diffusion V5New</div><div class="hashed-input-wrap"><input aria-label="Select the Model" value="" /></div></div></div>
         <div><span>Effort</span><div><button id="native-med-btn" style="background-color: rgba(0, 0, 0, 0);">Medium</button><button id="native-high-btn" style="background-color: rgb(25, 90, 95);">High</button></div></div>
       </div>
       <div class="image-gen-footer">
@@ -952,14 +1118,21 @@ test('Phase 8 Commit 10: Client UserScript Runtime, Dynamic Design Engine & Prod
     assert.strictEqual(armedDeadbandResp.status, 400);
     triggerObserverSync();
     await new Promise(r => setTimeout(r, 20));
-    assert.strictEqual(
-      context.document.getElementById('gw-hud-alert').style.display,
-      'block',
-      'MutationObserver tick must NOT wipe deadband alert while steps remain 25 with Anlas Bypass armed'
-    );
-    assert.match(context.document.getElementById('gw-hud-alert').textContent, /battery deadband/i);
+    assert.strictEqual(context.document.getElementById('gw-hud-alert').style.display, 'block');
 
-    // Disarm bypass and verify V5 High steps 24, 25, 28 at 1024x1024, 1 sample -> blocked client-side with ZERO network calls
+    // strength: 0 with 100000x100000 dimensions must fail locally (400) with zero network calls
+    const strength0Resp = await vm.runInContext(`
+      unsafeWindow.fetch('https://image.novelai.net/ai/generate-image-stream', {
+        method: 'POST',
+        body: JSON.stringify({
+          model: 'nai-diffusion-4-5-full',
+          parameters: { width: 100000, height: 100000, steps: 28, n_samples: 1, image: 'img', strength: 0 }
+        })
+      })
+    `, context);
+    assert.strictEqual(strength0Resp.status, 400);
+    assert.strictEqual(networkCalls.length, 0);
+
     bypassToggle.checked = false;
     bypassToggle.onchange();
     for (const badStep of [24, 25, 28]) {
@@ -1012,14 +1185,12 @@ test('Phase 8 Commit 10: Client UserScript Runtime, Dynamic Design Engine & Prod
     await new Promise(r => setTimeout(r, 1050));
     networkCalls[1].onload({ status: 200, responseText: '{"status":"your_turn"}' });
     await new Promise(r => setTimeout(r, 20));
-
     const fdProxyCall = networkCalls[2];
     assert.strictEqual(fdProxyCall.headers['x-gen-model'], 'V5-medium');
     assert.strictEqual(fdProxyCall.headers['x-gen-steps'], '14');
     const rawBlobPayload = JSON.parse(await fdProxyCall.data.get('request').text());
     assert.strictEqual(rawBlobPayload.model, 'nai-diffusion-5-full-medium');
-
-    fdProxyCall.onloadstart({
+    networkCalls[2].onloadstart({
       status: 200,
       response: new ReadableStream({ start(c) { c.close(); } }),
       responseHeaders: 'HTTP/1.1 200 OK\r\nContent-Type: application/x-msgpack'
@@ -1042,8 +1213,8 @@ test('Phase 8 Commit 10: Client UserScript Runtime, Dynamic Design Engine & Prod
     assert.strictEqual(unbypassedJson.error, 'BYPASS_DISABLED');
     assert.strictEqual(networkCalls.length, 0);
 
-    // 5. Switch native Model dropdown to V4.5 Full, NAI 3.5, and SD 1.5 -> must all render Legacy (0 NCP)
-    for (const legacyLabel of ['V4.5 Full', 'NAI Diffusion 3.5', 'SD 1.5']) {
+    // 5. Switch native Model dropdown to V4.5 Full, NAI 3.5, SD 1.5, and Model V50 -> must all render Legacy (0 NCP)
+    for (const legacyLabel of ['V4.5 Full', 'NAI Diffusion 3.5', 'SD 1.5', 'Model V50']) {
       context.document.getElementById('native-model-val').textContent = legacyLabel;
       triggerObserverSync();
       await new Promise(r => setTimeout(r, 20));
@@ -1081,7 +1252,7 @@ test('Phase 8 Commit 10: Client UserScript Runtime, Dynamic Design Engine & Prod
       response: new ReadableStream({ start(c) { c.close(); } }),
       responseHeaders: 'HTTP/1.1 200 OK\r\nContent-Type: application/x-msgpack'
     });
-    await freeWhileArmedPromise;
+    assert.strictEqual((await freeWhileArmedPromise).status, 200);
   });
 
   // ---------------------------------------------------------------------------
@@ -1178,8 +1349,7 @@ test('Phase 8 Commit 10: Client UserScript Runtime, Dynamic Design Engine & Prod
 
     context.document.getElementById('gw-nav-badge').onclick({ preventDefault: () => {}, stopPropagation: () => {} });
     await new Promise(r => setTimeout(r, 20));
-    const modalStatusCall = networkCalls[networkCalls.length - 1];
-    modalStatusCall.onload({
+    networkCalls[networkCalls.length - 1].onload({
       status: 200,
       responseText: JSON.stringify({
         approved: true,
@@ -1235,6 +1405,7 @@ test('Phase 8 Commit 10: Client UserScript Runtime, Dynamic Design Engine & Prod
     assert.strictEqual((await paidBlocked.json()).error, 'DEBT_LOCKED');
     assert.strictEqual(networkCalls.length, 0);
 
+    // Free Opus/V5 generation (1024x1024, 23 steps, 1 sample) succeeds (200) even while in debt
     const freePromise = vm.runInContext(`
       unsafeWindow.fetch('https://image.novelai.net/ai/generate-image-stream', {
         method: 'POST',
@@ -1261,9 +1432,9 @@ test('Phase 8 Commit 10: Client UserScript Runtime, Dynamic Design Engine & Prod
   });
 
   // ---------------------------------------------------------------------------
-  // 6. HELL PATH: V5 BATTERY LOCKOUT, NATIVE EFFORT SHIELD SYNC & SERVER ERRORS
+  // 6. HELL PATH: V5 BATTERY LOCKOUT, TOKEN EXPIRED DISPLAY/RECOVERY & SERVER ERRORS
   // ---------------------------------------------------------------------------
-  await t.test('Hell Path: Enforces 5.5% Battery Recharging lockout, clears shield on native Medium/Bypass, and propagates /queue/join & /proxy errors', async () => {
+  await t.test('Hell Path: Enforces 5.5% Battery Recharging lockout, lets token_expired reach server immediately, and propagates errors', async () => {
     const { context, networkCalls, triggerIntervalAtMs, triggerObserverSync } = createBrowserSandbox({
       approved: true,
       vps_host: 'https://vps.example.duckdns.org',
@@ -1287,7 +1458,52 @@ test('Phase 8 Commit 10: Client UserScript Runtime, Dynamic Design Engine & Prod
     triggerIntervalAtMs(10000);
     await new Promise(r => setTimeout(r, 20));
 
+    // Master Token Expired status surfaces explicitly without locking Generate shield
+    // AND does NOT falsely block V5 locally as V5_BATTERY_CRITICAL (allows immediate post-push recovery!)
     networkCalls[0].onload({
+      status: 200,
+      responseText: JSON.stringify({
+        approved: true,
+        tier: 'Normal',
+        anlas: { virtual_balance: 500, available_balance: 500, monthly_quota: 500, is_unlimited: false, is_in_debt: false },
+        v5: { banked_ncp: 180, available_ncp: 180, max_bank_ncp: 540, surplus_available_ncp: 0, surplus_eligible: true, is_unlimited: false },
+        telemetry: { master_v5_percent: null, master_token_expired: true, cluster_state: 'token_expired', is_hard_locked: true, subscription_active: false, last_fetched_at: 0 }
+      })
+    });
+    await new Promise(r => setTimeout(r, 20));
+    assert.match(context.document.getElementById('gw-v5-label').textContent, /Master Token Expired/);
+    assert.match(context.document.getElementById('gw-v5-eta').textContent, /TOKEN EXPIRED/);
+    assert.strictEqual(context.document.getElementById('gw-button-shield').style.display, 'none', 'Token expired must not lock Generate button behind client shield');
+
+    networkCalls.length = 0;
+    const immediateRecoveryPromise = vm.runInContext(`
+      unsafeWindow.fetch('https://image.novelai.net/ai/generate-image-stream', {
+        method: 'POST',
+        body: JSON.stringify({ model: 'nai-diffusion-5-full', parameters: { width: 1024, height: 1024, steps: 23, n_samples: 1 } })
+      })
+    `, context);
+    await new Promise(r => setTimeout(r, 20));
+    assert.strictEqual(networkCalls.length, 1, 'master_token_expired must not block V5 locally so guests recover immediately upon admin token push');
+    assert.strictEqual(networkCalls[0].url, 'https://vps.example.duckdns.org/queue/join');
+    // Simulate server still expired -> returns 503 MASTER_TOKEN_EXPIRED and refreshes HUD
+    networkCalls[0].onload({
+      status: 503,
+      responseText: JSON.stringify({
+        statusCode: 503,
+        error: 'MASTER_TOKEN_EXPIRED',
+        message: 'Master NovelAI session token was rejected upstream (401).'
+      })
+    });
+    const expiredJoinResp = await immediateRecoveryPromise;
+    assert.strictEqual(expiredJoinResp.status, 503);
+    assert.strictEqual((await expiredJoinResp.json()).error, 'MASTER_TOKEN_EXPIRED');
+    assert.match(context.document.getElementById('gw-hud-alert').textContent, /session token was rejected/);
+
+    // Switch to 5.0% Battery Recharging circuit breaker
+    networkCalls.length = 0;
+    triggerIntervalAtMs(10000);
+    await new Promise(r => setTimeout(r, 20));
+    networkCalls[networkCalls.length - 1].onload({
       status: 200,
       responseText: JSON.stringify({
         approved: true,
@@ -1435,10 +1651,10 @@ test('Phase 8 Commit 10: Client UserScript Runtime, Dynamic Design Engine & Prod
 
     // Simulate /proxy/image/* returning 503 MASTER_SUBSCRIPTION_INACTIVE -> surfaces HUD alert & triggers telemetry refresh
     networkCalls.length = 0;
-    const proxyFailPromise = vm.runInContext(`
+    const subInactivePromise = vm.runInContext(`
       unsafeWindow.fetch('https://image.novelai.net/ai/generate-image-stream', {
         method: 'POST',
-        body: JSON.stringify({ model: 'nai-diffusion-5-full', parameters: { width: 1536, height: 2048, steps: 28, n_samples: 1 } })
+        body: JSON.stringify({ model: 'nai-diffusion-4-5-full', parameters: { width: 1024, height: 1024, steps: 28, n_samples: 1 } })
       })
     `, context);
     await new Promise(r => setTimeout(r, 20));
@@ -1446,8 +1662,7 @@ test('Phase 8 Commit 10: Client UserScript Runtime, Dynamic Design Engine & Prod
     await new Promise(r => setTimeout(r, 1050));
     networkCalls[1].onload({ status: 200, responseText: '{"status":"your_turn"}' });
     await new Promise(r => setTimeout(r, 20));
-    const proxyRejectCall = networkCalls[2];
-    proxyRejectCall.onload({
+    networkCalls[2].onload({
       status: 503,
       readyState: 4,
       responseHeaders: 'HTTP/1.1 503 Service Unavailable\r\nContent-Type: application/json',
@@ -1457,16 +1672,44 @@ test('Phase 8 Commit 10: Client UserScript Runtime, Dynamic Design Engine & Prod
         message: 'Master NovelAI Opus subscription is inactive or expired.'
       })
     });
+    const subInactiveResp = await subInactivePromise;
+    assert.strictEqual(subInactiveResp.status, 503);
+    assert.match(context.document.getElementById('gw-hud-alert').textContent, /Opus subscription is inactive/);
+    assert.ok(networkCalls.some(c => c.url.includes('/auth/status')), '503 subscription inactive must trigger telemetry refresh');
+
+    // /proxy/image/* returning 503 MASTER_TOKEN_EXPIRED surfaces HUD alert and does NOT wipe approved
+    networkCalls.length = 0;
+    const proxyFailPromise = vm.runInContext(`
+      unsafeWindow.fetch('https://image.novelai.net/ai/generate-image-stream', {
+        method: 'POST',
+        body: JSON.stringify({ model: 'nai-diffusion-4-5-full', parameters: { width: 1024, height: 1024, steps: 28, n_samples: 1 } })
+      })
+    `, context);
+    await new Promise(r => setTimeout(r, 20));
+    networkCalls[0].onload({ status: 200, responseText: '{"success":true}' });
+    await new Promise(r => setTimeout(r, 1050));
+    networkCalls[1].onload({ status: 200, responseText: '{"status":"your_turn"}' });
+    await new Promise(r => setTimeout(r, 20));
+    networkCalls[2].onload({
+      status: 503,
+      readyState: 4,
+      responseHeaders: 'HTTP/1.1 503 Service Unavailable\r\nContent-Type: application/json',
+      responseText: JSON.stringify({
+        statusCode: 503,
+        error: 'MASTER_TOKEN_EXPIRED',
+        message: 'Master NovelAI session token was rejected upstream (401).'
+      })
+    });
     const proxyFailResp = await proxyFailPromise;
     assert.strictEqual(proxyFailResp.status, 503);
-    assert.match(context.document.getElementById('gw-hud-alert').textContent, /Opus subscription is inactive/);
-    assert.ok(networkCalls.some(c => c.url.includes('/auth/status')), '503 proxy rejection must trigger telemetry refresh');
+    assert.match(context.document.getElementById('gw-hud-alert').textContent, /session token was rejected/);
+    assert.ok(networkCalls.some(c => c.url.includes('/auth/status')));
   });
 
   // ---------------------------------------------------------------------------
-  // 7. ADMIN DUAL-LEDGER GOVERNANCE, OPERATOR CYCLE TELEMETRY & STRICT PROMPT PARSING
+  // 7. ADMIN DUAL-LEDGER GOVERNANCE, UNLINKED `user_id` & IMMEDIATE TOKEN REFRESH
   // ---------------------------------------------------------------------------
-  await t.test('Admin Governance: Renders dual-ledger balances, inactive badges, operator cycle usage & unlinked user_id payloads', async () => {
+  await t.test('Admin Governance: Renders expired/inactive badges, operator cycle usage, unlinked user_id payloads & post-token-push refresh', async () => {
     const { context, networkCalls, promptQueue, alertLog, triggerIntervalAtMs, triggerObserverSync } = createBrowserSandbox({
       approved: true,
       vps_host: 'https://vps.example.duckdns.org',
@@ -1567,33 +1810,73 @@ test('Phase 8 Commit 10: Client UserScript Runtime, Dynamic Design Engine & Prod
     devCall1.onload({ status: 200, responseText: JSON.stringify(mockDeviceGroups) });
     await new Promise(r => setTimeout(r, 20));
 
-    // Verify /admin/global-stats surfaces [INACTIVE] when subscription_active === false
-    const statsCall = networkCalls.find(c => c.url.includes('/admin/global-stats'));
-    assert.ok(statsCall);
-    statsCall.onload({
+    // First global-stats response verifies [TOKEN EXPIRED]
+    const statsCall1 = networkCalls.find(c => c.url.includes('/admin/global-stats'));
+    assert.ok(statsCall1);
+    statsCall1.onload({
       status: 200,
       responseText: JSON.stringify({
         v5_surplus_pool: 0,
         v5_surplus_available: 0,
-        telemetry: { master_v5_percent: 0, subscription_active: false, is_grace_period: false, master_anlas: 2995 }
+        telemetry: { master_v5_percent: null, master_token_expired: true, subscription_active: false, is_grace_period: false, master_anlas: null, last_fetched_at: 0 }
+      })
+    });
+    await new Promise(r => setTimeout(r, 20));
+    assert.strictEqual(context.document.getElementById('admin-stat-battery').textContent, '[TOKEN EXPIRED]');
+
+    // Sort trigger triggers a fresh governance render and a brand-new /admin/global-stats request
+    networkCalls.length = 0;
+    const sortReqs = context.document.querySelector('.sort-trigger[data-sort="reqs"]');
+    assert.ok(sortReqs);
+    sortReqs.onclick({ preventDefault: () => {}, currentTarget: sortReqs });
+    await new Promise(r => setTimeout(r, 20));
+
+    let currentDeviceCalls = networkCalls.filter(c => c.url.includes('/admin/devices'));
+    currentDeviceCalls[currentDeviceCalls.length - 1].onload({ status: 200, responseText: JSON.stringify(mockDeviceGroups) });
+    await new Promise(r => setTimeout(r, 20));
+
+    // Fresh global-stats response verifies [INACTIVE]
+    let currentStatsCalls = networkCalls.filter(c => c.url.includes('/admin/global-stats'));
+    const statsCall2 = currentStatsCalls[currentStatsCalls.length - 1];
+    assert.ok(statsCall2);
+    statsCall2.onload({
+      status: 200,
+      responseText: JSON.stringify({
+        v5_surplus_pool: 0,
+        v5_surplus_available: 0,
+        telemetry: { master_v5_percent: 0, master_token_expired: false, subscription_active: false, is_grace_period: false, master_anlas: 2995, last_fetched_at: Date.now() }
       })
     });
     await new Promise(r => setTimeout(r, 20));
     assert.match(context.document.getElementById('admin-stat-battery').textContent, /\[INACTIVE\]/);
+
+    // Pushing fresh token via PUSH TO GUILDWEAVE STORAGE triggers immediate HUD poll + modal refresh
+    networkCalls.length = 0;
+    context.document.getElementById('vps-master-token-input').value = 'fresh_master_jwt';
+    context.document.getElementById('vps-btn-push-token').onclick();
+    const updateTokCall = networkCalls.find(c => c.url.includes('/admin/update-token'));
+    assert.ok(updateTokCall);
+    updateTokCall.onload({ status: 200, responseText: '{"success":true}' });
+    await new Promise(r => setTimeout(r, 20));
+    assert.ok(networkCalls.some(c => c.url.includes('/auth/status')), 'Token push must refresh operator HUD immediately');
+    assert.ok(networkCalls.some(c => c.url.includes('/admin/devices')), 'Token push must refresh governance view immediately');
+    const refreshedDevCall = networkCalls.find(c => c.url.includes('/admin/devices'));
+    refreshedDevCall.onload({ status: 200, responseText: JSON.stringify(mockDeviceGroups) });
+    await new Promise(r => setTimeout(r, 20));
 
     // Expand both cards
     const headers = context.document.querySelectorAll('.client-card-header');
     headers[0].onclick({ currentTarget: headers[0] });
     await new Promise(r => setTimeout(r, 20));
     let deviceCalls = networkCalls.filter(c => c.url.includes('/admin/devices'));
-    deviceCalls[1].onload({ status: 200, responseText: JSON.stringify(mockDeviceGroups) });
+    deviceCalls[deviceCalls.length - 1].onload({ status: 200, responseText: JSON.stringify(mockDeviceGroups) });
     await new Promise(r => setTimeout(r, 20));
 
     const headers2 = context.document.querySelectorAll('.client-card-header');
     headers2[1].onclick({ currentTarget: headers2[1] });
     await new Promise(r => setTimeout(r, 20));
     deviceCalls = networkCalls.filter(c => c.url.includes('/admin/devices'));
-    deviceCalls[2].onload({ status: 200, responseText: JSON.stringify(mockDeviceGroups) });
+    deviceCalls[deviceCalls.length - 1].onload({ status: 200, responseText: JSON.stringify(mockDeviceGroups) });
     await new Promise(r => setTimeout(r, 20));
 
     const adjBtns = context.document.querySelectorAll('.btn-adjust-anlas');
@@ -1623,6 +1906,29 @@ test('Phase 8 Commit 10: Client UserScript Runtime, Dynamic Design Engine & Prod
     adjBtns[1].onclick({ currentTarget: adjBtns[1] });
     const adjCalls = networkCalls.filter(c => c.url.includes('/admin/adjust-balance'));
     assert.deepStrictEqual(JSON.parse(adjCalls[1].data), { user_id: 'b_pruned_orphan', anlas_delta: 25 });
+
+    // Verify Mock DOM <select> setter accurately updates selected <option> before approve
+    const orphanSelect = context.document.getElementById('tier-select-b_pruned_orphan');
+    assert.strictEqual(orphanSelect.value, 'Low');
+    orphanSelect.value = 'High';
+    assert.strictEqual(orphanSelect.value, 'High');
+
+    // Unlinked approve/revoke/ban actions must also pass { user_id: 'b_pruned_orphan' }
+    const approveBtns = context.document.querySelectorAll('.btn-approve-group');
+    approveBtns[1].onclick({ currentTarget: approveBtns[1] });
+    const appCall = networkCalls.find(c => c.url.includes('/admin/approve'));
+    assert.deepStrictEqual(JSON.parse(appCall.data), { user_id: 'b_pruned_orphan', priority_tier: 'High' });
+
+    const revokeBtns = context.document.querySelectorAll('.btn-revoke-group');
+    revokeBtns[1].onclick({ currentTarget: revokeBtns[1] });
+    const revCall = networkCalls.find(c => c.url.includes('/admin/revoke'));
+    assert.deepStrictEqual(JSON.parse(revCall.data), { user_id: 'b_pruned_orphan' });
+
+    const banBtns = context.document.querySelectorAll('.btn-ban-group');
+    promptQueue.push('Abuse');
+    banBtns[1].onclick({ currentTarget: banBtns[1] });
+    const banCall = networkCalls.find(c => c.url.includes('/admin/ban'));
+    assert.deepStrictEqual(JSON.parse(banCall.data), { user_id: 'b_pruned_orphan', reason: 'Abuse' });
 
     forgiveBtn.onclick({ currentTarget: forgiveBtn });
     const recCall = networkCalls.find(c => c.url.includes('/admin/reconcile-debt'));

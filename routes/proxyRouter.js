@@ -8,9 +8,10 @@
  * Stage 7 authoritative cost calculation (`C_auth`, including Module 643656 V5 1.5x,
  * Medium / 1.75, and `usageNegative` Opus lightweight bonus guard) + in-memory holds +
  * V5 NCP verification, and Stage 9 Point-of-No-Return (PoNR) SQLite settlement strictly on
- * upstream HTTP 200 OK.
- * Converts upstream NovelAI 401 responses into 503 MASTER_TOKEN_EXPIRED so expired master
- * credentials never wipe guest device approvals or trigger client reload loops.
+ * upstream HTTP 200 OK via serialized Bucket 2 persistence (`req.telemetry.persistSurplusPool`).
+ * Converts upstream NovelAI 401 responses into 503 MASTER_TOKEN_EXPIRED and shields
+ * cooldown windows so expired master credentials never report false TELEMETRY_FETCH_FAILED
+ * errors, never forward dead credentials upstream, and never wipe guest device approvals.
  * Orchestrates payload WAF buffering, upstream piping, and isolated Channel B `/ai/encode-vibe`
  * PoNR 2-Anlas settlement under a unified per-principal Anlas authorization gate.
  * Relational Normalization: Deducts allowances, charges Anlas/NCP, and evaluates bans against canonical user_id.
@@ -387,8 +388,15 @@ router.all('/:subdomain/{*splat}', async (req, res) => {
         } catch (telemetryErr) {
           if (isConnectionAborted()) return;
           console.error(`[GuildWeave Gatekeeper] On-demand telemetry sync failed:`, telemetryErr.message);
+          activeTask = requestId ? queueManager.getProcessingTask(requestId, browserId) : null;
+          if (req.telemetry.masterTokenExpired) {
+            return sendEarlyError(503, {
+              statusCode: 503,
+              error: 'MASTER_TOKEN_EXPIRED',
+              message: 'Master NovelAI session token was rejected upstream (401). Ask the administrator to push a fresh token.'
+            });
+          }
           if (req.telemetry.lastFetched === 0) {
-            activeTask = requestId ? queueManager.getProcessingTask(requestId, browserId) : null;
             return sendEarlyError(503, {
               statusCode: 503,
               error: 'TELEMETRY_FETCH_FAILED',
@@ -402,6 +410,14 @@ router.all('/:subdomain/{*splat}', async (req, res) => {
         // Re-verify Channel A lock ownership after async telemetry I/O so an evicted task cannot race upstream
         activeTask = requestId ? queueManager.getProcessingTask(requestId, browserId) : null;
 
+        if (req.telemetry.masterTokenExpired) {
+          return sendEarlyError(503, {
+            statusCode: 503,
+            error: 'MASTER_TOKEN_EXPIRED',
+            message: 'Master NovelAI session token was rejected upstream (401). Ask the administrator to push a fresh token.'
+          });
+        }
+
         if (req.telemetry.lastFetched === 0) {
           return sendEarlyError(503, {
             statusCode: 503,
@@ -409,6 +425,16 @@ router.all('/:subdomain/{*splat}', async (req, res) => {
             message: 'Master subscription telemetry has not been initialized.'
           });
         }
+      }
+
+      // Master Token Expiry Gate (shields legacy free requests from hitting upstream with revoked credentials)
+      if (req.telemetry && req.telemetry.masterTokenExpired) {
+        console.warn(`[GuildWeave Gatekeeper] Generation blocked for browser "${browserId}": Master token expired upstream.`);
+        return sendEarlyError(503, {
+          statusCode: 503,
+          error: 'MASTER_TOKEN_EXPIRED',
+          message: 'Master NovelAI session token was rejected upstream (401). Ask the administrator to push a fresh token.'
+        });
       }
 
       // Master Opus Subscription Active Gate (applies to all image generations once telemetry is initialized)
@@ -538,6 +564,13 @@ router.all('/:subdomain/{*splat}', async (req, res) => {
       } catch (telemetryErr) {
         if (isConnectionAborted()) return;
         console.error('[GuildWeave Gatekeeper] On-demand telemetry sync failed on /ai/encode-vibe:', telemetryErr.message);
+        if (req.telemetry.masterTokenExpired) {
+          return sendEarlyError(503, {
+            statusCode: 503,
+            error: 'MASTER_TOKEN_EXPIRED',
+            message: 'Master NovelAI session token was rejected upstream (401). Ask the administrator to push a fresh token.'
+          });
+        }
         if (req.telemetry.lastFetched === 0) {
           return sendEarlyError(503, {
             statusCode: 503,
@@ -548,6 +581,14 @@ router.all('/:subdomain/{*splat}', async (req, res) => {
       }
 
       if (isConnectionAborted()) return;
+
+      if (req.telemetry.masterTokenExpired) {
+        return sendEarlyError(503, {
+          statusCode: 503,
+          error: 'MASTER_TOKEN_EXPIRED',
+          message: 'Master NovelAI session token was rejected upstream (401). Ask the administrator to push a fresh token.'
+        });
+      }
 
       if (req.telemetry.lastFetched === 0) {
         return sendEarlyError(503, {
@@ -1037,6 +1078,17 @@ router.all('/:subdomain/{*splat}', async (req, res) => {
               await req.telemetry.ensureFresh();
             } catch (telemetryErr) {
               if (isConnectionAborted()) return;
+              if (req.telemetry.masterTokenExpired) {
+                executeCleanup();
+                if (!res.headersSent) {
+                  return res.status(503).json({
+                    statusCode: 503,
+                    error: 'MASTER_TOKEN_EXPIRED',
+                    message: 'Master NovelAI session token was rejected upstream (401). Ask the administrator to push a fresh token.'
+                  });
+                }
+                return;
+              }
               if (req.telemetry.lastFetched === 0) {
                 executeCleanup();
                 if (!res.headersSent) {
@@ -1050,6 +1102,17 @@ router.all('/:subdomain/{*splat}', async (req, res) => {
               }
             }
             if (isConnectionAborted()) return;
+            if (req.telemetry.masterTokenExpired) {
+              executeCleanup();
+              if (!res.headersSent) {
+                return res.status(503).json({
+                  statusCode: 503,
+                  error: 'MASTER_TOKEN_EXPIRED',
+                  message: 'Master NovelAI session token was rejected upstream (401). Ask the administrator to push a fresh token.'
+                });
+              }
+              return;
+            }
             if (req.telemetry.lastFetched === 0) {
               executeCleanup();
               if (!res.headersSent) {
@@ -1061,6 +1124,18 @@ router.all('/:subdomain/{*splat}', async (req, res) => {
               }
               return;
             }
+          }
+
+          if (req.telemetry && req.telemetry.masterTokenExpired) {
+            executeCleanup();
+            if (!res.headersSent) {
+              return res.status(503).json({
+                statusCode: 503,
+                error: 'MASTER_TOKEN_EXPIRED',
+                message: 'Master NovelAI session token was rejected upstream (401). Ask the administrator to push a fresh token.'
+              });
+            }
+            return;
           }
 
           if (req.telemetry && req.telemetry.lastFetched > 0 && req.telemetry.subscriptionActive === false) {
@@ -1353,9 +1428,12 @@ router.all('/:subdomain/{*splat}', async (req, res) => {
         ];
         stripHeaders.forEach(h => delete headers[h]);
 
-        headers['content-length'] = payloadBuffer.length;
+        const isBodylessUpstream = (req.method === 'GET' || req.method === 'HEAD') && payloadBuffer.length === 0;
+        if (!isBodylessUpstream) {
+          headers['content-length'] = payloadBuffer.length;
+        }
 
-        console.log(`[GuildWeave Telemetry] Forwarding piped request upstream to NovelAI: ${upstreamUrl} (Body: ${payloadBuffer.length} bytes)`);
+        console.log(`[GuildWeave Telemetry] Forwarding piped request upstream to NovelAI: ${upstreamUrl} (Method: ${req.method}, Body: ${payloadBuffer.length} bytes)`);
 
         const transport = upstreamUrl.startsWith('https:') ? https : http;
 
@@ -1482,11 +1560,16 @@ router.all('/:subdomain/{*splat}', async (req, res) => {
                         console.log(`[GuildWeave Audit Ledger] Committed PoNR ${settledNcp} personal V5 NCP debit (User: "${device.user_id}").`);
                       } else if (settledNcpSource === 'surplus') {
                         await auditEngine.recordSurplusV5Usage(device.user_id);
-                        await run(
-                          "INSERT OR REPLACE INTO config (key, value) VALUES ('v5_surplus_pool', ?)",
-                          [String(queueManager.getSurplusPool().pool)]
-                        );
-                        console.log(`[GuildWeave Audit Ledger] Committed PoNR ${settledNcp} surplus V5 NCP deduction (User: "${device.user_id}", Pool Remaining: ${queueManager.getSurplusPool().pool}).`);
+                        const latestSurplusPool = queueManager.getSurplusPool().pool;
+                        if (req.telemetry && typeof req.telemetry.persistSurplusPool === 'function') {
+                          await req.telemetry.persistSurplusPool(latestSurplusPool);
+                        } else {
+                          await run(
+                            "INSERT OR REPLACE INTO config (key, value) VALUES ('v5_surplus_pool', ?)",
+                            [String(latestSurplusPool)]
+                          );
+                        }
+                        console.log(`[GuildWeave Audit Ledger] Committed PoNR ${settledNcp} surplus V5 NCP deduction (User: "${device.user_id}", Pool Remaining: ${latestSurplusPool}).`);
                       }
                     }
                     if (shouldDeductAllowance) {
@@ -1556,7 +1639,9 @@ router.all('/:subdomain/{*splat}', async (req, res) => {
           queueManager.attachUpstreamRequest(activeTask.req_id, upstreamReq);
         }
 
-        upstreamReq.write(payloadBuffer);
+        if (payloadBuffer.length > 0) {
+          upstreamReq.write(payloadBuffer);
+        }
         upstreamReq.end();
       } catch (endErr) {
         console.error('[GuildWeave Telemetry] Fatal exception inside req.end settlement pipeline:', endErr);

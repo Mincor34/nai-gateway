@@ -533,13 +533,19 @@ if (!approved || !VPS_HOST) {
 
                     const batteryEl = container.querySelector("#guest-v5-battery");
                     if (batteryEl && data.telemetry) {
-                        const pct = typeof data.telemetry.master_v5_percent === 'number'
-                            ? `${data.telemetry.master_v5_percent.toFixed(1)}%`
-                            : '--%';
-                        const eta = typeof data.telemetry.next_percent_eta_ms === 'number' && data.telemetry.next_percent_eta_ms > 0
-                            ? ` (+1% in ${(data.telemetry.next_percent_eta_ms / 60000).toFixed(1)}m)`
-                            : '';
-                        batteryEl.textContent = `${pct} [${data.telemetry.cluster_state || 'ok'}]${eta}`;
+                        if (data.telemetry.master_token_expired) {
+                            batteryEl.innerHTML = `<span style="color:var(--theme-error, #e74c3c);">TOKEN EXPIRED</span>`;
+                        } else if (data.telemetry.last_fetched_at === 0) {
+                            batteryEl.innerHTML = `<span style="color:var(--theme-warning, #f39c12);">OFFLINE</span>`;
+                        } else {
+                            const pct = typeof data.telemetry.master_v5_percent === 'number'
+                                ? `${data.telemetry.master_v5_percent.toFixed(1)}%`
+                                : '--%';
+                            const eta = typeof data.telemetry.next_percent_eta_ms === 'number' && data.telemetry.next_percent_eta_ms > 0
+                                ? ` (+1% in ${(data.telemetry.next_percent_eta_ms / 60000).toFixed(1)}m)`
+                                : '';
+                            batteryEl.textContent = `${pct} [${data.telemetry.cluster_state || 'ok'}]${eta}`;
+                        }
                     }
 
                     const periodEl = container.querySelector("#guest-period-usage");

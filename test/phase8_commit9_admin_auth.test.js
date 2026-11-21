@@ -6,7 +6,8 @@
  *    - Serializes virtual Anlas balance, available balance (deducting cross-channel holds),
  *      monthly quota, debt state, zero_rollover, subscription-period usage, V5 banked NCP,
  *      available NCP, surplus pool availability, cluster_state (`surplus_active`, `reserve_mode`,
- *      `throttled`, `frozen`), time_until_next_percent, next_percent_eta_ms, and billing-cycle fields.
+ *      `throttled`, `frozen`, `token_expired`, `telemetry_offline`), time_until_next_percent,
+ *      next_percent_eta_ms, and billing-cycle fields.
  *    - Forwards `req.telemetry.nominalDailyCompute` into lazy `evaluateV5Accrual()` on `/auth/status`.
  *    - Preserves all legacy `/auth/status` response fields (`approved`, `tier`, `anlas_consumed`,
  *      `precise_limit`, `session`, `linked_devices`, `master_v5_percent`, `debug_*`), Admin Infinity
@@ -16,12 +17,18 @@
  *      available Anlas, active holds, debt flags, V5 banked/available/held NCP, and period counters.
  *    - `/admin/global-stats` exposes aggregate balances, debt counts, Bucket 2 surplus pool state,
  *      and live master telemetry snapshot.
- * 3. Hell Path: Onboarding Reset Gating, Cold-Boot Debt Guard & Grace-Period Freeze on `/auth/status`:
+ * 3. Hell Path: Onboarding Reset Gating, Cold-Boot Debt Guard, Grace-Period Freeze & 401 Stale-Metrics Masking:
  *    - Unapproved device polling `/auth/status` does NOT call `evaluateAnlasReset()` or stamp
  *      `last_anlas_reset_epoch` or lock in a pre-approval `Normal` quota.
  *    - Approving the device as `High` (`1000` monthlyAnlas) grants `1000` Anlas on its first post-approval poll.
  *    - Cold-boot (`lastFetched === 0 && activeCycleEpoch === null`) skips fallback reset on `/auth/status`,
- *      preserving pre-existing debt until first telemetry sync arrives.
+ *      preserving pre-existing debt until first telemetry sync arrives, and masks `master_v5_percent` to `null`
+ *      with `cluster_state: 'telemetry_offline'`.
+ *    - Mid-session `401` invalidation clears stale capacity, exposes `master_token_expired: true`,
+ *      `master_v5_percent: null`, `subscription_active: false`, and `cluster_state: 'token_expired'`
+ *      across `/auth/status` and `/admin/global-stats` until `POST /admin/update-token` refreshes it.
+ *    - `POST /admin/update-token` clears `master_token_expired` even if immediate upstream sync hits a
+ *      transient non-401 error (500).
  *    - `isGracePeriod: true` freezes Anlas resets on `/auth/status` even when `last_anlas_reset_epoch` is >30 days old.
  * 4. Hell Path: Admin Balance Injection Race (`POST /admin/adjust-balance`):
  *    - Client holds active Channel A (`held_cost = 40`, `held_ncp = 18`) and Channel B (`held_cost = 2`)
@@ -36,9 +43,12 @@
  *    - Partial paydown (`credit_amount: 50` on `-120` debt -> `-70`), `cap_at_zero: true` clamping excess
  *      credit at `0`, full forgiveness (`0`), clearing `DEBT_LOCKED` state, unlimited-tier immunity,
  *      and refusal to wipe/lower an already positive Anlas balance.
- * 6. Hell Path: Security Hardening, Input Validation, Token Normalization & Immediate Telemetry Refresh, Auth Guards, Query Arrays & Unban Cleanup:
+ * 6. Hell Path: Security Hardening, Pruned Unlinked Principal Governance, Input Validation, Token Normalization & Immediate Telemetry Refresh, Auth Guards, Query Arrays & Unban Cleanup:
  *    - Rejects `POST /auth/register` claiming reserved `browser_id: 'admin'` (`400`) or hijacking
  *      an existing non-browser canonical principal (`409`), and trims whitespace-padded `b_` IDs cleanly.
+ *    - Supports `/admin/{approve,revoke,ban,unban}` via canonical `user_id` or `browser_id` even after
+ *      device rows are pruned for unlinked `b_` principals, while rejecting empty `{}` bodies and
+ *      synthetic `'admin'` targets (`400`).
  *    - Strips leading `Bearer ` prefix from `POST /admin/update-token`, rejects `"Bearer   "` (`400`),
  *      immediately clears an inactive/non-Opus lockout in RAM without waiting 30m or restarting PM2,
  *      and verifies `syncTelemetry()` strips legacy `Bearer ` prefixes already persisted in SQLite.
@@ -87,11 +97,16 @@ cleanupFiles();
 
 const DEFAULT_SUB_EXPIRES = Math.floor(Date.now() / 1000) + (25 * 86400);
 let lastSubAuthHeader = null;
+let mockSubStatus = 200;
 
 const mockUpstream = http.createServer((req, res) => {
   const parsedUrl = new URL(req.url, `http://${req.headers.host}`);
   if (parsedUrl.pathname === '/user/subscription') {
     lastSubAuthHeader = req.headers['authorization'];
+    if (mockSubStatus !== 200) {
+      res.writeHead(mockSubStatus, { 'Content-Type': 'application/json' });
+      return res.end(JSON.stringify({ statusCode: mockSubStatus, message: 'Upstream error' }));
+    }
     res.writeHead(200, { 'Content-Type': 'application/json' });
     return res.end(JSON.stringify({
       tier: 3,
@@ -279,6 +294,7 @@ test('Phase 8 Commit 9: Administrative Telemetry, Governance & Dual-Ledger Statu
     assert.strictEqual(d.telemetry.cluster_state, 'surplus_active');
     assert.strictEqual(d.telemetry.subscription_active, true);
     assert.strictEqual(d.telemetry.is_grace_period, false);
+    assert.strictEqual(d.telemetry.master_token_expired, false);
     assert.strictEqual(d.subscription_period.anlas_consumed, 45);
     assert.strictEqual(d.subscription_period.v5_consumed, 5);
 
@@ -390,9 +406,9 @@ test('Phase 8 Commit 9: Administrative Telemetry, Governance & Dual-Ledger Statu
   });
 
   // ---------------------------------------------------------------------------
-  // 3. HELL PATH: ONBOARDING RESET GATING, COLD-BOOT GUARD & GRACE FREEZE
+  // 3. HELL PATH: ONBOARDING RESET GATING, COLD-BOOT MASKING, 401 EXPIRY & GRACE FREEZE
   // ---------------------------------------------------------------------------
-  await t.test('Hell Path: /auth/status gates resets behind approval, cold-boot telemetry & grace period', async () => {
+  await t.test('Hell Path: /auth/status gates resets, masks cold-boot & 401-expired metrics cleanly until refresh', async () => {
     queueManager.reset();
 
     // 1. Register unapproved onboarding device (defaults to Normal in users table)
@@ -445,7 +461,7 @@ test('Phase 8 Commit 9: Administrative Telemetry, Governance & Dual-Ledger Statu
     assert.strictEqual(gracePoll.data.anlas.is_in_debt, true);
     assert.strictEqual(gracePoll.data.telemetry.is_grace_period, true);
 
-    // 3. Cold-boot guard (lastFetched === 0 && activeCycleEpoch === null): must skip 30-day fallback reset
+    // 3. Cold-boot guard (lastFetched === 0 && activeCycleEpoch === null): skips fallback reset AND masks stale percent
     serverModule.resetTelemetryState({ lastFetchedAt: 0, activeCycleEpoch: 0 });
     const coldBootPoll = await queryGateway('/auth/status?browser_id=dev_debt9', 'GET', {
       'Authorization': 'Bearer sec_debt9'
@@ -453,6 +469,64 @@ test('Phase 8 Commit 9: Administrative Telemetry, Governance & Dual-Ledger Statu
     assert.strictEqual(coldBootPoll.status, 200);
     assert.strictEqual(coldBootPoll.data.anlas.virtual_balance, -120, 'Cold boot without cycle telemetry must skip 30-day fallback reset');
     assert.strictEqual(coldBootPoll.data.telemetry.last_fetched_at, 0);
+    assert.strictEqual(coldBootPoll.data.master_v5_percent, null, 'Cold boot must not expose phantom cached battery percent');
+    assert.strictEqual(coldBootPoll.data.telemetry.master_v5_percent, null);
+    assert.strictEqual(coldBootPoll.data.telemetry.cluster_state, 'telemetry_offline');
+
+    // 4. Mid-session upstream 401 -> clears stale 80% capacity and exposes explicit token_expired state across /auth/status and /admin/global-stats
+    serverModule.applyUsageTelemetry({
+      tier: 3, active: true, expiresAt: DEFAULT_SUB_EXPIRES,
+      trainingStepsLeft: { fixedTrainingStepsLeft: 9000, purchasedTrainingSteps: 0 },
+      isGracePeriod: false,
+      usage: { percent: 80, timeUntilNextPercent: 7200, isNegative: false }
+    }, undefined, Date.now());
+    mockSubStatus = 401;
+    try {
+      await assert.rejects(() => serverModule.syncTelemetry({ rescheduleHeartbeat: false }), /401/);
+    } finally {
+      mockSubStatus = 200;
+    }
+
+    const expiredAuthPoll = await queryGateway('/auth/status?browser_id=dev_alice_1', 'GET', {
+      'Authorization': 'Bearer sec_alice_1'
+    });
+    assert.strictEqual(expiredAuthPoll.status, 200);
+    assert.strictEqual(expiredAuthPoll.data.master_v5_percent, null);
+    assert.strictEqual(expiredAuthPoll.data.telemetry.master_v5_percent, null);
+    assert.strictEqual(expiredAuthPoll.data.telemetry.master_token_expired, true);
+    assert.strictEqual(expiredAuthPoll.data.telemetry.cluster_state, 'token_expired');
+    assert.strictEqual(expiredAuthPoll.data.telemetry.subscription_active, false);
+    assert.strictEqual(expiredAuthPoll.data.telemetry.is_hard_locked, true);
+
+    const expiredStats = await queryGateway('/admin/global-stats', 'GET', adminHeaders);
+    assert.strictEqual(expiredStats.status, 200);
+    assert.strictEqual(expiredStats.data.telemetry.master_v5_percent, null);
+    assert.strictEqual(expiredStats.data.telemetry.master_token_expired, true);
+    assert.strictEqual(expiredStats.data.telemetry.master_anlas, null);
+    assert.strictEqual(expiredStats.data.telemetry.is_hard_locked, true);
+
+    // 4b. Pushing a new token while upstream has a transient 500 must still clear stale master_token_expired
+    mockSubStatus = 500;
+    try {
+      const transientPushRes = await queryGateway('/admin/update-token', 'POST', adminHeaders, {
+        master_token: 'fresh_token_during_500'
+      });
+      assert.strictEqual(transientPushRes.status, 200);
+      const after500Stats = await queryGateway('/admin/global-stats', 'GET', adminHeaders);
+      assert.strictEqual(after500Stats.data.telemetry.master_token_expired, false, 'New token push must clear old 401 token_expired flag even if sync hits transient 500');
+    } finally {
+      mockSubStatus = 200;
+    }
+
+    // Pushing fresh token via POST /admin/update-token immediately restores telemetry
+    const refreshRes = await queryGateway('/admin/update-token', 'POST', adminHeaders, {
+      master_token: 'fresh_restored_token'
+    });
+    assert.strictEqual(refreshRes.status, 200);
+    const restoredStats = await queryGateway('/admin/global-stats', 'GET', adminHeaders);
+    assert.strictEqual(restoredStats.data.telemetry.master_token_expired, false);
+    assert.strictEqual(restoredStats.data.telemetry.subscription_active, true);
+    assert.ok(restoredStats.data.telemetry.master_v5_percent >= 80);
 
     // Restore healthy telemetry & clean u_debt9 epoch
     serverModule.resetTelemetryState({
@@ -667,9 +741,9 @@ test('Phase 8 Commit 9: Administrative Telemetry, Governance & Dual-Ledger Statu
   });
 
   // ---------------------------------------------------------------------------
-  // 6. HELL PATH: SECURITY, TOKEN NORMALIZATION, VALIDATION, AUTH GUARDS & UNBAN CLEANUP
+  // 6. HELL PATH: SECURITY, PRUNED UNLINKED GOVERNANCE, TOKEN NORMALIZATION, VALIDATION & UNBAN CLEANUP
   // ---------------------------------------------------------------------------
-  await t.test('Hell Path: Enforces reserved IDs, token Bearer normalization & immediate telemetry refresh, hijack guards, validation & unban cleanup', async () => {
+  await t.test('Hell Path: Enforces pruned unlinked user governance, reserved IDs, token Bearer normalization, hijack guards, validation & unban cleanup', async () => {
     for (const reservedId of ['admin', 'ADMIN', '  admin  ']) {
       const regAdminRes = await queryGateway('/auth/register', 'POST', {}, {
         browser_id: reservedId,
@@ -699,19 +773,56 @@ test('Phase 8 Commit 9: Administrative Telemetry, Governance & Dual-Ledger Statu
     assert.ok(await dbModule.get("SELECT browser_id FROM devices WHERE browser_id = 'b_padded_clean'"));
     assert.strictEqual(await dbModule.get("SELECT browser_id FROM devices WHERE browser_id = '  b_padded_clean  '"), undefined);
 
-    // 1d. Pruned unlinked b_ device CAN cleanly re-register
+    // 1d. Register -> prune device -> verify /admin/{approve,ban,unban,revoke} govern the orphaned `b_` user row
+    //     and confirm pruned unlinked b_ device CAN cleanly re-register
     await queryGateway('/auth/register', 'POST', {}, {
       browser_id: 'b_pruned_rejoin',
       device_secret: 'sec_pruned_rejoin',
       label: 'Pruned Guest'
     });
     await queryGateway('/admin/prune-device', 'POST', adminHeaders, { browser_id: 'b_pruned_rejoin' });
+
+    const prunedApproveRes = await queryGateway('/admin/approve', 'POST', adminHeaders, {
+      user_id: 'b_pruned_rejoin',
+      priority_tier: 'High'
+    });
+    assert.strictEqual(prunedApproveRes.status, 200);
+    assert.strictEqual((await dbModule.get("SELECT priority_tier FROM users WHERE user_id = 'b_pruned_rejoin'")).priority_tier, 'High');
+
+    const prunedBanViaLegacyBrowserField = await queryGateway('/admin/ban', 'POST', adminHeaders, {
+      browser_id: 'b_pruned_rejoin',
+      reason: 'Abuse prior to pruning'
+    });
+    assert.strictEqual(prunedBanViaLegacyBrowserField.status, 200);
+    assert.strictEqual(
+      (await dbModule.get("SELECT banned, ban_reason FROM users WHERE user_id = 'b_pruned_rejoin'")).banned,
+      1,
+      'Banning a pruned unlinked user must set users.banned = 1 even when devices row is absent'
+    );
+
+    const prunedUnbanRes = await queryGateway('/admin/unban', 'POST', adminHeaders, {
+      user_id: 'b_pruned_rejoin'
+    });
+    assert.strictEqual(prunedUnbanRes.status, 200);
+    assert.strictEqual((await dbModule.get("SELECT banned FROM users WHERE user_id = 'b_pruned_rejoin'")).banned, 0);
+
+    const prunedRevokeRes = await queryGateway('/admin/revoke', 'POST', adminHeaders, {
+      user_id: 'b_pruned_rejoin'
+    });
+    assert.strictEqual(prunedRevokeRes.status, 200);
+
     const reRegRes = await queryGateway('/auth/register', 'POST', {}, {
       browser_id: 'b_pruned_rejoin',
       device_secret: 'sec_pruned_rejoin',
       label: 'Rejoined Guest'
     });
     assert.strictEqual(reRegRes.status, 200, 'Pruned unlinked b_ device must be able to re-register');
+
+    // Empty {} and browser_id: 'admin' governance requests must fail with 400 rather than 200 no-op
+    for (const ep of ['/admin/approve', '/admin/revoke', '/admin/ban', '/admin/unban']) {
+      assert.strictEqual((await queryGateway(ep, 'POST', adminHeaders, {})).status, 400, `Empty body on ${ep} must return 400`);
+      assert.strictEqual((await queryGateway(ep, 'POST', adminHeaders, { browser_id: 'admin' })).status, 400, `browser_id: admin on ${ep} must return 400`);
+    }
 
     // Token normalization: POST /admin/update-token strips leading "Bearer " prefix, rejects empty prefix,
     // and immediately clears an inactive non-Opus subscription lockout without waiting 30m or restarting PM2
@@ -826,6 +937,10 @@ test('Phase 8 Commit 9: Administrative Telemetry, Governance & Dual-Ledger Statu
     );
     assert.strictEqual(
       (await queryGateway('/admin/approve', 'POST', adminHeaders, { browser_id: ['dev_alice_1'], priority_tier: 'Normal' })).status,
+      400
+    );
+    assert.strictEqual(
+      (await queryGateway('/admin/ban', 'POST', adminHeaders, { user_id: 'admin' })).status,
       400
     );
     assert.strictEqual(

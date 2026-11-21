@@ -4,7 +4,8 @@
  * Exhaustively exercises the decoupled Level 2 Audit Engine:
  * 1. Stateless Buffer Parsing:
  *    - Validates extraction from raw application/json buffers.
- *    - Validates extraction from complex multipart/form-data boundaries.
+ *    - Validates extraction from complex multipart/form-data boundaries, segregating
+ *      Character References (director_reference_images*) from Vibe Transfer (reference_image_multiple).
  *    - Hell Path: Binary part preceding name="request" (verifies zero UTF-16 string bloat).
  *    - Hell Path: Delimiter confusion where prompt contains boundary names and CRLF markdown dividers.
  *    - Hell Path: Mixed CRLF and LF multipart header delimiters.
@@ -97,12 +98,13 @@ test("Phase 4: Decoupled Audit Engine & Parameter Extraction Verification", asyn
     assert.strictEqual(extracted.inpaintImg2ImgStrength, 0.3);
   });
 
-  await t.test("Extractor: Accurately parses complex multipart/form-data boundaries", () => {
+  await t.test("Extractor: Accurately parses complex multipart/form-data boundaries and segregates Character Refs vs Vibe Transfer", () => {
     const jsonBlob = JSON.stringify({
       model: "nai-diffusion-4-5-full",
       parameters: {
         width: 1024, height: 1024, steps: 20, n_samples: 1,
-        reference_image_multiple: ["ref1", "ref2"]
+        director_reference_images: ["char1", "char2"],
+        reference_image_multiple: ["vibe1", "vibe2", "vibe3"]
       }
     });
 
@@ -126,7 +128,8 @@ Content-Type: image/png
     assert.strictEqual(extracted.width, 1024);
     assert.strictEqual(extracted.steps, 20);
     assert.strictEqual(extracted.model, "nai-diffusion-4-5-full");
-    assert.strictEqual(extracted.precise_ref_count, 2, "Must aggregate precise character references accurately");
+    assert.strictEqual(extracted.precise_ref_count, 2, "Must count director_reference_images as precise references");
+    assert.strictEqual(extracted.vibe_reference_count, 3, "Must route reference_image_multiple into vibe_reference_count");
   });
 
   await t.test("Hell Path: Multipart Delimiter Collision & Binary Precedence", () => {
@@ -288,7 +291,7 @@ Content-Type: image/png
     assert.ok(discordBan);
     assert.match(discordBan.reason, /suppressed X-Gen-Model header/i);
 
-    // ADDITIVE INVARIANT ASSERTION: Bare 'nai-diffusion-5' variant must also trigger full database ban ledger
+    // ADDITIVE INVARIANT ASSERTION: Bare 'nai-diffusion-5' variant without full/curated suffixes also triggers permanent ban
     const browserIdBare = "stealth_v5_bare_client";
     const discordIdBare = "discord_stealth_bare";
     await run('INSERT INTO devices (browser_id, device_secret, discord_id, priority_tier, approved, banned) VALUES (?, ?, ?, ?, 1, 0)', 
