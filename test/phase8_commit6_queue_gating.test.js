@@ -270,9 +270,9 @@ test('Phase 8 Commit 6: Queue Ingress Gating & Model-Aware Compute Reservation',
     queueManager.reset();
 
     // Set timeUntilNextPercent = 5000s => raw C_base = (86400 / 5000) * 17.28 = 298.5984
-    // u_a (2), u_b (2), u_debt (2), u_low_anlas (2) => totalWeight = 8 (u_banned_c6 excluded)
-    // Nominal Daily NCP = floor(298.5984 * 18) = 5374; share (2/8) = floor(5374 * 0.25) = 1343 NCP
-    // (Whereas fallback 190.0 would yield floor(3420 * 0.25) = 855 NCP)
+    // u_a (2), u_b (2), u_debt (2), u_low_anlas (2), implicit Admin (4) => totalWeight = 12 (u_banned_c6 excluded)
+    // Nominal Daily NCP = floor(298.5984 * 18) = 5374; share (2/12) = floor(5374 * (2/12)) = 895 NCP
+    // (Whereas fallback 190.0 would yield floor(3420 * (2/12)) = 570 NCP)
     serverModule.applyUsageTelemetry({ usage: { percent: 80, timeUntilNextPercent: 5000, isNegative: false } });
 
     // Rewind u_b's v5_last_accrual_epoch by 25 hours so evaluateV5Accrual triggers on join
@@ -294,8 +294,8 @@ test('Phase 8 Commit 6: Queue Ingress Gating & Model-Aware Compute Reservation',
     const updatedB = await dbModule.get("SELECT v5_banked_balance FROM users WHERE user_id = 'u_b'");
     assert.strictEqual(
       updatedB.v5_banked_balance,
-      1343,
-      'Must forward live telemetry nominalDailyCompute (1343 NCP) instead of falling back to 190.0 (855 NCP)'
+      895,
+      'Must forward live telemetry nominalDailyCompute (895 NCP) instead of falling back to 190.0 (570 NCP)'
     );
 
     queueManager.complete('req_cbase_forward', 'dev_b');

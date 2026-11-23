@@ -1,7 +1,9 @@
 /**
  * LEVEL 4: AUTHENTICATION ROUTER (routes/authRouter.js)
  * Manages device registration, nicknames, client authorization queries, dual-ledger status
- * serialization, and in-band diagnostic intent signaling.
+ * serialization, cycle-segregated period usage telemetry, physical master-tank solvency
+ * bounds on reported V5 availability, and in-band diagnostic intent signaling.
+ * Rejects HTML/control-character payloads in device labels to prevent stored XSS in Admin UI.
  * Masks uninitialized or 401-invalidated telemetry to prevent phantom capacity exposure.
  * Relational Normalization: Integrates canonical users and physical devices tables.
  */
@@ -15,6 +17,11 @@ const auditEngine = require('../auditEngine');
 const { loadConfig } = require('../config');
 
 const router = express.Router();
+
+const MAX_LABEL_LENGTH = 64;
+const UNSAFE_LABEL_REGEX = /[<>]|[\x00-\x1F\x7F]/;
+const V5_HIGH_IMAGES_PER_PERCENT = 17.28;
+const V5_HIGH_NCP_COST = 18;
 
 function getConfig() {
   return loadConfig(process.env);
@@ -32,6 +39,20 @@ function extractBearerToken(authHeader) {
   }
   const token = authHeader.slice(7).trim();
   return token.length > 0 ? token : null;
+}
+
+/**
+ * Validates that a device label is a non-empty string devoid of HTML tags or control bytes.
+ *
+ * @param {*} label - Candidate device label.
+ * @returns {string|null} Trimmed safe label or null if invalid.
+ */
+function sanitizeDeviceLabel(label) {
+  if (typeof label !== 'string') return null;
+  const trimmed = label.trim();
+  if (trimmed.length === 0 || trimmed.length > MAX_LABEL_LENGTH) return null;
+  if (UNSAFE_LABEL_REGEX.test(trimmed)) return null;
+  return trimmed;
 }
 
 /**
@@ -106,8 +127,14 @@ router.post('/register', async (req, res) => {
   if (cleanBrowserId.toLowerCase() === 'admin') {
     return res.status(400).json({ error: 'Reserved identifier.' });
   }
-  if (label !== undefined && label !== null && typeof label !== 'string') {
-    return res.status(400).json({ error: 'Bad parameters' });
+
+  let cleanLabel = 'Guest Instance';
+  if (label !== undefined && label !== null) {
+    const validatedLabel = sanitizeDeviceLabel(label);
+    if (!validatedLabel) {
+      return res.status(400).json({ error: 'Bad parameters' });
+    }
+    cleanLabel = validatedLabel;
   }
   
   try {
@@ -136,7 +163,7 @@ router.post('/register', async (req, res) => {
       `INSERT OR IGNORE INTO devices (
         browser_id, user_id, device_secret, label, approved, total_requests, last_active_at
       ) VALUES (?, ?, ?, ?, 0, 0, ?)`,
-      [cleanBrowserId, cleanBrowserId, device_secret, label || 'Guest Instance', now]
+      [cleanBrowserId, cleanBrowserId, device_secret, cleanLabel, now]
     );
 
     res.json({ success: true });
@@ -153,11 +180,9 @@ router.post('/update-label', async (req, res) => {
   if (!body) return res.status(400).json({ error: 'Missing parameters' });
   const { browser_id, label } = body;
 
-  if (
-    typeof browser_id !== 'string' || browser_id.trim().length === 0 ||
-    typeof label !== 'string' || label.trim().length === 0
-  ) {
-    return res.status(400).json({ error: 'Missing parameters' });
+  const cleanLabel = sanitizeDeviceLabel(label);
+  if (typeof browser_id !== 'string' || browser_id.trim().length === 0 || !cleanLabel) {
+    return res.status(400).json({ error: 'Missing or invalid parameters' });
   }
 
   try {
@@ -167,8 +192,8 @@ router.post('/update-label', async (req, res) => {
       return res.status(auth.status).json({ error: 'Unauthorized nickname change' });
     }
 
-    await run('UPDATE devices SET label = ? WHERE browser_id = ?', [label, browser_id]);
-    console.log(`[GuildWeave Telemetry] Device "${browser_id}" updated nickname: "${label}"`);
+    await run('UPDATE devices SET label = ? WHERE browser_id = ?', [cleanLabel, browser_id]);
+    console.log(`[GuildWeave Telemetry] Device "${browser_id}" updated nickname: "${cleanLabel}"`);
     res.json({ success: true });
   } catch (err) { 
     console.error('[GuildWeave Telemetry] Update label exception:', err);
@@ -278,6 +303,20 @@ router.get('/status', async (req, res) => {
       )
       : null;
 
+    // Resolve cycle-segregated period telemetry from `period_usage`, falling back safely to
+    // `users.subscription_period_*` only when the user row matches the active cycle epoch
+    // (prevents inactive users' stale Cycle 1 totals from bleeding into Cycle 2).
+    const activeCycleEpoch = (req.telemetry && typeof req.telemetry.activeCycleEpoch === 'number' && req.telemetry.activeCycleEpoch > 0)
+      ? req.telemetry.activeCycleEpoch
+      : 0;
+    const periodRow = await get(
+      `SELECT anlas_consumed, v5_high_gens, v5_medium_gens, legacy_image_gens,
+              vibe_encodes, upscale_gens, text_gens
+       FROM period_usage
+       WHERE cycle_epoch = ? AND user_id = ?`,
+      [activeCycleEpoch, device.user_id]
+    );
+
     let allowanceInfo = null;
     if (tierConfig && tierConfig.maxAllowance !== Infinity) {
       // Evaluate allowance against canonical user_id (shared pool across all user devices)
@@ -313,27 +352,30 @@ router.get('/status', async (req, res) => {
       ? false
       : (balanceInfo ? balanceInfo.is_in_debt : ((virtualBalance || 0) < 0));
     const lifetimeAnlasConsumed = userRow?.anlas_consumed ?? device.anlas_consumed ?? 0;
-    const subPeriodAnlas = userRow?.subscription_period_anlas ?? 0;
-    const subPeriodV5 = userRow?.subscription_period_v5 ?? 0;
-    const subPeriodStart = userRow?.subscription_period_start_epoch ?? null;
 
-    // Derive V5 Dual-Bucket NCP view
-    const isV5Unlimited = device.user_id === 'admin';
-    const heldPersonalNcp = queueManager.getHeldNcpForUser(device.user_id, 'personal');
-    const heldSurplusUserNcp = queueManager.getHeldNcpForUser(device.user_id, 'surplus');
-    const rawV5Banked = v5Accrual
-      ? v5Accrual.v5_banked_balance
-      : Math.max(0, Math.trunc(userRow?.v5_banked_balance || 0));
-    const v5BankedNcp = (isV5Unlimited || !Number.isFinite(rawV5Banked)) ? null : rawV5Banked;
-    const v5AvailableNcp = v5BankedNcp === null ? null : Math.max(0, v5BankedNcp - heldPersonalNcp);
-    const v5DailyShareNcp = (v5Accrual && Number.isFinite(v5Accrual.daily_share_ncp)) ? v5Accrual.daily_share_ncp : null;
-    const v5MaxBankNcp = (v5Accrual && Number.isFinite(v5Accrual.max_bank_ncp)) ? v5Accrual.max_bank_ncp : null;
+    const userRowMatchesActiveCycle = Boolean(
+      userRow && (
+        activeCycleEpoch === 0 ||
+        userRow.subscription_period_start_epoch === activeCycleEpoch
+      )
+    );
+    const periodV5High = periodRow ? (periodRow.v5_high_gens || 0) : 0;
+    const periodV5Med = periodRow ? (periodRow.v5_medium_gens || 0) : 0;
+    const periodV5FromArchive = periodV5High + periodV5Med;
+    const userPeriodAnlas = userRowMatchesActiveCycle ? (userRow.subscription_period_anlas ?? 0) : 0;
+    const userPeriodV5 = userRowMatchesActiveCycle ? (userRow.subscription_period_v5 ?? 0) : 0;
 
-    const surplusState = queueManager.getSurplusPool();
-    const surplusHeldTotal = queueManager.getHeldSurplusNcp();
-    const surplusAvailableNcp = queueManager.getAvailableSurplusNcp();
+    const subPeriodAnlas = periodRow
+      ? Math.max(periodRow.anlas_consumed || 0, userPeriodAnlas)
+      : userPeriodAnlas;
+    const subPeriodV5 = periodRow
+      ? Math.max(periodV5FromArchive, userPeriodV5)
+      : userPeriodV5;
+    const subPeriodStart = activeCycleEpoch > 0
+      ? activeCycleEpoch
+      : (userRow?.subscription_period_start_epoch ?? null);
 
-    // Derive Master Telemetry & Replenishment Countdown view
+    // Derive Master Telemetry & Physical Solvency Ceiling
     const telemetrySnap = (req.telemetry && typeof req.telemetry.getProjectionSnapshot === 'function')
       ? req.telemetry.getProjectionSnapshot(now)
       : {
@@ -345,12 +387,40 @@ router.get('/status', async (req, res) => {
         masterTokenExpired: req.telemetry?.masterTokenExpired ?? false,
         nominalDailyCompute: req.telemetry?.nominalDailyCompute ?? config.NOMINAL_DAILY_V5_COMPUTE,
         timeUntilNextPercent: req.telemetry?.timeUntilNextPercent ?? null,
-        activePeriodSeconds: req.telemetry?.activePeriodSeconds ?? ((86400 * 17.28) / config.NOMINAL_DAILY_V5_COMPUTE),
+        activePeriodSeconds: req.telemetry?.activePeriodSeconds ?? ((86400 * V5_HIGH_IMAGES_PER_PERCENT) / config.NOMINAL_DAILY_V5_COMPUTE),
         subscriptionActive: req.telemetry?.subscriptionActive ?? true,
         isGracePeriod: req.telemetry?.isGracePeriod ?? false,
         masterExpiresAt: req.telemetry?.masterExpiresAt ?? null,
         activeCycleEpoch: req.telemetry?.activeCycleEpoch ?? null
       };
+
+    const spendableMasterNcp = (telemetrySnap.lastFetched > 0 && !telemetrySnap.masterTokenExpired)
+      ? ((telemetrySnap.isHardLocked || !telemetrySnap.subscriptionActive)
+        ? 0
+        : Math.floor(Math.max(0, telemetrySnap.rawProjected - config.V5_CIRCUIT_BREAKER_PERCENT) * V5_HIGH_IMAGES_PER_PERCENT * V5_HIGH_NCP_COST))
+      : null;
+
+    // Derive V5 Dual-Bucket NCP view, capping effective available credits to physical master headroom
+    const isV5Unlimited = device.user_id === 'admin';
+    const heldPersonalNcp = queueManager.getHeldNcpForUser(device.user_id, 'personal');
+    const heldSurplusUserNcp = queueManager.getHeldNcpForUser(device.user_id, 'surplus');
+    const rawV5Banked = v5Accrual
+      ? v5Accrual.v5_banked_balance
+      : Math.max(0, Math.trunc(userRow?.v5_banked_balance || 0));
+    const v5BankedNcp = (isV5Unlimited || !Number.isFinite(rawV5Banked)) ? null : rawV5Banked;
+    const uncappedAvailableNcp = v5BankedNcp === null ? null : Math.max(0, v5BankedNcp - heldPersonalNcp);
+    const v5AvailableNcp = uncappedAvailableNcp === null
+      ? null
+      : (spendableMasterNcp !== null ? Math.min(uncappedAvailableNcp, spendableMasterNcp) : uncappedAvailableNcp);
+    const v5DailyShareNcp = (v5Accrual && Number.isFinite(v5Accrual.daily_share_ncp)) ? v5Accrual.daily_share_ncp : null;
+    const v5MaxBankNcp = (v5Accrual && Number.isFinite(v5Accrual.max_bank_ncp)) ? v5Accrual.max_bank_ncp : null;
+
+    const surplusState = queueManager.getSurplusPool();
+    const surplusHeldTotal = queueManager.getHeldSurplusNcp();
+    const rawSurplusAvailableNcp = queueManager.getAvailableSurplusNcp();
+    const surplusAvailableNcp = spendableMasterNcp !== null
+      ? Math.min(rawSurplusAvailableNcp, spendableMasterNcp)
+      : rawSurplusAvailableNcp;
 
     const isColdOrExpired = telemetrySnap.lastFetched === 0;
     const nextPercentEtaMs = computeNextPercentEtaMs(telemetrySnap);
@@ -382,6 +452,7 @@ router.get('/status', async (req, res) => {
       v5: {
         banked_ncp: v5BankedNcp,
         available_ncp: v5AvailableNcp,
+        spendable_master_ncp: spendableMasterNcp,
         held_ncp: heldPersonalNcp + heldSurplusUserNcp,
         held_personal_ncp: heldPersonalNcp,
         held_surplus_ncp: heldSurplusUserNcp,
@@ -417,6 +488,12 @@ router.get('/status', async (req, res) => {
       subscription_period: {
         anlas_consumed: subPeriodAnlas,
         v5_consumed: subPeriodV5,
+        v5_high_gens: periodV5High,
+        v5_medium_gens: periodV5Med,
+        legacy_image_gens: periodRow ? (periodRow.legacy_image_gens || 0) : 0,
+        vibe_encodes: periodRow ? (periodRow.vibe_encodes || 0) : 0,
+        upscale_gens: periodRow ? (periodRow.upscale_gens || 0) : 0,
+        text_gens: periodRow ? (periodRow.text_gens || 0) : 0,
         start_epoch: subPeriodStart
       }
     });

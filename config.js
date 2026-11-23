@@ -31,6 +31,7 @@ const PROXY_PATH_WHITELIST = Object.freeze(new Set([
   'ai/generate-image',
   'ai/generate-image-stream',
   'ai/encode-vibe',      // Whitelisted path to support vibe transfer pre-processing via master token
+  'ai/upscale',          // Whitelisted path to support Anlas-billed image upscaling via master token
   'ai/generate-stream',  // Legacy Text/story Generation API endpoint
   'oa/v1/completions',   // New OpenAI-compatible Text Generation API endpoint (GLM-4, Erato, Xialong, etc.)
   'user/subscription'    // Allow proxying of read-only subscription telemetry to spoof native UI meters

@@ -134,6 +134,16 @@
   var FIREWALL_MAX_PIXELS = 1048576;
   var FIREWALL_MAX_STEPS = 28;
   var FIREWALL_MAX_SAMPLES = 1;
+  var UPSCALE_COST_BUCKETS = [
+    [1048576, 1],
+    [1747627, 2],
+    [2446678, 3],
+    [3145728, 4]
+  ];
+  var UPSCALE_FAST_BYTES = 65536;
+  var UPSCALE_JPEG_MAX_BYTES = 2097152;
+  var BASE64_FAST_CHARS = 87384;
+  var BASE64_JPEG_MAX_CHARS = 2796200;
   function isV5ModelFamily(model) {
     if (typeof model !== "string") return false;
     const trimmed = model.trim();
@@ -176,6 +186,240 @@
       }
     }
     return fallback;
+  }
+  function extractImageDimensionsFromBytes(bytes) {
+    if (!bytes || !(bytes instanceof Uint8Array) || bytes.length < 10) {
+      return null;
+    }
+    const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+    if (bytes.length >= 24 && bytes[0] === 137 && bytes[1] === 80 && bytes[2] === 78 && bytes[3] === 71 && bytes[4] === 13 && bytes[5] === 10 && bytes[6] === 26 && bytes[7] === 10 && bytes[12] === 73 && bytes[13] === 72 && bytes[14] === 68 && bytes[15] === 82) {
+      const width = view.getUint32(16, false);
+      const height = view.getUint32(20, false);
+      return width > 0 && height > 0 ? { width, height, format: "png" } : null;
+    }
+    if (bytes.length >= 30 && bytes[0] === 82 && bytes[1] === 73 && bytes[2] === 70 && bytes[3] === 70 && bytes[8] === 87 && bytes[9] === 69 && bytes[10] === 66 && bytes[11] === 80) {
+      const tag = String.fromCharCode(bytes[12], bytes[13], bytes[14], bytes[15]);
+      if (tag === "VP8 ") {
+        if ((bytes[20] & 1) === 0 && bytes[23] === 157 && bytes[24] === 1 && bytes[25] === 42) {
+          const width = view.getUint16(26, true) & 16383;
+          const height = view.getUint16(28, true) & 16383;
+          return width > 0 && height > 0 ? { width, height, format: "webp" } : null;
+        }
+        return null;
+      }
+      if (tag === "VP8L") {
+        if (bytes[20] === 47) {
+          const bits = view.getUint32(21, true);
+          const width = (bits & 16383) + 1;
+          const height = (bits >> 14 & 16383) + 1;
+          return width > 0 && height > 0 ? { width, height, format: "webp" } : null;
+        }
+        return null;
+      }
+      if (tag === "VP8X") {
+        const width = 1 + (bytes[24] | bytes[25] << 8 | bytes[26] << 16);
+        const height = 1 + (bytes[27] | bytes[28] << 8 | bytes[29] << 16);
+        return width > 0 && height > 0 ? { width, height, format: "webp" } : null;
+      }
+      return null;
+    }
+    if (bytes.length >= 4 && bytes[0] === 255 && bytes[1] === 216) {
+      let pos = 2;
+      while (pos + 1 < bytes.length) {
+        if (bytes[pos] !== 255) {
+          pos++;
+          continue;
+        }
+        while (pos + 1 < bytes.length && bytes[pos + 1] === 255) {
+          pos++;
+        }
+        if (pos + 1 >= bytes.length) break;
+        const marker = bytes[pos + 1];
+        pos += 2;
+        if (marker === 0 || marker === 1 || marker >= 208 && marker <= 216) {
+          continue;
+        }
+        if (marker === 217 || marker === 218) break;
+        if (pos + 2 > bytes.length) break;
+        const segLen = view.getUint16(pos, false);
+        if (segLen < 2 || pos + segLen > bytes.length) break;
+        const isSof = marker >= 192 && marker <= 195 || marker >= 197 && marker <= 199 || marker >= 201 && marker <= 203 || marker >= 205 && marker <= 207;
+        if (isSof && segLen >= 7 && pos + 7 <= bytes.length) {
+          const height = view.getUint16(pos + 3, false);
+          const width = view.getUint16(pos + 5, false);
+          return width > 0 && height > 0 ? { width, height, format: "jpeg" } : null;
+        }
+        pos += segLen;
+      }
+      return null;
+    }
+    if (bytes.length >= 10 && bytes[0] === 71 && bytes[1] === 73 && bytes[2] === 70 && bytes[3] === 56 && (bytes[4] === 55 || bytes[4] === 57) && bytes[5] === 97) {
+      const width = view.getUint16(6, true);
+      const height = view.getUint16(8, true);
+      return width > 0 && height > 0 ? { width, height, format: "gif" } : null;
+    }
+    if (bytes.length >= 22 && bytes[0] === 66 && bytes[1] === 77) {
+      const dibSize = view.getUint32(14, true);
+      if (dibSize === 12) {
+        const width = view.getUint16(18, true);
+        const height = view.getUint16(20, true);
+        return width > 0 && height > 0 ? { width, height, format: "bmp" } : null;
+      }
+      if (bytes.length >= 26) {
+        const width = view.getInt32(18, true);
+        const height = Math.abs(view.getInt32(22, true));
+        return width > 0 && height > 0 ? { width, height, format: "bmp" } : null;
+      }
+    }
+    return null;
+  }
+  function extractDimensionsFromBase64Browser(rawImageStr) {
+    if (typeof rawImageStr !== "string" || typeof atob !== "function") return null;
+    const trimmed = rawImageStr.trim();
+    const commaIdx = trimmed.startsWith("data:image/") ? trimmed.indexOf(",") : -1;
+    const cleanB64 = (commaIdx !== -1 ? trimmed.slice(commaIdx + 1) : trimmed).replace(/\s+/g, "");
+    if (cleanB64.length === 0) return null;
+    const decodeSlice = (len) => {
+      const aligned = len - len % 4;
+      if (aligned <= 0) return null;
+      const binStr = atob(cleanB64.slice(0, aligned));
+      const bytes = new Uint8Array(binStr.length);
+      for (let i = 0; i < binStr.length; i++) {
+        bytes[i] = binStr.charCodeAt(i);
+      }
+      return extractImageDimensionsFromBytes(bytes);
+    };
+    const fastLen = Math.min(cleanB64.length, BASE64_FAST_CHARS);
+    const fastDims = decodeSlice(fastLen);
+    if (fastDims) return fastDims;
+    if (cleanB64.startsWith("/9j/") && cleanB64.length > BASE64_FAST_CHARS) {
+      return decodeSlice(Math.min(cleanB64.length, BASE64_JPEG_MAX_CHARS));
+    }
+    return null;
+  }
+  async function extractUpscaleBodyParams(body) {
+    if (!body) return null;
+    try {
+      if (typeof FormData !== "undefined" && body instanceof FormData) {
+        const imgPart = body.get("image");
+        if (!imgPart) return null;
+        if (typeof Blob !== "undefined" && imgPart instanceof Blob) {
+          const headerSlice = typeof imgPart.slice === "function" ? imgPart.slice(0, UPSCALE_FAST_BYTES) : imgPart;
+          const fastBytes = new Uint8Array(await headerSlice.arrayBuffer());
+          const fastDims = extractImageDimensionsFromBytes(fastBytes);
+          if (fastDims) return fastDims;
+          if (fastBytes.length >= 2 && fastBytes[0] === 255 && fastBytes[1] === 216 && typeof imgPart.slice === "function" && (imgPart.size || 0) > UPSCALE_FAST_BYTES) {
+            const jpegSlice = imgPart.slice(0, Math.min(imgPart.size, UPSCALE_JPEG_MAX_BYTES));
+            const jpegBytes = new Uint8Array(await jpegSlice.arrayBuffer());
+            return extractImageDimensionsFromBytes(jpegBytes);
+          }
+          return null;
+        }
+        if (imgPart instanceof Uint8Array) {
+          const fastDims = extractImageDimensionsFromBytes(imgPart.subarray(0, UPSCALE_FAST_BYTES));
+          if (fastDims) return fastDims;
+          if (imgPart.length > UPSCALE_FAST_BYTES && imgPart[0] === 255 && imgPart[1] === 216) {
+            return extractImageDimensionsFromBytes(imgPart.subarray(0, UPSCALE_JPEG_MAX_BYTES));
+          }
+          return null;
+        }
+        if (typeof ArrayBuffer !== "undefined" && imgPart instanceof ArrayBuffer) {
+          const fullView = new Uint8Array(imgPart);
+          const fastDims = extractImageDimensionsFromBytes(fullView.subarray(0, UPSCALE_FAST_BYTES));
+          if (fastDims) return fastDims;
+          if (fullView.length > UPSCALE_FAST_BYTES && fullView[0] === 255 && fullView[1] === 216) {
+            return extractImageDimensionsFromBytes(fullView.subarray(0, UPSCALE_JPEG_MAX_BYTES));
+          }
+          return null;
+        }
+        if (typeof imgPart === "string") {
+          return extractDimensionsFromBase64Browser(imgPart);
+        }
+        return null;
+      }
+      let parsedJson = null;
+      if (typeof body === "string") {
+        parsedJson = JSON.parse(body);
+      } else if (typeof Blob !== "undefined" && body instanceof Blob) {
+        parsedJson = JSON.parse(await body.text());
+      } else if (body instanceof Uint8Array || typeof ArrayBuffer !== "undefined" && body instanceof ArrayBuffer) {
+        const bytes = body instanceof ArrayBuffer ? new Uint8Array(body) : body;
+        parsedJson = JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(bytes));
+      } else if (typeof body === "object" && !Array.isArray(body)) {
+        parsedJson = body;
+      }
+      if (parsedJson && typeof parsedJson.image === "string") {
+        return extractDimensionsFromBase64Browser(parsedJson.image);
+      }
+    } catch (_) {
+    }
+    return null;
+  }
+  function calculateUpscaleAnlasCost(width, height) {
+    if (typeof width !== "number" || !Number.isInteger(width) || width <= 0 || typeof height !== "number" || !Number.isInteger(height) || height <= 0) {
+      throw new Error("Upscale image dimensions must be positive integers.");
+    }
+    const area = width * height;
+    if (!Number.isSafeInteger(area) || area <= 0 || area > MAX_NOVELAI_PIXELS) {
+      throw new Error(`Upscale image resolution area of ${area}px (${width}x${height}) exceeds maximum NovelAI cap of ${MAX_NOVELAI_PIXELS}px.`);
+    }
+    for (const [maxArea, cost] of UPSCALE_COST_BUCKETS) {
+      if (area <= maxArea) {
+        return cost;
+      }
+    }
+    throw new Error(`Upscale image resolution area of ${area}px exceeds maximum NovelAI cap of ${MAX_NOVELAI_PIXELS}px.`);
+  }
+  function evaluateUpscalePolicy(upscaleDims, state = {}) {
+    if (!upscaleDims || !upscaleDims.width || !upscaleDims.height) {
+      return {
+        ok: false,
+        status: 400,
+        error: "INVALID_UPSCALE_PAYLOAD",
+        message: "Unable to read source image dimensions for upscale billing.",
+        cost: 0
+      };
+    }
+    let cost;
+    try {
+      cost = calculateUpscaleAnlasCost(upscaleDims.width, upscaleDims.height);
+    } catch (err) {
+      return {
+        ok: false,
+        status: 400,
+        error: "PARAMETRIC_LIMIT_EXCEEDED",
+        message: err.message,
+        cost: 0
+      };
+    }
+    if (state.isInDebt) {
+      return {
+        ok: false,
+        status: 403,
+        error: "DEBT_LOCKED",
+        message: `Anlas Overdrawn: ${state.virtualBalance} (Paid Features Paused). Upscaling requires restoring your Anlas balance.`,
+        cost
+      };
+    }
+    if (typeof state.availableAnlas === "number" && Number.isFinite(state.availableAnlas) && cost > state.availableAnlas) {
+      return {
+        ok: false,
+        status: 403,
+        error: "INSUFFICIENT_ANLAS",
+        message: `Insufficient monthly Anlas (${state.availableAnlas} available, ${cost} required to upscale).`,
+        cost
+      };
+    }
+    if (state.subscriptionActive === false && typeof state.lastFetchedAt === "number" && state.lastFetchedAt > 0) {
+      return {
+        ok: false,
+        status: 503,
+        error: "MASTER_SUBSCRIPTION_INACTIVE",
+        message: "Master NovelAI Opus subscription is inactive or expired. Upscaling temporarily unavailable.",
+        cost
+      };
+    }
+    return { ok: true, cost };
   }
   function calculateAnlasCostDetails(params, { isOpus = true, usageNegative = false } = {}) {
     if (!params || typeof params !== "object") {
@@ -324,7 +568,7 @@
         ok: false,
         status: 400,
         error: "PARAMETRIC_LIMIT_EXCEEDED",
-        message: "Steps 24-28 on V5 Full (High) are prohibited (battery deadband). Use \u226423 for free tier, switch to Medium effort, or enable Anlas bypass with >28 steps.",
+        message: "V5 High allows up to 23 steps without Anlas (or 29+ steps when using Anlas). Steps 24\u201328 are blocked to protect shared V5 limits\u2014use \u226423 steps or switch to Medium.",
         isV5,
         isV5Medium,
         isBasePaid: false,
@@ -341,7 +585,7 @@
         ok: false,
         status: 403,
         error: "DEBT_LOCKED",
-        message: `Anlas Balance: ${state.virtualBalance} (Bypass Locked). Anlas-consuming generations are locked until balance restoration. Free Opus generations remain operational.`,
+        message: `Anlas Overdrawn: ${state.virtualBalance} (Paid Features Paused). Anlas-consuming generations are locked until balance restoration. Standard generations remain operational.`,
         isV5,
         isV5Medium,
         isBasePaid,
@@ -354,7 +598,7 @@
         ok: false,
         status: 400,
         error: "BYPASS_DISABLED",
-        message: `Anlas Bypass is disabled. Enable 'Anlas Bypass' in GuildWeave HUD/Settings to generate above 1MP, >1 sample, or >28 steps (Estimated cost: ${totalAnlas} Anlas).`,
+        message: `Anlas Specs Locked: Enable 'Use Monthly Anlas' in the GuildWeave bar or settings to generate >1MP sizes, batches (>1), or >28 steps (Estimated cost: ${totalAnlas} Anlas).`,
         isV5,
         isV5Medium,
         isBasePaid,
@@ -367,7 +611,7 @@
         ok: false,
         status: 403,
         error: "INSUFFICIENT_ANLAS",
-        message: `Insufficient virtual Anlas balance (${state.availableAnlas} available, ${totalAnlas} required).`,
+        message: `Insufficient monthly Anlas (${state.availableAnlas} available, ${totalAnlas} required).`,
         isV5,
         isV5Medium,
         isBasePaid,
@@ -394,7 +638,7 @@
           ok: false,
           status: 503,
           error: "V5_BATTERY_CRITICAL",
-          message: "Battery Recharging: Master V5 capacity is at or below the 5.5% safety floor. Switch to a non-V5 model or use Anlas Bypass (>1MP / >1 sample / >28 steps).",
+          message: "V5 Shared Pool Recharging: Shared capacity is below 5.5%. Switch to a legacy model or enable monthly Anlas for higher specs.",
           isV5,
           isV5Medium,
           isBasePaid,
@@ -407,11 +651,13 @@
         const surplusAvailable = typeof state.v5SurplusAvailableNcp === "number" ? state.v5SurplusAvailableNcp : 0;
         const surplusOk = Boolean(state.v5SurplusEligible) && surplusAvailable >= reqNcp;
         if (!personalOk && !surplusOk) {
+          const highAvail = Math.floor(state.v5AvailableNcp / V5_HIGH_NCP_COST);
+          const medAvail = Math.floor(state.v5AvailableNcp / V5_MEDIUM_NCP_COST);
           return {
             ok: false,
             status: 429,
             error: "V5_CAPACITY_DEPLETED",
-            message: `V5 Quota Depleted: Insufficient V5 compute capacity (${state.v5AvailableNcp} personal NCP, ${state.v5SurplusEligible ? surplusAvailable : 0} surplus NCP available; ${reqNcp} NCP required).`,
+            message: `V5 Allowance Exhausted: You currently have ${highAvail} High / ${medAvail} Medium V5 generations remaining. Switch to a legacy model or wait for the next daily refill.`,
             isV5,
             isV5Medium,
             isBasePaid,
@@ -431,7 +677,727 @@
     };
   }
 
+  // src/userscripts/shared/theme.js
+  var DEFAULT_PALETTE = {
+    bg0: "#13152c",
+    bg1: "#1a1d3a",
+    bg2: "#23274c",
+    border: "rgba(255, 255, 255, 0.14)",
+    borderStrong: "rgba(255, 255, 255, 0.24)",
+    text: "#f5f3c2",
+    textMuted: "rgba(245, 243, 194, 0.68)",
+    accent: "#f5f3c2",
+    accentText: "#13152c",
+    controlAccent: "#23274c",
+    controlAccentText: "#f5f3c2",
+    success: "#34c77b",
+    warning: "#f0b44c",
+    error: "#ef5b5b",
+    font: 'system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif'
+  };
+  function escapeHtml(value) {
+    if (value === null || value === void 0) return "";
+    return String(value).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;").replace(/'/g, "&#39;");
+  }
+  function parseCssColor(colorStr) {
+    if (typeof colorStr !== "string") return null;
+    const trimmed = colorStr.trim().toLowerCase();
+    if (!trimmed || trimmed === "transparent") {
+      return { r: 0, g: 0, b: 0, a: 0 };
+    }
+    const rgbMatch = trimmed.match(/^rgba?\(\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)(?:\s*,\s*([0-9.]+))?\s*\)$/);
+    if (rgbMatch) {
+      return {
+        r: parseInt(rgbMatch[1], 10),
+        g: parseInt(rgbMatch[2], 10),
+        b: parseInt(rgbMatch[3], 10),
+        a: rgbMatch[4] !== void 0 ? parseFloat(rgbMatch[4]) : 1
+      };
+    }
+    const hexMatch = trimmed.match(/^#([0-9a-f]{3}|[0-9a-f]{6}|[0-9a-f]{8})$/);
+    if (hexMatch) {
+      const h = hexMatch[1];
+      if (h.length === 3) {
+        return {
+          r: parseInt(h[0] + h[0], 16),
+          g: parseInt(h[1] + h[1], 16),
+          b: parseInt(h[2] + h[2], 16),
+          a: 1
+        };
+      }
+      return {
+        r: parseInt(h.slice(0, 2), 16),
+        g: parseInt(h.slice(2, 4), 16),
+        b: parseInt(h.slice(4, 6), 16),
+        a: h.length === 8 ? parseInt(h.slice(6, 8), 16) / 255 : 1
+      };
+    }
+    return null;
+  }
+  function clampByte(n) {
+    return Math.max(0, Math.min(255, Math.round(n)));
+  }
+  function isOpaque(parsed) {
+    return Boolean(parsed && parsed.a > 0.05);
+  }
+  function isSolidSurface(parsed) {
+    return Boolean(parsed && parsed.a >= 0.75);
+  }
+  function relativeLuminance(rgb) {
+    return (0.2126 * rgb.r + 0.7152 * rgb.g + 0.0722 * rgb.b) / 255;
+  }
+  function shiftColor(rgb, delta) {
+    return `rgb(${clampByte(rgb.r + delta)}, ${clampByte(rgb.g + delta)}, ${clampByte(rgb.b + delta)})`;
+  }
+  function withAlpha(rgb, alpha) {
+    return `rgba(${rgb.r}, ${rgb.g}, ${rgb.b}, ${alpha})`;
+  }
+  function isInsideGuildWeave(node) {
+    if (!node) return false;
+    if (node.id && (node.id.startsWith("gw-") || node.id.startsWith("vps-"))) return true;
+    if (typeof node.closest === "function") {
+      return Boolean(node.closest('[id^="gw-"]') || node.closest('[id^="vps-"]'));
+    }
+    return false;
+  }
+  function collectAncestors(el, maxHops = 6, { excludeRoot = false } = {}) {
+    const out = [];
+    let cur = el ? el.parentElement : null;
+    let steps = 0;
+    while (cur && steps < maxHops) {
+      if (cur === document.body || cur === document.documentElement) {
+        if (!excludeRoot) out.push(cur);
+        break;
+      }
+      out.push(cur);
+      cur = cur.parentElement;
+      steps++;
+    }
+    return out;
+  }
+  function extractSolidBackground(st) {
+    if (!st) return null;
+    const bgCol = st.backgroundColor;
+    const parsedBg = parseCssColor(bgCol);
+    if (isSolidSurface(parsedBg)) {
+      return { color: bgCol, parsed: parsedBg };
+    }
+    const bgImg = st.backgroundImage;
+    if (typeof bgImg === "string" && bgImg !== "none" && bgImg.includes("gradient")) {
+      const stopMatches = bgImg.match(/rgba?\([^)]+\)|#[0-9a-fA-F]{3,8}/g);
+      if (stopMatches) {
+        for (const stop of stopMatches) {
+          const parsedStop = parseCssColor(stop);
+          if (isSolidSurface(parsedStop)) {
+            return { color: `rgb(${parsedStop.r}, ${parsedStop.g}, ${parsedStop.b})`, parsed: parsedStop };
+          }
+        }
+      }
+    }
+    return null;
+  }
+  function scrapeNovelAITheme() {
+    const palette = { ...DEFAULT_PALETTE };
+    if (typeof window === "undefined" || typeof window.getComputedStyle !== "function" || typeof document === "undefined") {
+      return palette;
+    }
+    try {
+      const bodyEl = document.body || document.documentElement;
+      if (!bodyEl) return palette;
+      const safeGetStyle = (el) => {
+        if (!el) return null;
+        try {
+          return window.getComputedStyle(el);
+        } catch (_) {
+          return null;
+        }
+      };
+      const navRow = typeof document.querySelector === "function" ? document.querySelector(".image-gen-nav-row") : null;
+      const footerEl = typeof document.querySelector === "function" ? document.querySelector(".image-gen-footer") : null;
+      const modelRow = typeof document.querySelector === "function" ? document.querySelector(".image-gen-model-mode-row") : null;
+      const genBtn = typeof document.querySelector === "function" ? document.querySelector(".image-gen-generate-button") : null;
+      const menuBtn = typeof document.querySelector === "function" ? document.querySelector('button[aria-label="menu"]') : null;
+      const promptNode = typeof document.querySelector === "function" ? document.querySelector("textarea") || document.querySelector('[contenteditable="true"]') : null;
+      const nextRoot = typeof document.getElementById === "function" ? document.getElementById("__next") : null;
+      const topDownWrappers = [];
+      const pushChain = (startNode, depth = 4) => {
+        let cur = startNode;
+        for (let i = 0; cur && i < depth; i++) {
+          topDownWrappers.push(cur);
+          cur = cur.firstElementChild;
+        }
+      };
+      pushChain(nextRoot, 4);
+      pushChain(bodyEl.firstElementChild, 4);
+      const bg0Candidates = [
+        ...collectAncestors(navRow, 24, { excludeRoot: true }),
+        ...collectAncestors(modelRow, 24, { excludeRoot: true }),
+        ...collectAncestors(footerEl, 24, { excludeRoot: true }),
+        navRow,
+        modelRow,
+        footerEl,
+        ...topDownWrappers,
+        document.body,
+        document.documentElement
+      ];
+      const seenBg0 = /* @__PURE__ */ new Set();
+      let bg0Parsed = null;
+      for (const node of bg0Candidates) {
+        if (!node || seenBg0.has(node) || node === genBtn || node === promptNode || isInsideGuildWeave(node)) continue;
+        seenBg0.add(node);
+        const st = safeGetStyle(node);
+        const extracted = extractSolidBackground(st);
+        if (extracted) {
+          palette.bg0 = extracted.color;
+          bg0Parsed = extracted.parsed;
+          break;
+        }
+      }
+      const isDark = !bg0Parsed || relativeLuminance(bg0Parsed) < 0.5;
+      const bg0Lum = bg0Parsed ? relativeLuminance(bg0Parsed) : 0.08;
+      if (bg0Parsed) {
+        palette.bg1 = shiftColor(bg0Parsed, isDark ? 8 : -8);
+        palette.bg2 = shiftColor(bg0Parsed, isDark ? 16 : -16);
+        palette.controlAccent = palette.bg2;
+      }
+      const textCandidates = [
+        nextRoot,
+        navRow,
+        ...collectAncestors(navRow, 6, { excludeRoot: true }),
+        modelRow,
+        footerEl,
+        promptNode,
+        typeof document.querySelector === "function" ? document.querySelector("span, label, p, button, h1, h2") : null,
+        document.body,
+        document.documentElement
+      ];
+      let textParsed = null;
+      for (const node of textCandidates) {
+        if (!node || isInsideGuildWeave(node)) continue;
+        const st = safeGetStyle(node);
+        if (!st) continue;
+        if (st.fontFamily && st.fontFamily.trim() && palette.font === DEFAULT_PALETTE.font) {
+          palette.font = st.fontFamily.trim();
+        }
+        const col = parseCssColor(st.color);
+        if (isOpaque(col) && Math.abs(relativeLuminance(col) - bg0Lum) >= 0.25) {
+          palette.text = st.color;
+          textParsed = col;
+          if (st.fontFamily && st.fontFamily.trim()) {
+            palette.font = st.fontFamily.trim();
+          }
+          break;
+        }
+      }
+      if (textParsed) {
+        palette.textMuted = withAlpha(textParsed, 0.68);
+        palette.border = withAlpha(textParsed, 0.14);
+        palette.borderStrong = withAlpha(textParsed, 0.24);
+        palette.accent = palette.text;
+        palette.accentText = palette.bg0;
+        palette.controlAccentText = palette.text;
+      }
+      const dialogNode = typeof document.querySelector === "function" ? document.querySelector('[role="dialog"]') : null;
+      const footerChildren = footerEl && footerEl.children ? Array.from(footerEl.children) : [];
+      const surfaceNodes = [
+        dialogNode,
+        promptNode,
+        ...collectAncestors(promptNode, 4, { excludeRoot: true }),
+        navRow,
+        footerEl,
+        modelRow,
+        ...collectAncestors(modelRow, 3, { excludeRoot: true }),
+        ...footerChildren
+      ];
+      let bg1Parsed = null;
+      for (const node of surfaceNodes) {
+        if (!node || node === genBtn || isInsideGuildWeave(node)) continue;
+        const st = safeGetStyle(node);
+        const extracted = extractSolidBackground(st);
+        if (!extracted || extracted.color === palette.bg0) continue;
+        const lum = relativeLuminance(extracted.parsed);
+        if (isDark ? lum < 0.35 : lum > 0.65) {
+          palette.bg1 = extracted.color;
+          bg1Parsed = extracted.parsed;
+          palette.bg2 = shiftColor(extracted.parsed, isDark ? 10 : -10);
+          break;
+        }
+      }
+      if (!bg0Parsed && bg1Parsed) {
+        const bg1IsDark = relativeLuminance(bg1Parsed) < 0.5;
+        palette.bg0 = shiftColor(bg1Parsed, bg1IsDark ? 10 : -10);
+      }
+      let foundExplicitBorder = false;
+      let foundExplicitControlAccent = false;
+      const modelButtons = modelRow && typeof modelRow.querySelectorAll === "function" ? Array.from(modelRow.querySelectorAll("button")) : [];
+      if (modelButtons.length >= 2) {
+        let medBtn = null;
+        let highBtn = null;
+        for (const b of modelButtons) {
+          const lbl = (b.textContent || "").trim().toLowerCase();
+          if (lbl === "medium") medBtn = b;
+          else if (lbl === "high") highBtn = b;
+        }
+        if (medBtn && highBtn) {
+          const medSt = safeGetStyle(medBtn);
+          const highSt = safeGetStyle(highBtn);
+          const medBg = medSt ? parseCssColor(medSt.backgroundColor) : null;
+          const highBg = highSt ? parseCssColor(highSt.backgroundColor) : null;
+          const medAttr = medBtn.getAttribute("aria-pressed") === "true" || medBtn.getAttribute("aria-selected") === "true";
+          const highAttr = highBtn.getAttribute("aria-pressed") === "true" || highBtn.getAttribute("aria-selected") === "true";
+          let activeBtn = null;
+          let inactiveBtn = null;
+          if (medAttr !== highAttr) {
+            activeBtn = medAttr ? medBtn : highBtn;
+            inactiveBtn = medAttr ? highBtn : medBtn;
+          } else if (isOpaque(medBg) && !isOpaque(highBg)) {
+            activeBtn = medBtn;
+            inactiveBtn = highBtn;
+          } else if (isOpaque(highBg) && !isOpaque(medBg)) {
+            activeBtn = highBtn;
+            inactiveBtn = medBtn;
+          } else if (isOpaque(medBg) && isOpaque(highBg) && medSt.backgroundColor !== highSt.backgroundColor) {
+            const medLum = relativeLuminance(medBg);
+            const highLum = relativeLuminance(highBg);
+            const medActive = isDark ? medLum > highLum : medLum < highLum;
+            activeBtn = medActive ? medBtn : highBtn;
+            inactiveBtn = medActive ? highBtn : medBtn;
+          }
+          if (activeBtn) {
+            const actSt = safeGetStyle(activeBtn);
+            const actBg = actSt ? parseCssColor(actSt.backgroundColor) : null;
+            if (isOpaque(actBg) && actSt.backgroundColor !== palette.bg0 && actSt.backgroundColor !== palette.bg1) {
+              palette.controlAccent = actSt.backgroundColor;
+              foundExplicitControlAccent = true;
+              const actText = parseCssColor(actSt.color);
+              if (isOpaque(actText) && Math.abs(relativeLuminance(actText) - relativeLuminance(actBg)) >= 0.25) {
+                palette.controlAccentText = actSt.color;
+              } else {
+                palette.controlAccentText = relativeLuminance(actBg) > 0.55 ? "#111111" : palette.text;
+              }
+            }
+            if (inactiveBtn) {
+              const inactSt = safeGetStyle(inactiveBtn);
+              const inactBg = inactSt ? parseCssColor(inactSt.backgroundColor) : null;
+              if (isOpaque(inactBg) && inactSt.backgroundColor !== palette.bg0) {
+                const lum = relativeLuminance(inactBg);
+                if (isDark ? lum < 0.42 : lum > 0.58) {
+                  palette.bg2 = inactSt.backgroundColor;
+                }
+              }
+            }
+          }
+        }
+      }
+      const borderPool = [
+        menuBtn,
+        ...navRow && typeof navRow.querySelectorAll === "function" ? Array.from(navRow.querySelectorAll("button, div")).slice(0, 12) : [],
+        ...modelButtons,
+        ...modelRow && typeof modelRow.querySelectorAll === "function" ? Array.from(modelRow.querySelectorAll("div, button")).slice(0, 12) : [],
+        promptNode,
+        ...collectAncestors(promptNode, 3, { excludeRoot: true }),
+        ...typeof document.querySelectorAll === "function" ? Array.from(document.querySelectorAll("input, button")).slice(0, 20) : []
+      ].filter(Boolean);
+      for (const ctrl of borderPool) {
+        if (ctrl === genBtn || isInsideGuildWeave(ctrl)) continue;
+        const st = safeGetStyle(ctrl);
+        if (!st) continue;
+        const bw = parseFloat(st.borderTopWidth || "1");
+        const borderStyleOk = !st.borderTopStyle || st.borderTopStyle !== "none";
+        const borderRaw = st.borderTopColor || st.borderColor;
+        const borderParsed = parseCssColor(borderRaw);
+        if ((Number.isNaN(bw) || bw > 0) && borderStyleOk && isOpaque(borderParsed) && borderRaw !== palette.bg0 && borderRaw !== palette.bg1) {
+          palette.borderStrong = borderRaw;
+          palette.border = withAlpha(borderParsed, 0.58);
+          foundExplicitBorder = true;
+          break;
+        }
+      }
+      const controlBgPool = [
+        menuBtn,
+        ...modelButtons,
+        promptNode,
+        ...typeof document.querySelectorAll === "function" ? Array.from(document.querySelectorAll("input, button")).slice(0, 20) : []
+      ].filter(Boolean);
+      for (const ctrl of controlBgPool) {
+        if (ctrl === genBtn || isInsideGuildWeave(ctrl)) continue;
+        const st = safeGetStyle(ctrl);
+        if (!st) continue;
+        const bgParsed = parseCssColor(st.backgroundColor);
+        if (isOpaque(bgParsed) && st.backgroundColor !== palette.bg0 && st.backgroundColor !== palette.bg1) {
+          const lum = relativeLuminance(bgParsed);
+          if (isDark ? lum < 0.45 : lum > 0.55) {
+            palette.bg2 = st.backgroundColor;
+            if (!foundExplicitControlAccent) {
+              palette.controlAccent = st.backgroundColor;
+              palette.controlAccentText = relativeLuminance(bgParsed) > 0.55 ? "#111111" : palette.text;
+              foundExplicitControlAccent = true;
+            }
+            break;
+          }
+        }
+      }
+      if (genBtn) {
+        const btnStyle = safeGetStyle(genBtn);
+        if (btnStyle) {
+          const btnBgParsed = parseCssColor(btnStyle.backgroundColor);
+          const btnTextParsed = parseCssColor(btnStyle.color);
+          const bgHasContrast = isOpaque(btnBgParsed) && btnStyle.backgroundColor !== palette.bg0 && (isDark ? relativeLuminance(btnBgParsed) >= 0.35 : relativeLuminance(btnBgParsed) <= 0.65);
+          if (bgHasContrast) {
+            palette.accent = btnStyle.backgroundColor;
+            if (isOpaque(btnTextParsed)) {
+              palette.accentText = btnStyle.color;
+            } else {
+              palette.accentText = relativeLuminance(btnBgParsed) > 0.55 ? "#111111" : "#ffffff";
+            }
+          } else if (isOpaque(btnTextParsed) && (isDark ? relativeLuminance(btnTextParsed) >= 0.45 : relativeLuminance(btnTextParsed) <= 0.45)) {
+            palette.accent = btnStyle.color;
+            palette.accentText = isDark ? palette.bg0 : "#ffffff";
+          }
+        }
+      }
+      if (!foundExplicitControlAccent) {
+        palette.controlAccent = palette.accent;
+        palette.controlAccentText = palette.accentText;
+      }
+      if (!foundExplicitBorder && isOpaque(parseCssColor(palette.bg2))) {
+        const parsedBg2 = parseCssColor(palette.bg2);
+        palette.borderStrong = shiftColor(parsedBg2, isDark ? 20 : -20);
+        palette.border = withAlpha(parsedBg2, 0.65);
+      }
+    } catch (_) {
+    }
+    return palette;
+  }
+  function ensureGuildWeaveStyles() {
+    const theme = scrapeNovelAITheme();
+    if (typeof document === "undefined" || typeof document.getElementById !== "function") {
+      return theme;
+    }
+    let styleEl = document.getElementById("gw-ui-styles");
+    if (!styleEl) {
+      styleEl = document.createElement("style");
+      styleEl.id = "gw-ui-styles";
+      const host = typeof document.head !== "undefined" && document.head ? document.head : document.documentElement || document.body;
+      if (host && typeof host.appendChild === "function") {
+        host.appendChild(styleEl);
+      }
+    }
+    const nextCss = `
+    #vps-admin-panel, #vps-settings-modal, #vps-approval-overlay, #gw-v5-bar, #gw-allowance-bar {
+      --theme-bg0: ${theme.bg0};
+      --theme-bg1: ${theme.bg1};
+      --theme-bg2: ${theme.borderStrong};
+      --theme-text: ${theme.text};
+      --theme-textSecondary: ${theme.textMuted};
+      --theme-accent: ${theme.accent};
+      --gw-bg0: var(--theme-bg0, ${theme.bg0});
+      --gw-bg1: var(--theme-bg1, ${theme.bg1});
+      --gw-bg2: ${theme.bg2};
+      --gw-border: var(--theme-bg2, ${theme.border});
+      --gw-border-strong: ${theme.borderStrong};
+      --gw-text: var(--theme-text, ${theme.text});
+      --gw-text-muted: var(--theme-textSecondary, ${theme.textMuted});
+      --gw-accent: var(--theme-accent, ${theme.accent});
+      --gw-accent-text: ${theme.accentText};
+      --gw-control-bg: ${theme.controlAccent};
+      --gw-control-text: ${theme.controlAccentText};
+      --gw-control-border: ${theme.borderStrong};
+      --gw-success: var(--theme-success, ${theme.success});
+      --gw-warning: var(--theme-warning, ${theme.warning});
+      --gw-error: var(--theme-error, ${theme.error});
+      font-family: ${theme.font};
+      box-sizing: border-box;
+    }
+    #vps-admin-panel *, #vps-settings-modal *, #vps-approval-overlay *, #gw-v5-bar *, #gw-allowance-bar * {
+      box-sizing: border-box;
+    }
+    @keyframes gwPulse {
+      0% { opacity: 0.45; transform: scale(0.92); }
+      100% { opacity: 1; transform: scale(1.08); }
+    }
+    .gw-modal-header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      padding-bottom: 12px;
+      margin-bottom: 14px;
+      border-bottom: 1px solid ${theme.border};
+    }
+    .gw-modal-title {
+      margin: 0;
+      font-size: 15px;
+      font-weight: 700;
+      letter-spacing: 0.3px;
+      color: var(--gw-text);
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+    .gw-pill-tag {
+      font-size: 10px;
+      font-weight: 700;
+      padding: 2px 8px;
+      border-radius: 999px;
+      background: var(--gw-control-bg);
+      border: 1px solid var(--gw-control-border);
+      color: var(--gw-control-text);
+      text-transform: uppercase;
+      letter-spacing: 0.4px;
+    }
+    .gw-close-btn {
+      background: transparent;
+      border: 1px solid transparent;
+      color: var(--gw-text-muted);
+      width: 28px;
+      height: 28px;
+      border-radius: 6px;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      font-size: 16px;
+      cursor: pointer;
+    }
+    .gw-close-btn:hover {
+      background: var(--gw-bg2);
+      color: var(--gw-text);
+    }
+    .gw-tabs {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 6px;
+      padding: 4px;
+      border-radius: 8px;
+      background: var(--gw-bg1);
+      border: 1px solid ${theme.border};
+      margin-bottom: 14px;
+    }
+    .gw-tab-btn {
+      padding: 7px 10px;
+      font-size: 12px;
+      font-weight: 600;
+      border: 1px solid transparent;
+      border-radius: 6px;
+      cursor: pointer;
+      background: transparent;
+      color: var(--gw-text-muted);
+      transition: background 0.15s ease, color 0.15s ease, border-color 0.15s ease;
+    }
+    .gw-tab-btn.is-active {
+      background: var(--gw-control-bg);
+      border-color: var(--gw-control-border);
+      color: var(--gw-control-text);
+      box-shadow: 0 1px 3px rgba(0, 0, 0, 0.25);
+    }
+    .gw-card {
+      background: var(--gw-bg1);
+      border: 1px solid ${theme.border};
+      border-radius: 8px;
+      padding: 12px 14px;
+      margin-bottom: 12px;
+    }
+    .gw-section-title {
+      display: block;
+      font-size: 11px;
+      font-weight: 700;
+      color: var(--gw-text-muted);
+      margin-bottom: 8px;
+      letter-spacing: 0.2px;
+    }
+    .gw-stat-grid {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 10px 14px;
+      font-size: 12px;
+      font-variant-numeric: tabular-nums;
+    }
+    .gw-stat-item {
+      display: flex;
+      flex-direction: column;
+      gap: 2px;
+    }
+    .gw-stat-label {
+      font-size: 10px;
+      color: var(--gw-text-muted);
+    }
+    .gw-stat-val {
+      font-size: 12px;
+      font-weight: 600;
+      color: var(--gw-text);
+    }
+    .gw-toggle-row {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      cursor: pointer;
+      user-select: none;
+    }
+    .gw-toggle-copy {
+      display: flex;
+      flex-direction: column;
+      gap: 3px;
+      flex: 1 1 auto;
+      min-width: 0;
+    }
+    .gw-toggle-title {
+      font-size: 12px;
+      font-weight: 600;
+      color: var(--gw-text);
+    }
+    .gw-toggle-desc {
+      font-size: 11px;
+      line-height: 1.4;
+      color: var(--gw-text-muted);
+    }
+    input[type="checkbox"].gw-switch {
+      appearance: none;
+      -webkit-appearance: none;
+      display: inline-block !important;
+      width: 36px !important;
+      min-width: 36px !important;
+      max-width: 36px !important;
+      height: 20px !important;
+      min-height: 0 !important;
+      flex: 0 0 36px !important;
+      margin: 0 !important;
+      padding: 0 !important;
+      box-shadow: none !important;
+      border-radius: 999px;
+      background: var(--gw-bg0);
+      border: 1px solid ${theme.borderStrong};
+      position: relative;
+      cursor: pointer;
+      transition: background 0.18s ease, border-color 0.18s ease;
+    }
+    input[type="checkbox"].gw-switch::after {
+      content: "";
+      position: absolute;
+      top: 2px;
+      left: 2px;
+      width: 14px;
+      height: 14px;
+      border-radius: 50%;
+      background: var(--gw-text-muted);
+      transition: transform 0.18s ease, background 0.18s ease;
+    }
+    input[type="checkbox"].gw-switch:checked {
+      background: var(--gw-accent);
+      border-color: var(--gw-accent);
+    }
+    input[type="checkbox"].gw-switch:checked::after {
+      background: var(--gw-accent-text);
+      transform: translateX(16px);
+    }
+    input[type="checkbox"].gw-switch:disabled {
+      opacity: 0.45;
+      cursor: not-allowed;
+    }
+    input[type="checkbox"].gw-inline-check {
+      display: inline-block !important;
+      width: 14px !important;
+      min-width: 14px !important;
+      max-width: 14px !important;
+      height: 14px !important;
+      min-height: 0 !important;
+      flex: 0 0 14px !important;
+      margin: 0 !important;
+      box-shadow: none !important;
+      accent-color: var(--gw-accent);
+      cursor: pointer;
+    }
+    .gw-input-row {
+      display: flex;
+      gap: 8px;
+      align-items: center;
+    }
+    .gw-input, .gw-select {
+      background: var(--gw-bg0);
+      border: 1px solid ${theme.borderStrong};
+      color: var(--gw-text);
+      padding: 7px 10px;
+      font-size: 12px;
+      border-radius: 6px;
+      outline: none;
+    }
+    .gw-input {
+      flex: 1 1 auto;
+      min-width: 0;
+    }
+    .gw-input:focus, .gw-select:focus {
+      border-color: var(--gw-accent);
+    }
+    .gw-btn {
+      border: 1px solid ${theme.borderStrong};
+      background: var(--gw-bg2);
+      color: var(--gw-text);
+      padding: 7px 12px;
+      font-size: 11px;
+      font-weight: 600;
+      border-radius: 6px;
+      cursor: pointer;
+      white-space: nowrap;
+      transition: opacity 0.15s ease, background 0.15s ease;
+    }
+    .gw-btn:hover {
+      opacity: 0.9;
+    }
+    .gw-btn-primary, .gw-btn-success {
+      background: var(--gw-control-bg);
+      color: var(--gw-control-text);
+      border-color: var(--gw-control-border);
+    }
+    .gw-btn-accent {
+      background: var(--gw-accent);
+      color: var(--gw-accent-text);
+      border-color: var(--gw-accent);
+    }
+    .gw-btn-danger {
+      background: var(--gw-error);
+      color: #ffffff;
+      border-color: var(--gw-error);
+    }
+    .gw-btn-warning {
+      background: var(--gw-warning);
+      color: #1f1404;
+      border-color: var(--gw-warning);
+    }
+    .gw-btn-sm {
+      padding: 4px 8px;
+      font-size: 10px;
+      border-radius: 4px;
+    }
+    .gw-feedback {
+      font-size: 11px;
+      margin-top: 6px;
+      line-height: 1.4;
+    }
+    .gw-code-chip {
+      display: inline-block;
+      font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+      font-size: 10px;
+      padding: 1px 5px;
+      border-radius: 4px;
+      background: var(--gw-bg0);
+      border: 1px solid ${theme.border};
+      color: var(--gw-text);
+    }
+    .gw-details-note {
+      font-size: 11px;
+      line-height: 1.45;
+      color: var(--gw-text-muted);
+      margin-top: 6px;
+    }
+  `.trim();
+    if (styleEl.textContent !== nextCss) {
+      styleEl.textContent = nextCss;
+    }
+    return theme;
+  }
+
   // src/userscripts/shared/domEngine.js
+  var V5_HIGH_IMAGES_PER_PERCENT = 17.28;
+  var V5_CIRCUIT_BREAKER_PERCENT = 5.5;
   var classCache = /* @__PURE__ */ new Map();
   var cachedPolicyState = {
     virtualBalance: null,
@@ -553,6 +1519,107 @@
     }
     return null;
   }
+  function isStepControlInput(input) {
+    if (!input || input.tagName !== "INPUT") return false;
+    if (input.id === "gw-bypass-toggle" || input.id === "settings-anlas-bypass") return false;
+    const aria = (input.getAttribute("aria-label") || "").toLowerCase();
+    const name = (input.getAttribute("name") || "").toLowerCase();
+    const id = (input.id || "").toLowerCase();
+    const dataCtrl = (input.getAttribute("data-gw-control") || "").toLowerCase();
+    return dataCtrl === "steps" || aria.includes("step") || name.includes("step") || id.includes("step");
+  }
+  function isInsideGuildWeaveNode(node) {
+    if (!node) return false;
+    if (node.id && (node.id.startsWith("gw-") || node.id.startsWith("vps-"))) return true;
+    if (typeof node.closest === "function") {
+      return Boolean(node.closest('[id^="gw-"]') || node.closest('[id^="vps-"]'));
+    }
+    return false;
+  }
+  function readNativeGenerationSpecsFromDOM(activeModel = "") {
+    const isMed = isV5MediumModel(activeModel);
+    let width = 1024;
+    let height = 1024;
+    let steps = isMed ? 14 : 23;
+    let samples = 1;
+    if (typeof document === "undefined" || typeof document.querySelectorAll !== "function") {
+      return { width, height, area: width * height, steps, samples };
+    }
+    let foundWidth = null;
+    let foundHeight = null;
+    let foundSteps = null;
+    let foundSamples = null;
+    const inputs = document.querySelectorAll("input");
+    for (const input of inputs) {
+      if (!input || isInsideGuildWeaveNode(input)) continue;
+      const aria = (input.getAttribute("aria-label") || "").toLowerCase();
+      const placeholder = (input.getAttribute("placeholder") || "").toLowerCase();
+      const name = (input.getAttribute("name") || "").toLowerCase();
+      const id = (input.id || "").toLowerCase();
+      const numVal = parseInt(input.value, 10);
+      if (!Number.isFinite(numVal) || numVal <= 0) continue;
+      if (isStepControlInput(input)) {
+        foundSteps = numVal;
+      } else if (aria === "width" || placeholder === "width" || name === "width" || id.includes("width")) {
+        foundWidth = numVal;
+      } else if (aria === "height" || placeholder === "height" || name === "height" || id.includes("height")) {
+        foundHeight = numVal;
+      } else if (aria.includes("number of images") || aria.includes("samples") || name === "n_samples" || id.includes("sample")) {
+        foundSamples = numVal;
+      }
+    }
+    if (foundSamples === null && typeof document.querySelector === "function") {
+      const genBtn = document.querySelector(".image-gen-generate-button");
+      if (genBtn) {
+        const btnTextParts = [];
+        for (const child of genBtn.children) {
+          if (child && child.id !== "gw-button-shield" && child.textContent) {
+            btnTextParts.push(child.textContent);
+          }
+        }
+        const btnText = btnTextParts.join(" ");
+        const genMatch = btnText.match(/generate\s+(\d+)\s+image/i);
+        if (genMatch) {
+          const parsedSamples = parseInt(genMatch[1], 10);
+          if (Number.isFinite(parsedSamples) && parsedSamples > 0) {
+            foundSamples = parsedSamples;
+          }
+        }
+      }
+    }
+    if (foundWidth === null || foundHeight === null) {
+      const candidateGroups = [];
+      if (typeof document.querySelectorAll === "function") {
+        candidateGroups.push(...document.querySelectorAll("div, span, button"));
+      }
+      const footerEl = typeof document.querySelector === "function" ? document.querySelector(".image-gen-footer") : null;
+      for (const el of candidateGroups) {
+        if (!el || isInsideGuildWeaveNode(el)) continue;
+        const cls = el.getAttribute("class") || "";
+        const isControlSurface = cls.includes("singleValue") || Boolean(el.getAttribute("aria-haspopup")) || footerEl && el.parentElement === footerEl;
+        if (!isControlSurface) continue;
+        const txt = (el.textContent || "").trim();
+        if (txt.length > 48) continue;
+        const resMatch = txt.match(/\b(\d{3,4})\s*[x×]\s*(\d{3,4})\b/i);
+        if (resMatch) {
+          const w = parseInt(resMatch[1], 10);
+          const h = parseInt(resMatch[2], 10);
+          if (w >= 64 && h >= 64 && w <= 4096 && h <= 4096) {
+            foundWidth = w;
+            foundHeight = h;
+            break;
+          }
+        }
+      }
+    }
+    if (foundWidth !== null && foundHeight !== null) {
+      width = foundWidth;
+      height = foundHeight;
+    }
+    if (foundSteps !== null) steps = foundSteps;
+    if (foundSamples !== null) samples = foundSamples;
+    return { width, height, area: width * height, steps, samples };
+  }
   function readNativeModelAndEffortFromDOM() {
     if (typeof document === "undefined" || typeof document.querySelector !== "function") return null;
     const modelRow = document.querySelector(".image-gen-model-mode-row");
@@ -616,14 +1683,48 @@
     }
     return classCache.get(cacheKey) || "";
   }
+  function syncNavBadgeAppearance(badgeBtn, menuBtn) {
+    const btnClasses = getElementClasses(menuBtn, "nav_menu_btn");
+    if (btnClasses && badgeBtn.className !== btnClasses) {
+      badgeBtn.className = btnClasses;
+      badgeBtn.style.backgroundColor = "";
+      badgeBtn.style.borderColor = "";
+      badgeBtn.style.color = "";
+    }
+    if (typeof window !== "undefined" && typeof window.getComputedStyle === "function") {
+      try {
+        const menuStyle = window.getComputedStyle(menuBtn);
+        const badgeStyle = window.getComputedStyle(badgeBtn);
+        if (menuStyle && badgeStyle) {
+          if (menuStyle.backgroundColor && badgeStyle.backgroundColor !== menuStyle.backgroundColor) {
+            badgeBtn.style.backgroundColor = menuStyle.backgroundColor;
+          }
+          if (menuStyle.color && badgeStyle.color !== menuStyle.color) {
+            badgeBtn.style.color = menuStyle.color;
+          }
+          const mBorder = menuStyle.borderTopColor || menuStyle.borderColor;
+          const bBorder = badgeStyle.borderTopColor || badgeStyle.borderColor;
+          if (mBorder && bBorder !== mBorder) {
+            badgeBtn.style.borderColor = mBorder;
+          }
+        }
+      } catch (_) {
+      }
+    }
+  }
   function injectNavBadge(onClickHandler) {
-    if (document.getElementById("gw-nav-badge")) return true;
     const menuBtn = document.querySelector('button[aria-label="menu"]');
     if (!menuBtn || !menuBtn.parentElement) return false;
-    const btnClasses = getElementClasses(menuBtn, "nav_menu_btn");
+    const existing = document.getElementById("gw-nav-badge");
+    if (existing) {
+      if (existing.parentElement === menuBtn.parentElement) {
+        syncNavBadgeAppearance(existing, menuBtn);
+        return true;
+      }
+      existing.remove();
+    }
     const badgeBtn = document.createElement("button");
     badgeBtn.id = "gw-nav-badge";
-    badgeBtn.className = btnClasses;
     badgeBtn.setAttribute("aria-label", "GuildWeave Settings");
     badgeBtn.setAttribute("title", "GuildWeave Settings");
     badgeBtn.style.marginRight = "8px";
@@ -649,22 +1750,24 @@
       }
     };
     menuBtn.parentElement.insertBefore(badgeBtn, menuBtn);
+    syncNavBadgeAppearance(badgeBtn, menuBtn);
     return true;
   }
   function injectAllowanceBar() {
     if (document.getElementById("gw-allowance-bar")) return true;
     const genBtn = document.querySelector(".image-gen-generate-button");
     if (!genBtn || !genBtn.parentElement) return false;
+    const theme = ensureGuildWeaveStyles();
     const barRoot = document.createElement("div");
     barRoot.id = "gw-allowance-bar";
     barRoot.style.cssText = `
-    display: flex;
+    display: none;
     flex-direction: column;
     gap: 4px;
-    padding: 5px 8px 7px;
+    padding: 6px 9px 7px;
     border-radius: 8px;
-    border: 1px solid var(--theme-bg2, rgb(34, 37, 63));
-    background-color: var(--theme-bg0, rgb(14, 15, 33));
+    border: 1px solid var(--theme-bg2, ${theme.borderStrong});
+    background-color: var(--theme-bg0, ${theme.bg0});
     font-size: 0.8125rem;
     font-weight: 600;
     margin-bottom: 0px;
@@ -685,18 +1788,19 @@
     white-space: nowrap;
     overflow: hidden;
     text-overflow: ellipsis;
-    color: var(--theme-text, rgb(245, 243, 194));
+    color: var(--theme-text, ${theme.text});
     font-size: 0.75rem;
     font-weight: 600;
   `.replace(/\s+/g, " ").trim();
-    labelSpan.textContent = "Rolling Allowance: --/100 Images";
+    labelSpan.textContent = "Image Allowance: --/100";
     headerRow.appendChild(labelSpan);
     const trackDiv = document.createElement("div");
+    trackDiv.id = "gw-allowance-track";
     trackDiv.style.cssText = `
     height: 4px;
     width: 100%;
-    background: var(--theme-bg2, rgba(255, 255, 255, 0.1));
-    border-radius: 2px;
+    background: var(--theme-bg2, ${theme.border});
+    border-radius: 999px;
     overflow: hidden;
     position: relative;
   `.replace(/\s+/g, " ").trim();
@@ -705,8 +1809,8 @@
     fillDiv.style.cssText = `
     height: 100%;
     width: 100%;
-    background-color: var(--theme-success, #2ecc71);
-    border-radius: 2px;
+    background-color: var(--theme-accent, ${theme.accent});
+    border-radius: 999px;
     transition: width 0.35s ease-in-out, background-color 0.35s ease-in-out;
   `.replace(/\s+/g, " ").trim();
     trackDiv.appendChild(fillDiv);
@@ -716,6 +1820,7 @@
     return true;
   }
   function refreshDualLedgerHud() {
+    ensureGuildWeaveStyles();
     injectDualLedgerBar();
     const nativeModel = readNativeModelAndEffortFromDOM();
     if (nativeModel) {
@@ -731,16 +1836,17 @@
     if (document.getElementById("gw-v5-bar")) return true;
     const allowanceBar = document.getElementById("gw-allowance-bar");
     if (!allowanceBar || !allowanceBar.parentElement) return false;
+    const theme = ensureGuildWeaveStyles();
     const v5Root = document.createElement("div");
     v5Root.id = "gw-v5-bar";
     v5Root.style.cssText = `
     display: flex;
     flex-direction: column;
     gap: 5px;
-    padding: 6px 8px 7px;
+    padding: 7px 9px 8px;
     border-radius: 8px;
-    border: 1px solid var(--theme-bg2, rgb(34, 37, 63));
-    background-color: var(--theme-bg0, rgb(14, 15, 33));
+    border: 1px solid var(--theme-bg2, ${theme.borderStrong});
+    background-color: var(--theme-bg0, ${theme.bg0});
     font-size: 0.75rem;
     font-weight: 600;
     margin-bottom: 4px;
@@ -750,42 +1856,46 @@
     v5HeaderRow.style.cssText = "display: flex; flex-direction: row; align-items: center; justify-content: space-between; gap: 6px;";
     const v5Label = document.createElement("span");
     v5Label.id = "gw-v5-label";
-    v5Label.style.cssText = "color: var(--theme-text, rgb(245, 243, 194)); font-size: 0.72rem; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;";
-    v5Label.textContent = "V5 Bank: --/-- NCP | Tank: --%";
+    v5Label.style.cssText = `color: var(--theme-text, ${theme.text}); font-size: 0.72rem; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;`;
+    v5Label.textContent = "V5 Allowance: Syncing...";
     const v5Eta = document.createElement("span");
     v5Eta.id = "gw-v5-eta";
-    v5Eta.style.cssText = "color: var(--theme-textSecondary, #aaa); font-size: 0.68rem; white-space: nowrap;";
+    v5Eta.style.cssText = `color: var(--theme-textSecondary, ${theme.textMuted}); font-size: 0.68rem; white-space: nowrap;`;
     v5Eta.textContent = "";
     v5HeaderRow.appendChild(v5Label);
     v5HeaderRow.appendChild(v5Eta);
     const v5Track = document.createElement("div");
-    v5Track.style.cssText = "height: 4px; width: 100%; background: var(--theme-bg2, rgba(255, 255, 255, 0.1)); border-radius: 2px; overflow: hidden; position: relative;";
+    v5Track.id = "gw-v5-track";
+    v5Track.style.cssText = `height: 4px; width: 100%; background: var(--theme-bg2, ${theme.border}); border-radius: 999px; overflow: hidden; position: relative;`;
     const v5Fill = document.createElement("div");
     v5Fill.id = "gw-v5-fill";
-    v5Fill.style.cssText = "height: 100%; width: 100%; background-color: var(--theme-success, #2ecc71); border-radius: 2px; transition: width 0.35s ease-in-out, background-color 0.35s ease-in-out;";
+    v5Fill.style.cssText = `height: 100%; width: 100%; background-color: var(--theme-accent, ${theme.accent}); border-radius: 999px; transition: width 0.35s ease-in-out, background-color 0.35s ease-in-out;`;
     v5Track.appendChild(v5Fill);
     const controlsRow = document.createElement("div");
     controlsRow.style.cssText = "display: flex; flex-direction: row; align-items: center; justify-content: space-between; gap: 6px; flex-wrap: wrap;";
     const anlasLabel = document.createElement("span");
     anlasLabel.id = "gw-anlas-label";
-    anlasLabel.style.cssText = "color: var(--theme-textSecondary, #ccc); font-size: 0.68rem; white-space: nowrap;";
-    anlasLabel.textContent = "Anlas: -- (No Rollover)";
+    anlasLabel.style.cssText = `color: var(--theme-textSecondary, ${theme.textMuted}); font-size: 0.68rem; white-space: nowrap;`;
+    anlasLabel.textContent = "Monthly Anlas: --";
+    anlasLabel.setAttribute("title", "Resets each billing cycle; unused Anlas does not roll over.");
     const rightControls = document.createElement("div");
     rightControls.style.cssText = "display: flex; align-items: center; gap: 8px;";
     const costBadge = document.createElement("span");
     costBadge.id = "gw-v5-cost";
-    costBadge.style.cssText = "color: var(--theme-textSecondary, #aaa); font-size: 0.68rem; white-space: nowrap;";
+    costBadge.style.cssText = `color: var(--theme-textSecondary, ${theme.textMuted}); font-size: 0.68rem; white-space: nowrap;`;
     costBadge.textContent = "";
     const state = getClientPolicyState();
     const bypassLabel = document.createElement("label");
     bypassLabel.id = "gw-bypass-label";
-    bypassLabel.style.cssText = "display: flex; align-items: center; gap: 4px; font-size: 0.68rem; cursor: pointer; color: var(--theme-warning, #f39c12); white-space: nowrap;";
+    bypassLabel.style.cssText = `display: inline-flex; align-items: center; gap: 5px; font-size: 0.68rem; cursor: pointer; color: var(--theme-textSecondary, ${theme.textMuted}); white-space: nowrap;`;
+    bypassLabel.setAttribute("title", "Enable spending monthly Anlas for sizes >1MP, >1 image, or >28 steps.");
     const bypassCheckbox = document.createElement("input");
     bypassCheckbox.type = "checkbox";
     bypassCheckbox.id = "gw-bypass-toggle";
+    bypassCheckbox.className = "gw-inline-check";
     bypassCheckbox.checked = Boolean(state.bypassEnabled) && !state.isInDebt;
     bypassCheckbox.disabled = Boolean(state.isInDebt);
-    bypassCheckbox.style.cursor = "pointer";
+    bypassCheckbox.style.cssText = "width: 14px; min-width: 14px; flex: 0 0 14px; margin: 0; cursor: pointer;";
     bypassCheckbox.onchange = () => {
       const latest = getClientPolicyState();
       if (latest.isInDebt) {
@@ -802,7 +1912,7 @@
     };
     const bypassText = document.createElement("span");
     bypassText.id = "gw-bypass-text";
-    bypassText.textContent = state.isInDebt ? "Bypass Locked" : "Anlas Bypass";
+    bypassText.textContent = state.isInDebt ? "Anlas Paused" : "Use Anlas";
     bypassLabel.appendChild(bypassCheckbox);
     bypassLabel.appendChild(bypassText);
     rightControls.appendChild(costBadge);
@@ -811,7 +1921,7 @@
     controlsRow.appendChild(rightControls);
     const alertDiv = document.createElement("div");
     alertDiv.id = "gw-hud-alert";
-    alertDiv.style.cssText = "display: none; font-size: 0.68rem; line-height: 1.3; padding: 3px 6px; border-radius: 4px; background: var(--theme-bg1, #222); color: var(--theme-warning, #f39c12);";
+    alertDiv.style.cssText = `display: none; font-size: 0.68rem; line-height: 1.35; padding: 4px 7px; border-radius: 5px; background: var(--theme-bg1, ${theme.bg1}); border: 1px solid ${theme.border}; color: var(--theme-warning, ${theme.warning});`;
     v5Root.appendChild(v5HeaderRow);
     v5Root.appendChild(v5Track);
     v5Root.appendChild(controlsRow);
@@ -833,14 +1943,17 @@
       alertEl.textContent = "";
       return;
     }
+    const theme = ensureGuildWeaveStyles();
     alertEl.style.display = "block";
     alertEl.textContent = message;
+    alertEl.style.backgroundColor = `var(--theme-bg1, ${theme.bg1})`;
+    alertEl.style.borderColor = theme.border;
     if (severity === "error") {
-      alertEl.style.color = "var(--theme-error, #e74c3c)";
+      alertEl.style.color = `var(--theme-error, ${theme.error})`;
     } else if (severity === "info") {
-      alertEl.style.color = "var(--theme-accent, #00bc8c)";
+      alertEl.style.color = `var(--theme-accent, ${theme.accent})`;
     } else {
-      alertEl.style.color = "var(--theme-warning, #f39c12)";
+      alertEl.style.color = `var(--theme-warning, ${theme.warning})`;
     }
   }
   function formatNextPercentEta(etaMs) {
@@ -852,13 +1965,43 @@
     }
     return `+1% in ${mins.toFixed(1)}m`;
   }
-  function resolveClusterStateColor(clusterState) {
-    if (clusterState === "frozen" || clusterState === "token_expired") return "var(--theme-error, #e74c3c)";
-    if (clusterState === "throttled" || clusterState === "telemetry_offline") return "var(--theme-warning, #e67e22)";
-    if (clusterState === "reserve_mode") return "var(--theme-warning, #f1c40f)";
-    return "var(--theme-success, #2ecc71)";
+  function formatReadableClusterState(clusterState) {
+    switch (clusterState) {
+      case "surplus_active":
+        return "Shared Bonus Open";
+      case "reserve_mode":
+        return "Personal Allowance";
+      case "throttled":
+        return "Low Shared Pool";
+      case "frozen":
+        return "Recharging";
+      case "token_expired":
+        return "Session Expired";
+      case "telemetry_offline":
+        return "Syncing";
+      default:
+        return "";
+    }
+  }
+  function resolveClusterStateColor(clusterState, theme) {
+    if (clusterState === "frozen" || clusterState === "token_expired") return `var(--theme-error, ${theme.error})`;
+    if (clusterState === "throttled" || clusterState === "telemetry_offline") return `var(--theme-warning, ${theme.warning})`;
+    return `var(--theme-accent, ${theme.accent})`;
+  }
+  function computeClientSpendableMasterNcp(state) {
+    if (typeof state.masterV5Percent !== "number" || !Number.isFinite(state.masterV5Percent)) {
+      return null;
+    }
+    if (state.isHardLocked || state.subscriptionActive === false || state.masterTokenExpired) {
+      return 0;
+    }
+    const rawPct = typeof state.masterV5RawPercent === "number" && Number.isFinite(state.masterV5RawPercent) ? state.masterV5RawPercent : state.masterV5Percent;
+    return Math.floor(Math.max(0, rawPct - V5_CIRCUIT_BREAKER_PERCENT) * V5_HIGH_IMAGES_PER_PERCENT * V5_HIGH_NCP_COST);
   }
   function renderDualLedgerHudFromState(state) {
+    const theme = ensureGuildWeaveStyles();
+    const v5Root = document.getElementById("gw-v5-bar");
+    const v5Track = document.getElementById("gw-v5-track");
     const v5Label = document.getElementById("gw-v5-label");
     const v5Eta = document.getElementById("gw-v5-eta");
     const v5Fill = document.getElementById("gw-v5-fill");
@@ -867,86 +2010,137 @@
     const bypassCheckbox = document.getElementById("gw-bypass-toggle");
     const bypassText = document.getElementById("gw-bypass-text");
     const modalBypass = document.getElementById("settings-anlas-bypass");
+    const allowanceRoot = document.getElementById("gw-allowance-bar");
+    const allowanceLabel = document.getElementById("gw-allowance-label");
+    const allowanceTrack = document.getElementById("gw-allowance-track");
+    const shieldEl = document.getElementById("gw-button-shield");
+    const shieldTextEl = document.getElementById("gw-shield-text");
+    if (v5Root) {
+      v5Root.style.backgroundColor = `var(--theme-bg0, ${theme.bg0})`;
+      v5Root.style.border = `1px solid var(--theme-bg2, ${theme.borderStrong})`;
+    }
+    if (v5Track) {
+      v5Track.style.background = theme.border;
+    }
+    if (allowanceRoot) {
+      allowanceRoot.style.backgroundColor = `var(--theme-bg0, ${theme.bg0})`;
+      allowanceRoot.style.border = `1px solid var(--theme-bg2, ${theme.borderStrong})`;
+    }
+    if (allowanceLabel) {
+      allowanceLabel.style.color = `var(--theme-text, ${theme.text})`;
+    }
+    if (allowanceTrack) {
+      allowanceTrack.style.background = theme.border;
+    }
+    if (shieldEl) {
+      shieldEl.style.background = `var(--theme-bg1, ${theme.bg1})`;
+      shieldEl.style.border = `1px solid var(--theme-accent, ${theme.borderStrong})`;
+    }
+    if (shieldTextEl) {
+      shieldTextEl.style.color = `var(--theme-textHeadings, ${theme.text})`;
+    }
     const activeModel = state.activeModel || "";
     const isV5 = isV5ModelFamily(activeModel);
     const isMed = isV5MediumModel(activeModel);
+    const specs = readNativeGenerationSpecsFromDOM(activeModel);
+    const isBaseAnlasBypass = Boolean(state.bypassEnabled) && (specs.area > FIREWALL_MAX_PIXELS || specs.samples !== FIREWALL_MAX_SAMPLES || isV5 && !isMed && specs.steps > FIREWALL_MAX_STEPS);
+    const spendableMasterNcp = computeClientSpendableMasterNcp(state);
     if (v5Label && v5Fill) {
+      v5Label.style.color = `var(--theme-text, ${theme.text})`;
       const pctText = typeof state.masterV5Percent === "number" && Number.isFinite(state.masterV5Percent) ? `${state.masterV5Percent.toFixed(1)}%` : "--%";
       if (state.masterTokenExpired || state.clusterState === "token_expired") {
         v5Label.textContent = "Master Token Expired (Awaiting Admin)";
+        v5Label.setAttribute("title", "The shared NovelAI session token expired and needs to be refreshed by an admin.");
         v5Fill.style.width = "0%";
-        v5Fill.style.backgroundColor = "var(--theme-error, #e74c3c)";
+        v5Fill.style.backgroundColor = `var(--theme-error, ${theme.error})`;
       } else if (state.subscriptionActive === false && state.lastFetchedAt > 0) {
         v5Label.textContent = "Master Subscription Inactive";
         v5Fill.style.width = "0%";
-        v5Fill.style.backgroundColor = "var(--theme-error, #e74c3c)";
+        v5Fill.style.backgroundColor = `var(--theme-error, ${theme.error})`;
       } else if (state.isHardLocked) {
-        v5Label.textContent = `Battery Recharging (${pctText} <= 5.5%)`;
+        v5Label.textContent = `V5 Recharging (${pctText} <= 5.5%)`;
+        v5Label.setAttribute("title", "Shared V5 capacity must stay above 5.5% to prevent a cluster-wide cooldown. Legacy models and Anlas-paid specs still work.");
         const widthPct = typeof state.masterV5Percent === "number" ? Math.max(0, Math.min(100, state.masterV5Percent)) : 0;
         v5Fill.style.width = `${widthPct}%`;
-        v5Fill.style.backgroundColor = "var(--theme-error, #e74c3c)";
+        v5Fill.style.backgroundColor = `var(--theme-error, ${theme.error})`;
       } else if (state.isUnlimitedV5) {
-        v5Label.textContent = `V5 Bank: Exempt (Unlimited) | Tank: ${pctText}`;
+        v5Label.textContent = `V5 Allowance: Unlimited \xB7 Pool: ${pctText}`;
         v5Fill.style.width = "100%";
-        v5Fill.style.backgroundColor = resolveClusterStateColor(state.clusterState);
+        v5Fill.style.backgroundColor = resolveClusterStateColor(state.clusterState, theme);
       } else if (typeof state.v5AvailableNcp === "number") {
+        const effectiveNcp = spendableMasterNcp !== null && state.lastFetchedAt > 0 ? Math.min(state.v5AvailableNcp, spendableMasterNcp) : state.v5AvailableNcp;
+        const effectiveSurplus = spendableMasterNcp !== null && state.lastFetchedAt > 0 && typeof state.v5SurplusAvailableNcp === "number" ? Math.min(state.v5SurplusAvailableNcp, spendableMasterNcp) : state.v5SurplusAvailableNcp || 0;
+        const highLeft = Math.floor(effectiveNcp / V5_HIGH_NCP_COST);
+        const medLeft = Math.floor(effectiveNcp / V5_MEDIUM_NCP_COST);
         const maxNcp = typeof state.v5MaxBankNcp === "number" && state.v5MaxBankNcp > 0 ? state.v5MaxBankNcp : state.v5AvailableNcp;
-        const surplusSuffix = state.v5SurplusEligible && typeof state.v5SurplusAvailableNcp === "number" && state.v5SurplusAvailableNcp > 0 ? ` (+${state.v5SurplusAvailableNcp} Surplus)` : "";
-        const depleted = state.v5AvailableNcp < 10 && (!state.v5SurplusEligible || (state.v5SurplusAvailableNcp || 0) < 10);
-        v5Label.textContent = depleted ? `V5 Quota Depleted (0/${maxNcp} NCP) | Tank: ${pctText}` : `V5 Bank: ${state.v5AvailableNcp}/${maxNcp} NCP${surplusSuffix} | Tank: ${pctText}`;
-        const barPct = maxNcp > 0 ? Math.min(100, Math.max(0, state.v5AvailableNcp / maxNcp * 100)) : 0;
+        const surplusHigh = state.v5SurplusEligible && effectiveSurplus >= V5_HIGH_NCP_COST ? Math.floor(effectiveSurplus / V5_HIGH_NCP_COST) : 0;
+        const surplusSuffix = surplusHigh > 0 ? ` (+${surplusHigh} Bonus)` : "";
+        const depleted = effectiveNcp < V5_MEDIUM_NCP_COST && (!state.v5SurplusEligible || effectiveSurplus < V5_MEDIUM_NCP_COST);
+        v5Label.textContent = depleted ? `V5 Limit Reached \xB7 Pool: ${pctText}` : `V5 Free: ${highLeft} High / ${medLeft} Med${surplusSuffix} \xB7 Pool: ${pctText}`;
+        v5Label.setAttribute(
+          "title",
+          `Personal Reserve: ${effectiveNcp}/${maxNcp} V5 credits (accumulates daily up to 3 days). Bonus Pool activates above 50% shared pool.`
+        );
+        const barPct = maxNcp > 0 ? Math.min(100, Math.max(0, effectiveNcp / maxNcp * 100)) : 0;
         v5Fill.style.width = `${barPct}%`;
-        v5Fill.style.backgroundColor = resolveClusterStateColor(state.clusterState);
+        v5Fill.style.backgroundColor = resolveClusterStateColor(state.clusterState, theme);
       } else {
-        v5Label.textContent = `V5 Bank: --/-- NCP | Tank: ${pctText}`;
+        v5Label.textContent = `V5 Allowance: Syncing \xB7 Pool: ${pctText}`;
       }
     }
     if (v5Eta) {
+      v5Eta.style.color = `var(--theme-textSecondary, ${theme.textMuted})`;
       const etaStr = formatNextPercentEta(state.nextPercentEtaMs);
-      const stateTag = state.clusterState ? state.clusterState.replace(/_/g, " ").toUpperCase() : "";
-      v5Eta.textContent = [stateTag, etaStr].filter(Boolean).join(" \xB7 ");
+      const stateLabel = formatReadableClusterState(state.clusterState);
+      v5Eta.textContent = [stateLabel, etaStr].filter(Boolean).join(" \xB7 ");
     }
     if (costBadge) {
-      if (!activeModel) {
+      if (!activeModel || isV5 && isBaseAnlasBypass) {
+        costBadge.style.display = "none";
         costBadge.textContent = "";
       } else if (isMed) {
-        costBadge.textContent = `Cost: ${V5_MEDIUM_NCP_COST} NCP (Med)`;
-        costBadge.style.color = "var(--theme-accent, #00bc8c)";
+        costBadge.style.display = "";
+        costBadge.textContent = `Uses ${V5_MEDIUM_NCP_COST} V5 pts (Med)`;
+        costBadge.setAttribute("title", `Medium effort uses ${V5_MEDIUM_NCP_COST} credits vs ${V5_HIGH_NCP_COST} on High.`);
+        costBadge.style.color = `var(--theme-text, ${theme.text})`;
       } else if (isV5) {
-        costBadge.textContent = `Cost: ${V5_HIGH_NCP_COST} NCP (High)`;
-        costBadge.style.color = "var(--theme-accent, #00bc8c)";
+        costBadge.style.display = "";
+        costBadge.textContent = `Uses ${V5_HIGH_NCP_COST} V5 pts (High)`;
+        costBadge.setAttribute("title", `High effort uses ${V5_HIGH_NCP_COST} credits per free-size generation.`);
+        costBadge.style.color = `var(--theme-text, ${theme.text})`;
       } else {
-        costBadge.textContent = "Legacy (0 NCP)";
-        costBadge.style.color = "var(--theme-textSecondary, #aaa)";
+        costBadge.style.display = "";
+        costBadge.textContent = "Legacy (0 V5 pts)";
+        costBadge.style.color = `var(--theme-textSecondary, ${theme.textMuted})`;
       }
     }
     if (anlasLabel) {
       if (state.isUnlimitedAnlas) {
-        anlasLabel.textContent = "Anlas: Unlimited";
-        anlasLabel.style.color = "var(--theme-accent, #00bc8c)";
+        anlasLabel.textContent = "Monthly Anlas: Unlimited";
+        anlasLabel.style.color = `var(--theme-text, ${theme.text})`;
       } else if (state.isInDebt) {
-        anlasLabel.textContent = `Anlas Balance: ${state.virtualBalance} (Bypass Locked)`;
-        anlasLabel.style.color = "var(--theme-error, #e74c3c)";
+        anlasLabel.textContent = `Anlas Overdrawn: ${state.virtualBalance} (Paid Paused)`;
+        anlasLabel.style.color = `var(--theme-error, ${theme.error})`;
       } else if (typeof state.availableAnlas === "number") {
         const quotaSuffix = typeof state.monthlyQuota === "number" ? `/${state.monthlyQuota}` : "";
-        anlasLabel.textContent = `Anlas: ${state.availableAnlas}${quotaSuffix} (No Rollover)`;
-        anlasLabel.style.color = "var(--theme-textSecondary, #ccc)";
+        anlasLabel.textContent = `Monthly Anlas: ${state.availableAnlas}${quotaSuffix}`;
+        anlasLabel.style.color = `var(--theme-textSecondary, ${theme.textMuted})`;
       } else {
-        anlasLabel.textContent = "Anlas: -- (No Rollover)";
-        anlasLabel.style.color = "var(--theme-textSecondary, #ccc)";
+        anlasLabel.textContent = "Monthly Anlas: --";
+        anlasLabel.style.color = `var(--theme-textSecondary, ${theme.textMuted})`;
       }
     }
     if (bypassCheckbox && bypassText) {
       if (state.isInDebt) {
         bypassCheckbox.checked = false;
         bypassCheckbox.disabled = true;
-        bypassText.textContent = "Bypass Locked";
-        bypassText.style.color = "var(--theme-error, #e74c3c)";
+        bypassText.textContent = "Anlas Paused";
+        bypassText.style.color = `var(--theme-error, ${theme.error})`;
       } else {
         bypassCheckbox.disabled = false;
         bypassCheckbox.checked = Boolean(state.bypassEnabled);
-        bypassText.textContent = "Anlas Bypass";
-        bypassText.style.color = "var(--theme-warning, #f39c12)";
+        bypassText.textContent = "Use Anlas";
+        bypassText.style.color = state.bypassEnabled ? `var(--theme-accent, ${theme.accent})` : `var(--theme-textSecondary, ${theme.textMuted})`;
       }
     }
     if (modalBypass) {
@@ -961,14 +2155,16 @@
     if (!queueShieldLockActive) {
       if (state.subscriptionActive === false && state.lastFetchedAt > 0) {
         setGenerateLockoutState(true, "Subscription Inactive");
-      } else if (isV5 && !state.bypassEnabled && !state.masterTokenExpired && state.clusterState !== "token_expired") {
+      } else if (isV5 && !isBaseAnlasBypass && !state.bypassEnabled && !state.masterTokenExpired && state.clusterState !== "token_expired") {
         if (state.isHardLocked) {
-          setGenerateLockoutState(true, "Battery Recharging");
+          setGenerateLockoutState(true, "V5 Recharging");
         } else if (typeof state.v5AvailableNcp === "number" && !state.isUnlimitedV5 && state.lastFetchedAt > 0) {
           const reqNcp = isMed ? V5_MEDIUM_NCP_COST : V5_HIGH_NCP_COST;
-          const surplusAvail = state.v5SurplusEligible ? state.v5SurplusAvailableNcp || 0 : 0;
-          if (state.v5AvailableNcp < reqNcp && surplusAvail < reqNcp) {
-            setGenerateLockoutState(true, "V5 Quota Depleted");
+          const effectiveNcp = spendableMasterNcp !== null ? Math.min(state.v5AvailableNcp, spendableMasterNcp) : state.v5AvailableNcp;
+          const effectiveSurplus = spendableMasterNcp !== null && typeof state.v5SurplusAvailableNcp === "number" ? Math.min(state.v5SurplusAvailableNcp, spendableMasterNcp) : state.v5SurplusAvailableNcp || 0;
+          const surplusAvail = state.v5SurplusEligible ? effectiveSurplus : 0;
+          if (effectiveNcp < reqNcp && surplusAvail < reqNcp) {
+            setGenerateLockoutState(true, "V5 Allowance Reached");
           } else {
             setGenerateLockoutState(false, "");
           }
@@ -1028,15 +2224,6 @@
     setClientPolicyState(patch);
     return refreshDualLedgerHud();
   }
-  function isStepControlInput(input) {
-    if (!input || input.tagName !== "INPUT") return false;
-    if (input.id === "gw-bypass-toggle" || input.id === "settings-anlas-bypass") return false;
-    const aria = (input.getAttribute("aria-label") || "").toLowerCase();
-    const name = (input.getAttribute("name") || "").toLowerCase();
-    const id = (input.id || "").toLowerCase();
-    const dataCtrl = (input.getAttribute("data-gw-control") || "").toLowerCase();
-    return dataCtrl === "steps" || aria.includes("step") || name.includes("step") || id.includes("step");
-  }
   function syncUIControlConstraints(state = getClientPolicyState()) {
     if (typeof document === "undefined" || typeof document.querySelectorAll !== "function") return;
     const activeModel = state.activeModel || "";
@@ -1062,7 +2249,7 @@
         if (Number.isFinite(numVal) && numVal >= 24 && numVal <= 28) {
           deadbandTriggered = true;
           setHudAlert(
-            "Steps 24-28 on V5 Full (High) are prohibited (battery deadband). Use \u226423 for free tier, switch to Medium effort, or enable Anlas bypass with >28 steps.",
+            "V5 High allows up to 23 steps without Anlas (or 29+ steps when using Anlas). Steps 24\u201328 are blocked to protect shared V5 limits\u2014use \u226423 steps or switch to Medium.",
             "warning"
           );
         }
@@ -1071,7 +2258,7 @@
         input.setAttribute("max", state.bypassEnabled ? "50" : "28");
       }
     }
-    if (!deadbandTriggered && lastHudAlertText && lastHudAlertText.includes("deadband") && (!isV5High || foundStepInput && !hasStepInDeadband)) {
+    if (!deadbandTriggered && lastHudAlertText && lastHudAlertText.includes("24\u201328") && (!isV5High || foundStepInput && !hasStepInDeadband)) {
       setHudAlert("", "info");
     }
   }
@@ -1125,15 +2312,19 @@
   function updateAllowanceBar(allowance, maxAllowance, nextRefillMs = 0) {
     injectAllowanceBar();
     injectDualLedgerBar();
+    const barRoot = document.getElementById("gw-allowance-bar");
     const labelSpan = document.getElementById("gw-allowance-label");
     const fillDiv = document.getElementById("gw-allowance-fill");
-    if (!labelSpan || !fillDiv) return;
+    if (!barRoot || !labelSpan || !fillDiv) return;
+    const theme = ensureGuildWeaveStyles();
     if (allowance === null || maxAllowance === Infinity) {
-      labelSpan.textContent = "Rolling Allowance: Exempt (Unlimited)";
+      barRoot.style.display = "none";
+      labelSpan.textContent = "Image Allowance: Unlimited";
       fillDiv.style.width = "100%";
-      fillDiv.style.backgroundColor = "var(--theme-accent, #00bc8c)";
+      fillDiv.style.backgroundColor = `var(--theme-accent, ${theme.accent})`;
       return;
     }
+    barRoot.style.display = "flex";
     const max = maxAllowance || 100;
     const clampedAllowance = Math.max(0, allowance);
     const percent = Math.min(100, Math.max(0, clampedAllowance / max * 100));
@@ -1144,20 +2335,21 @@
     } else if (clampedAllowance >= max) {
       refillSuffix = " (Full)";
     }
-    labelSpan.textContent = `Rolling Allowance: ${clampedAllowance}/${max} Images${refillSuffix}`;
+    labelSpan.textContent = `Image Allowance: ${clampedAllowance}/${max}${refillSuffix}`;
     fillDiv.style.width = `${percent}%`;
     if (percent < 20) {
-      fillDiv.style.backgroundColor = "var(--theme-error, #e74c3c)";
+      fillDiv.style.backgroundColor = `var(--theme-error, ${theme.error})`;
     } else if (percent < 50) {
-      fillDiv.style.backgroundColor = "var(--theme-warning, #f39c12)";
+      fillDiv.style.backgroundColor = `var(--theme-warning, ${theme.warning})`;
     } else {
-      fillDiv.style.backgroundColor = "var(--theme-success, #2ecc71)";
+      fillDiv.style.backgroundColor = `var(--theme-accent, ${theme.accent})`;
     }
   }
   function injectQueueShield() {
     const genBtn = document.querySelector(".image-gen-generate-button");
     if (!genBtn) return false;
     if (document.getElementById("gw-button-shield")) return true;
+    const theme = ensureGuildWeaveStyles();
     genBtn.style.position = "relative";
     genBtn.style.overflow = "hidden";
     const shield = document.createElement("div");
@@ -1170,9 +2362,9 @@
     z-index: 9999 !important;
     box-sizing: border-box !important;
     margin: 0 !important;
-    background: var(--theme-bg1, rgb(24, 26, 46)) !important;
+    background: var(--theme-bg1, ${theme.bg1}) !important;
     border-radius: inherit !important;
-    border: 1px solid var(--theme-accent, #00bc8c) !important;
+    border: 1px solid var(--theme-accent, ${theme.borderStrong}) !important;
     cursor: wait !important;
     display: none;
     pointer-events: none;
@@ -1181,11 +2373,11 @@
     opacity: 1 !important;
   `.replace(/\s+/g, " ").trim();
     const pulseIndicator = document.createElement("div");
-    pulseIndicator.style.cssText = "width:8px; height:8px; border-radius:50%; background:var(--theme-accent, #00bc8c); margin-right:8px; animation:gwPulse 1s infinite alternate; flex-shrink:0;";
+    pulseIndicator.style.cssText = `width:8px; height:8px; border-radius:50%; background:var(--theme-accent, ${theme.accent}); margin-right:8px; animation:gwPulse 1s infinite alternate; flex-shrink:0;`;
     const labelText = document.createElement("span");
     labelText.id = "gw-shield-text";
-    labelText.style.cssText = "font-weight:bold; font-size:13px; color:var(--theme-textHeadings, #fff); white-space:nowrap; letter-spacing:0.5px;";
-    labelText.textContent = "Queue Slot Active...";
+    labelText.style.cssText = `font-weight:bold; font-size:13px; color:var(--theme-textHeadings, ${theme.text}); white-space:nowrap; letter-spacing:0.5px;`;
+    labelText.textContent = "Joining Queue...";
     shield.appendChild(pulseIndicator);
     shield.appendChild(labelText);
     genBtn.appendChild(shield);
@@ -1225,9 +2417,10 @@
   }
   function setGenerateLockoutState(locked, reasonText = "") {
     if (queueShieldLockActive) return;
-    applyButtonShieldVisual(Boolean(locked), reasonText || "V5 Quota Depleted", "not-allowed");
+    applyButtonShieldVisual(Boolean(locked), reasonText || "V5 Allowance Reached", "not-allowed");
   }
   var observerInstance = null;
+  var headObserverInstance = null;
   var rafScheduled = false;
   var observedInputRoot = null;
   var inputConstraintHandler = null;
@@ -1241,12 +2434,22 @@
       injectQueueShield();
       refreshDualLedgerHud();
     };
+    const scheduleSync = () => {
+      if (!rafScheduled) {
+        rafScheduled = true;
+        if (typeof requestAnimationFrame === "function") {
+          requestAnimationFrame(runSync);
+        } else {
+          setTimeout(runSync, 16);
+        }
+      }
+    };
     observerInstance = new MutationObserver((mutations) => {
       let relevant = false;
       for (const m of mutations) {
         if (m.target) {
-          if (m.target.id && m.target.id.startsWith("gw-")) continue;
-          if (typeof m.target.closest === "function" && m.target.closest('[id^="gw-"]')) continue;
+          if (m.target.id && (m.target.id.startsWith("gw-") || m.target.id.startsWith("vps-"))) continue;
+          if (typeof m.target.closest === "function" && (m.target.closest('[id^="gw-"]') || m.target.closest('[id^="vps-"]'))) continue;
         }
         if (m.type === "attributes") {
           relevant = true;
@@ -1257,13 +2460,8 @@
           break;
         }
       }
-      if (relevant && !rafScheduled) {
-        rafScheduled = true;
-        if (typeof requestAnimationFrame === "function") {
-          requestAnimationFrame(runSync);
-        } else {
-          setTimeout(runSync, 16);
-        }
+      if (relevant) {
+        scheduleSync();
       }
     });
     const root = document.body || document.documentElement;
@@ -1277,13 +2475,30 @@
       if (typeof root.addEventListener === "function") {
         observedInputRoot = root;
         inputConstraintHandler = (ev) => {
-          if (ev && isStepControlInput(ev.target)) {
-            syncUIControlConstraints(getClientPolicyState());
+          if (ev && ev.target && !isInsideGuildWeaveNode(ev.target)) {
+            refreshDualLedgerHud();
           }
         };
         root.addEventListener("input", inputConstraintHandler, true);
         root.addEventListener("change", inputConstraintHandler, true);
       }
+    }
+    if (typeof document !== "undefined" && document.head && document.head !== root) {
+      headObserverInstance = new MutationObserver((mutations) => {
+        for (const m of mutations) {
+          if (m.target && m.target.id === "gw-ui-styles") continue;
+          const touchesOwnStyle = Array.from(m.addedNodes || []).some((n) => n && n.id === "gw-ui-styles") || Array.from(m.removedNodes || []).some((n) => n && n.id === "gw-ui-styles");
+          if (!touchesOwnStyle) {
+            scheduleSync();
+            break;
+          }
+        }
+      });
+      headObserverInstance.observe(document.head, {
+        childList: true,
+        subtree: true,
+        characterData: true
+      });
     }
     runSync();
   }
@@ -1291,6 +2506,10 @@
     if (observerInstance) {
       observerInstance.disconnect();
       observerInstance = null;
+    }
+    if (headObserverInstance) {
+      headObserverInstance.disconnect();
+      headObserverInstance = null;
     }
     if (observedInputRoot && inputConstraintHandler && typeof observedInputRoot.removeEventListener === "function") {
       observedInputRoot.removeEventListener("input", inputConstraintHandler, true);
@@ -1311,8 +2530,8 @@
     if (document.getElementById("vps-debug-badge")) return;
     const badge = document.createElement("div");
     badge.id = "vps-debug-badge";
-    badge.innerHTML = message;
-    badge.style.cssText = `position:fixed; top:10px; left:50%; transform:translateX(-50%); background:${bgColor}; color:#fff; font-weight:bold; font-size:11px; padding:6px 12px; border-radius:4px; z-index:99999; box-shadow:0 2px 8px rgba(0,0,0,0.4); pointer-events:none; font-family:sans-serif;`;
+    badge.textContent = message;
+    badge.style.cssText = `position:fixed; top:10px; left:50%; transform:translateX(-50%); background:${bgColor}; color:#fff; font-weight:600; font-size:11px; padding:6px 14px; border-radius:999px; z-index:99999; box-shadow:0 4px 12px rgba(0,0,0,0.45); pointer-events:none; font-family:sans-serif;`;
     const root = document.body || document.documentElement;
     if (root) root.appendChild(badge);
   }
@@ -1516,7 +2735,7 @@
         GM_setValue("anlas_bypass_enabled", false);
         setClientPolicyState({ isInDebt: true, bypassEnabled: false });
         refreshDualLedgerHud();
-        setHudAlert(parsedError.message || "Account is in Anlas debt. Bypass locked.", "error");
+        setHudAlert(parsedError.message || "Anlas overdrawn. Paid features paused until balance is restored.", "error");
       } else if (parsedError && (parsedError.message || parsedError.error) && (status === 400 || status === 403 || status === 429 || status === 503)) {
         setHudAlert(parsedError.message || parsedError.error, status === 403 || status === 503 ? "error" : "warning");
       }
@@ -1542,6 +2761,199 @@
       }));
       return true;
     }
+  }
+  async function dispatchThroughChannelA({
+    url,
+    config,
+    req_id,
+    joinPayload,
+    proxyHeaders,
+    isImageGen,
+    refreshTelemetry
+  }) {
+    try {
+      const joinRes = await backgroundRequest({
+        method: "POST",
+        url: `${envConfig.VPS_HOST}/queue/join`,
+        headers: {
+          "Content-Type": "application/json",
+          "Authorization": `Bearer ${envConfig.deviceSecret}`
+        },
+        data: JSON.stringify(joinPayload)
+      });
+      if (joinRes.status === 401) {
+        console.warn(`[${envConfig.logPrefix}] Server returned 401 on queue join. Restoring setup lock.`);
+        GM_setValue("approved", false);
+        if (typeof envConfig.onRevoked === "function") {
+          envConfig.onRevoked();
+        }
+        return new Response(JSON.stringify({ statusCode: 401, message: "Device revoked." }), { status: 401 });
+      }
+      if (joinRes.status !== 200) {
+        let errorDetails = {};
+        try {
+          errorDetails = JSON.parse(joinRes.responseText || "{}");
+        } catch (e) {
+          console.error(`[${envConfig.logPrefix}]: Failed to parse error response text safely`, e);
+        }
+        hideQueueStatusBanner();
+        if (errorDetails.error === "ALLOWANCE_EXHAUSTED") {
+          const msg = "Allowance Exhausted: You have run out of image tokens. Allowance refills at a rate of 1 image per 30 minutes (max 100).";
+          setHudAlert(msg, "error");
+          return new Response(JSON.stringify({
+            statusCode: 403,
+            error: "ALLOWANCE_EXHAUSTED",
+            message: msg
+          }), { status: 403 });
+        }
+        if (errorDetails.error === "DEBT_LOCKED") {
+          GM_setValue("anlas_bypass_enabled", false);
+          setClientPolicyState({ isInDebt: true, bypassEnabled: false });
+          refreshDualLedgerHud();
+        }
+        if (typeof envConfig.onTelemetryRefresh === "function" && (joinRes.status === 403 || joinRes.status === 429 || joinRes.status === 503)) {
+          setTimeout(() => {
+            try {
+              envConfig.onTelemetryRefresh();
+            } catch (_) {
+            }
+          }, 0);
+        }
+        if (joinRes.status === 400 || joinRes.status === 403 || joinRes.status === 429 || joinRes.status === 503) {
+          const msg = errorDetails.message || errorDetails.error || "Queue admission rejected.";
+          setHudAlert(msg, joinRes.status === 403 || joinRes.status === 503 ? "error" : "warning");
+          return new Response(JSON.stringify({
+            statusCode: joinRes.status,
+            error: errorDetails.error,
+            message: msg
+          }), {
+            status: joinRes.status,
+            headers: { "Content-Type": "application/json" }
+          });
+        }
+        throw new Error("Join rejection");
+      }
+    } catch (e) {
+      return new Response(JSON.stringify({ statusCode: 502, message: "Queue allocation failure" }), { status: 502 });
+    }
+    let turnAcquired = false;
+    showQueueStatusBanner("Acquiring channel slot...");
+    while (!turnAcquired) {
+      await new Promise((r) => setTimeout(r, 1e3));
+      try {
+        const statusRes = await backgroundRequest({
+          method: "GET",
+          url: `${envConfig.VPS_HOST}/queue/status?req_id=${req_id}&browser_id=${envConfig.browserId}`,
+          headers: { "Authorization": `Bearer ${envConfig.deviceSecret}` }
+        });
+        if (statusRes.status === 200) {
+          const sData = JSON.parse(statusRes.responseText);
+          if (sData.status === "your_turn") {
+            turnAcquired = true;
+            hideQueueStatusBanner();
+          } else if (sData.status === "waiting") {
+            showQueueStatusBanner(`Queue Position: ${sData.position}`);
+          }
+        } else {
+          throw new Error("Expired state");
+        }
+      } catch (e) {
+        hideQueueStatusBanner();
+        backgroundRequest({
+          method: "POST",
+          url: `${envConfig.VPS_HOST}/queue/complete`,
+          headers: {
+            "Content-Type": "application/json",
+            "Authorization": `Bearer ${envConfig.deviceSecret}`
+          },
+          data: JSON.stringify({ req_id, browser_id: envConfig.browserId })
+        });
+        return new Response(JSON.stringify({ statusCode: 502, message: "Queue processing aborted" }), { status: 502 });
+      }
+    }
+    const originalUrlObj = new URL(url);
+    const subdomain = originalUrlObj.hostname.split(".")[0];
+    const proxyUrl = `${envConfig.VPS_HOST}/proxy/${subdomain}${originalUrlObj.pathname}${originalUrlObj.search}`;
+    const updatedHeaders = /* @__PURE__ */ new Map();
+    if (config.headers) {
+      if (config.headers instanceof Headers) {
+        for (let [k, v] of config.headers.entries()) {
+          updatedHeaders.set(k.toLowerCase(), v);
+        }
+      } else {
+        Object.keys(config.headers).forEach((k) => {
+          updatedHeaders.set(k.toLowerCase(), config.headers[k]);
+        });
+      }
+    }
+    for (const [k, v] of Object.entries(proxyHeaders)) {
+      if (v !== void 0 && v !== null) {
+        updatedHeaders.set(k.toLowerCase(), String(v));
+      }
+    }
+    updatedHeaders.set("x-browser-id", envConfig.browserId);
+    updatedHeaders.set("x-request-id", req_id);
+    updatedHeaders.set("authorization", `Bearer ${envConfig.deviceSecret}`);
+    updatedHeaders.set("x-script-version", GM_info.script.version);
+    if (GM_getValue("debug_mode", false)) {
+      updatedHeaders.set("x-debug-mode", "true");
+      console.log(`[GuildWeave Debug Mode] Outbound payload details:`, config.body);
+    }
+    updatedHeaders.delete("host");
+    updatedHeaders.delete("content-length");
+    if (typeof FormData !== "undefined" && config.body instanceof FormData) {
+      updatedHeaders.delete("content-type");
+    }
+    let hasResolved = false;
+    console.log(`[${envConfig.logPrefix}] Intercepting fetch targeting GuildWeave rewrite URL: ${proxyUrl}`);
+    return new Promise((resolve, reject) => {
+      GM_xmlhttpRequest({
+        method: config.method || "POST",
+        url: proxyUrl,
+        headers: Object.fromEntries(updatedHeaders.entries()),
+        data: config.body,
+        responseType: "stream",
+        onloadstart: async function(responseDetails) {
+          console.log(`[${envConfig.logPrefix}] Telemetry: onloadstart fired. ReadyState: ${responseDetails.readyState}, Status: ${extractStatusCode(responseDetails)}`);
+          if (hasResolved) return;
+          if (await tryResolveProxyResponse(responseDetails, resolve, isImageGen, false, refreshTelemetry)) {
+            hasResolved = true;
+          }
+        },
+        onreadystatechange: async function(responseDetails) {
+          console.log(`[${envConfig.logPrefix}] Telemetry: onreadystatechange fired. ReadyState: ${responseDetails.readyState}, ExtractedStatus: ${extractStatusCode(responseDetails)}`);
+          if (hasResolved) return;
+          if (responseDetails.readyState >= 2) {
+            if (await tryResolveProxyResponse(responseDetails, resolve, isImageGen, false, refreshTelemetry)) {
+              hasResolved = true;
+            }
+          }
+        },
+        onload: async function(responseDetails) {
+          console.log(`[${envConfig.logPrefix}] Telemetry: onload fired. Status: ${extractStatusCode(responseDetails)}. Socket download complete.`);
+          if (hasResolved) return;
+          if (await tryResolveProxyResponse(responseDetails, resolve, isImageGen, false, refreshTelemetry)) {
+            hasResolved = true;
+          }
+        },
+        onerror: (err) => {
+          console.error(`[${envConfig.logPrefix}] Telemetry: Fatal network transport crash during GM_xmlhttpRequest transmission.`, err);
+          backgroundRequest({
+            method: "POST",
+            url: `${envConfig.VPS_HOST}/queue/complete`,
+            headers: {
+              "Content-Type": "application/json",
+              "Authorization": `Bearer ${envConfig.deviceSecret}`
+            },
+            data: JSON.stringify({ req_id, browser_id: envConfig.browserId })
+          });
+          if (!hasResolved) {
+            hasResolved = true;
+            reject(err);
+          }
+        }
+      });
+    });
   }
   async function handleGenerationIntercept(url, config) {
     const req_id = "req_" + generateUUID();
@@ -1597,225 +3009,90 @@
         headers: { "Content-Type": "application/json" }
       });
     }
-    const executeQueueJoin = async () => {
-      try {
-        const joinPayload = {
-          browser_id: envConfig.browserId,
-          tab_id,
-          req_id,
-          ...imgParams.model ? { model: imgParams.model } : {},
-          steps: imgParams.steps,
-          width: imgParams.width,
-          height: imgParams.height,
-          n_samples: imgParams.n_samples,
-          is_base_paid: policy.isBasePaid,
-          is_v5: policy.isV5,
-          declared_anlas: policy.costDetails.total
-        };
-        const joinRes = await backgroundRequest({
-          method: "POST",
-          url: `${envConfig.VPS_HOST}/queue/join`,
-          headers: {
-            "Content-Type": "application/json",
-            "Authorization": `Bearer ${envConfig.deviceSecret}`
-          },
-          data: JSON.stringify(joinPayload)
-        });
-        if (joinRes.status === 401) {
-          console.warn(`[${envConfig.logPrefix}] Server returned 401 on queue join. Restoring setup lock.`);
-          GM_setValue("approved", false);
-          if (typeof envConfig.onRevoked === "function") {
-            envConfig.onRevoked();
-          }
-          return new Response(JSON.stringify({ statusCode: 401, message: "Device revoked." }), { status: 401 });
-        }
-        if (joinRes.status !== 200) {
-          let errorDetails = {};
-          try {
-            errorDetails = JSON.parse(joinRes.responseText || "{}");
-          } catch (e) {
-            console.error(`[${envConfig.logPrefix}]: Failed to parse error response text safely`, e);
-          }
-          hideQueueStatusBanner();
-          if (errorDetails.error === "ALLOWANCE_EXHAUSTED") {
-            const msg = "Allowance Exhausted: You have run out of image tokens. Allowance refills at a rate of 1 image per 30 minutes (max 100).";
-            setHudAlert(msg, "error");
-            return new Response(JSON.stringify({
-              statusCode: 403,
-              error: "ALLOWANCE_EXHAUSTED",
-              message: msg
-            }), { status: 403 });
-          }
-          if (errorDetails.error === "DEBT_LOCKED") {
-            GM_setValue("anlas_bypass_enabled", false);
-            setClientPolicyState({ isInDebt: true, bypassEnabled: false });
-            refreshDualLedgerHud();
-          }
-          if (typeof envConfig.onTelemetryRefresh === "function" && (joinRes.status === 403 || joinRes.status === 429 || joinRes.status === 503)) {
-            setTimeout(() => {
-              try {
-                envConfig.onTelemetryRefresh();
-              } catch (_) {
-              }
-            }, 0);
-          }
-          if (joinRes.status === 400 || joinRes.status === 403 || joinRes.status === 429 || joinRes.status === 503) {
-            const msg = errorDetails.message || errorDetails.error || "Queue admission rejected.";
-            setHudAlert(msg, joinRes.status === 403 || joinRes.status === 503 ? "error" : "warning");
-            return new Response(JSON.stringify({
-              statusCode: joinRes.status,
-              error: errorDetails.error,
-              message: msg
-            }), {
-              status: joinRes.status,
-              headers: { "Content-Type": "application/json" }
-            });
-          }
-          throw new Error("Join rejection");
-        }
-      } catch (e) {
-        return new Response(JSON.stringify({ statusCode: 502, message: "Queue allocation failure" }), { status: 502 });
-      }
-      let turnAcquired = false;
-      showQueueStatusBanner("Acquiring channel slot...");
-      while (!turnAcquired) {
-        await new Promise((r) => setTimeout(r, 1e3));
-        try {
-          const statusRes = await backgroundRequest({
-            method: "GET",
-            url: `${envConfig.VPS_HOST}/queue/status?req_id=${req_id}&browser_id=${envConfig.browserId}`,
-            headers: { "Authorization": `Bearer ${envConfig.deviceSecret}` }
-          });
-          if (statusRes.status === 200) {
-            const sData = JSON.parse(statusRes.responseText);
-            if (sData.status === "your_turn") {
-              turnAcquired = true;
-              hideQueueStatusBanner();
-            } else if (sData.status === "waiting") {
-              showQueueStatusBanner(`Queue Position: ${sData.position}`);
-            }
-          } else {
-            throw new Error("Expired state");
-          }
-        } catch (e) {
-          hideQueueStatusBanner();
-          backgroundRequest({
-            method: "POST",
-            url: `${envConfig.VPS_HOST}/queue/complete`,
-            headers: {
-              "Content-Type": "application/json",
-              "Authorization": `Bearer ${envConfig.deviceSecret}`
-            },
-            data: JSON.stringify({ req_id, browser_id: envConfig.browserId })
-          });
-          return new Response(JSON.stringify({ statusCode: 502, message: "Queue processing aborted" }), { status: 502 });
-        }
-      }
-      const originalUrlObj = new URL(url);
-      const subdomain = originalUrlObj.hostname.split(".")[0];
-      const proxyUrl = `${envConfig.VPS_HOST}/proxy/${subdomain}${originalUrlObj.pathname}${originalUrlObj.search}`;
-      const updatedHeaders = /* @__PURE__ */ new Map();
-      if (config.headers) {
-        if (config.headers instanceof Headers) {
-          for (let [k, v] of config.headers.entries()) {
-            updatedHeaders.set(k.toLowerCase(), v);
-          }
-        } else {
-          Object.keys(config.headers).forEach((k) => {
-            updatedHeaders.set(k.toLowerCase(), config.headers[k]);
-          });
-        }
-      }
-      const isV5Medium = isV5MediumModel(imgParams.model);
-      const isV5 = isV5ModelFamily(imgParams.model);
-      updatedHeaders.set("x-browser-id", envConfig.browserId);
-      updatedHeaders.set("x-request-id", req_id);
-      updatedHeaders.set("x-gen-width", imgParams.width.toString());
-      updatedHeaders.set("x-gen-height", imgParams.height.toString());
-      updatedHeaders.set("x-gen-steps", imgParams.steps.toString());
-      updatedHeaders.set("x-gen-samples", imgParams.n_samples.toString());
-      updatedHeaders.set("x-precise-refs", imgParams.precise_refs.toString());
-      if (isV5Medium) {
-        updatedHeaders.set("x-gen-model", "V5-medium");
-      } else if (isV5) {
-        updatedHeaders.set("x-gen-model", "V5");
-      } else {
-        updatedHeaders.set("x-gen-model", "legacy");
-      }
-      updatedHeaders.set("x-base-paid", policy.isBasePaid ? "true" : "false");
-      updatedHeaders.set("x-declared-anlas", policy.costDetails.total.toString());
-      if (scrapedAnlas !== null) {
-        updatedHeaders.set("x-scraped-anlas", scrapedAnlas.toString());
-      }
-      updatedHeaders.set("authorization", `Bearer ${envConfig.deviceSecret}`);
-      updatedHeaders.set("x-script-version", GM_info.script.version);
-      if (GM_getValue("debug_mode", false)) {
-        updatedHeaders.set("x-debug-mode", "true");
-        console.log(`[GuildWeave Debug Mode] Outbound image generation details:`, originalBody);
-      }
-      updatedHeaders.delete("host");
-      updatedHeaders.delete("content-length");
-      if (typeof FormData !== "undefined" && originalBody instanceof FormData) {
-        updatedHeaders.delete("content-type");
-      }
-      let hasResolved = false;
-      console.log(`[${envConfig.logPrefix}] Intercepting fetch targeting GuildWeave rewrite URL: ${proxyUrl}`);
-      return new Promise((resolve, reject) => {
-        GM_xmlhttpRequest({
-          method: config.method || "POST",
-          url: proxyUrl,
-          headers: Object.fromEntries(updatedHeaders.entries()),
-          data: originalBody,
-          responseType: "stream",
-          onloadstart: async function(responseDetails) {
-            console.log(`[${envConfig.logPrefix}] Telemetry: onloadstart fired. ReadyState: ${responseDetails.readyState}, Status: ${extractStatusCode(responseDetails)}`);
-            if (hasResolved) return;
-            if (await tryResolveProxyResponse(responseDetails, resolve, true, false, true)) {
-              hasResolved = true;
-            }
-          },
-          onreadystatechange: async function(responseDetails) {
-            console.log(`[${envConfig.logPrefix}] Telemetry: onreadystatechange fired. ReadyState: ${responseDetails.readyState}, ExtractedStatus: ${extractStatusCode(responseDetails)}`);
-            if (hasResolved) return;
-            if (responseDetails.readyState >= 2) {
-              if (await tryResolveProxyResponse(responseDetails, resolve, true, false, true)) {
-                hasResolved = true;
-              }
-            }
-          },
-          onload: async function(responseDetails) {
-            console.log(`[${envConfig.logPrefix}] Telemetry: onload fired. Status: ${extractStatusCode(responseDetails)}. Socket download complete.`);
-            if (hasResolved) return;
-            if (await tryResolveProxyResponse(responseDetails, resolve, true, false, true)) {
-              hasResolved = true;
-            }
-          },
-          onerror: (err) => {
-            console.error(`[${envConfig.logPrefix}] Telemetry: Fatal network transport crash during GM_xmlhttpRequest transmission.`, err);
-            backgroundRequest({
-              method: "POST",
-              url: `${envConfig.VPS_HOST}/queue/complete`,
-              headers: {
-                "Content-Type": "application/json",
-                "Authorization": `Bearer ${envConfig.deviceSecret}`
-              },
-              data: JSON.stringify({ req_id, browser_id: envConfig.browserId })
-            });
-            if (!hasResolved) {
-              hasResolved = true;
-              reject(err);
-            }
-          }
-        });
-      });
+    const isV5Medium = isV5MediumModel(imgParams.model);
+    const isV5 = isV5ModelFamily(imgParams.model);
+    const joinPayload = {
+      browser_id: envConfig.browserId,
+      tab_id,
+      req_id,
+      ...imgParams.model ? { model: imgParams.model } : {},
+      steps: imgParams.steps,
+      width: imgParams.width,
+      height: imgParams.height,
+      n_samples: imgParams.n_samples,
+      is_base_paid: policy.isBasePaid,
+      is_v5: policy.isV5,
+      declared_anlas: policy.costDetails.total
     };
-    let resolveOuter, rejectOuter;
-    const outerPromise = new Promise((res, rej) => {
-      resolveOuter = res;
-      rejectOuter = rej;
+    const proxyHeaders = {
+      "x-gen-width": imgParams.width.toString(),
+      "x-gen-height": imgParams.height.toString(),
+      // Stage 5 Invariant: forward exact body steps (14 default for Medium / 28 default otherwise when absent)
+      "x-gen-steps": imgParams.steps.toString(),
+      "x-gen-samples": imgParams.n_samples.toString(),
+      "x-precise-refs": imgParams.precise_refs.toString(),
+      "x-gen-model": isV5Medium ? "V5-medium" : isV5 ? "V5" : "legacy",
+      "x-base-paid": policy.isBasePaid ? "true" : "false",
+      "x-declared-anlas": policy.costDetails.total.toString(),
+      ...scrapedAnlas !== null ? { "x-scraped-anlas": scrapedAnlas.toString() } : {}
+    };
+    return dispatchThroughChannelA({
+      url,
+      config,
+      req_id,
+      joinPayload,
+      proxyHeaders,
+      isImageGen: true,
+      refreshTelemetry: true
     });
-    executeQueueJoin().then(resolveOuter, rejectOuter);
-    return outerPromise;
+  }
+  async function handleUpscaleIntercept(url, config) {
+    const req_id = "req_" + generateUUID();
+    const tab_id = typeof sessionStorage !== "undefined" && sessionStorage.getItem("vps_tab_id") || (() => {
+      const tid = "t_" + generateUUID();
+      if (typeof sessionStorage !== "undefined") {
+        sessionStorage.setItem("vps_tab_id", tid);
+      }
+      return tid;
+    })();
+    const dims = await extractUpscaleBodyParams(config.body);
+    const currentState = getClientPolicyState();
+    const policy = evaluateUpscalePolicy(dims, currentState);
+    if (!policy.ok) {
+      hideQueueStatusBanner();
+      setHudAlert(policy.message, policy.status === 403 ? "error" : "warning");
+      return new Response(JSON.stringify({
+        statusCode: policy.status,
+        error: policy.error,
+        message: policy.message
+      }), {
+        status: policy.status,
+        headers: { "Content-Type": "application/json" }
+      });
+    }
+    const joinPayload = {
+      browser_id: envConfig.browserId,
+      tab_id,
+      req_id,
+      is_upscale: true,
+      width: dims.width,
+      height: dims.height,
+      declared_anlas: policy.cost
+    };
+    const proxyHeaders = {
+      "x-gen-width": dims.width.toString(),
+      "x-gen-height": dims.height.toString(),
+      "x-declared-anlas": policy.cost.toString()
+    };
+    return dispatchThroughChannelA({
+      url,
+      config,
+      req_id,
+      joinPayload,
+      proxyHeaders,
+      isImageGen: false,
+      refreshTelemetry: true
+    });
   }
   async function handleTextGenerationIntercept(url, config, defaultMethod = "POST", options = {}) {
     const { countAsTextGen = true, refreshTelemetry = false } = options;
@@ -1906,6 +3183,10 @@
             const cloned = response.clone();
             try {
               const data = await cloned.json();
+              const policyState = getClientPolicyState();
+              const hasKnownFiniteAnlas = typeof policyState.availableAnlas === "number" && Number.isFinite(policyState.availableAnlas) && !policyState.isUnlimitedAnlas;
+              const fixedAnlas = hasKnownFiniteAnlas ? Math.max(0, Math.trunc(policyState.availableAnlas)) : 9999;
+              const purchasedAnlas = hasKnownFiniteAnlas ? 0 : 9999;
               data.subscription = {
                 tier: 3,
                 active: true,
@@ -1920,8 +3201,8 @@
                 },
                 paymentProcessorData: null,
                 trainingStepsLeft: {
-                  fixedTrainingStepsLeft: 9999,
-                  purchasedTrainingSteps: 9999
+                  fixedTrainingStepsLeft: fixedAnlas,
+                  purchasedTrainingSteps: purchasedAnlas
                 },
                 accountType: 0,
                 isGracePeriod: false,
@@ -1962,6 +3243,9 @@
         if (urlString.includes("/ai/generate-image") && !urlString.includes("/suggest-tags")) {
           return handleGenerationIntercept(urlString, config);
         }
+        if (urlString.includes("/ai/upscale")) {
+          return handleUpscaleIntercept(urlString, config);
+        }
         if (urlString.includes("/ai/generate-stream") || urlString.includes("/oa/v1/completions")) {
           return handleTextGenerationIntercept(urlString, config, "POST", {
             countAsTextGen: true,
@@ -1985,6 +3269,7 @@
   var approved = GM_getValue("approved", false);
   var VPS_HOST = GM_getValue("vps_host", "");
   var currentSort = GM_getValue("admin_sort_mode", "anlas");
+  var selectedCycleEpoch = "";
   var activeSubTab = "governance";
   var expandedKeys = /* @__PURE__ */ new Set();
   function parseStrictPromptInt(rawInput) {
@@ -1993,6 +3278,12 @@
     if (!/^-?\d+$/.test(trimmed)) return null;
     const parsed = Number(trimmed);
     return Number.isSafeInteger(parsed) ? parsed : null;
+  }
+  function formatCycleLabel(cycle) {
+    if (!cycle || !cycle.cycle_epoch) return "Pre-Cycle Baseline";
+    const dt = new Date(cycle.cycle_epoch);
+    const dateStr = isNaN(dt.getTime()) ? String(cycle.cycle_epoch) : dt.toLocaleDateString();
+    return cycle.is_active ? `Current Cycle (${dateStr})` : `Cycle: ${dateStr}`;
   }
   try {
     if (!browserId) {
@@ -2010,9 +3301,10 @@
       if (!document.body) return;
       let overlay = document.getElementById("vps-approval-overlay");
       if (!overlay) {
+        const theme = ensureGuildWeaveStyles();
         overlay = document.createElement("div");
         overlay.id = "vps-approval-overlay";
-        overlay.style.cssText = "position:fixed !important; top:0 !important; left:0 !important; width:100vw !important; height:100vh !important; background:var(--theme-bg0, #121212) !important; color:var(--theme-text, #fff) !important; z-index:2147483647 !important; display:flex !important; flex-direction:column !important; align-items:center !important; justify-content:center !important; font-family:inherit !important;";
+        overlay.style.cssText = `position:fixed !important; top:0 !important; left:0 !important; width:100vw !important; height:100vh !important; background:var(--theme-bg0, ${theme.bg0}) !important; color:var(--theme-text, ${theme.text}) !important; z-index:2147483647 !important; display:flex !important; flex-direction:column !important; align-items:center !important; justify-content:center !important; font-family:inherit !important;`;
         document.body.appendChild(overlay);
         renderSetupWizard(overlay);
       }
@@ -2020,34 +3312,34 @@
   }
   function renderSetupWizard(container) {
     if (container.querySelector(".setup-wizard-card")) return;
+    const theme = ensureGuildWeaveStyles();
+    const safeHost = escapeHtml(GM_getValue("vps_host", ""));
+    const safeNick = escapeHtml(GM_getValue("device_nickname", ""));
     container.innerHTML = `
-        <div class="setup-wizard-card" style="background:var(--theme-bg1, #1c1c1c); padding:35px; border-radius:8px; border:1px solid var(--theme-error, #c0392b); box-shadow:0 8px 30px rgba(0,0,0,0.6); max-width:90vw; width:420px; box-sizing:border-box; color:var(--theme-text, #fff); font-family:inherit;">
-            <h3 style="margin:0 0 15px 0; color:var(--theme-accent, #00bc8c); text-align:center; letter-spacing:1px; font-size:18px;">GUILDWEAVE SETUP (ADMIN)</h3>
+        <div class="setup-wizard-card gw-card" style="background:var(--theme-bg1, ${theme.bg1}); padding:28px; border-radius:12px; border:1px solid var(--theme-bg2, ${theme.borderStrong}); box-shadow:0 12px 36px rgba(0,0,0,0.6); max-width:90vw; width:430px; color:var(--theme-text, ${theme.text});">
+            <h3 style="margin:0 0 18px 0; color:var(--theme-accent, ${theme.accent}); text-align:center; font-size:18px; font-weight:700;">GuildWeave Admin Setup</h3>
             
-            <!-- Gateway Domain Configuration -->
-            <div id="step-1-container" style="margin-bottom:20px;">
-                <label style="display:block; font-size:12px; color:var(--theme-textSecondary, #aaa); margin-bottom:5px; font-weight:bold;">STEP 1: ENTER GUILDWEAVE DOMAIN</label>
-                <div style="display:flex; gap:10px;">
-                    <input type="text" id="setup-domain" value="${GM_getValue("vps_host", "")}" placeholder="https://your-domain.duckdns.org" style="flex:1; background:var(--theme-bg0, #111); border:1px solid var(--theme-bg2, #444); color:var(--theme-text, #fff); padding:8px; font-size:12px; border-radius:4px; font-family:inherit;">
-                    <button id="btn-verify-domain" style="background:var(--theme-accent, #2980b9); border:none; color:var(--theme-bg0, #fff); padding:8px 15px; font-size:11px; font-weight:bold; cursor:pointer; border-radius:4px; font-family:inherit;">Verify</button>
+            <div id="step-1-container" style="margin-bottom:18px;">
+                <label class="gw-section-title" for="setup-domain">1. GuildWeave Server URL</label>
+                <div class="gw-input-row">
+                    <input type="text" id="setup-domain" class="gw-input" value="${safeHost}" placeholder="https://your-domain.duckdns.org">
+                    <button id="btn-verify-domain" class="gw-btn gw-btn-primary">Verify</button>
                 </div>
-                <div id="step-1-status" style="margin-top:5px; font-size:11px; display:none;"></div>
+                <div id="step-1-status" class="gw-feedback" style="display:none;"></div>
             </div>
 
-            <!-- Nickname Configuration -->
-            <div id="step-2-container" style="margin-bottom:20px; display:none;">
-                <label style="display:block; font-size:12px; color:var(--theme-textSecondary, #aaa); margin-bottom:5px; font-weight:bold;">STEP 2: ENTER NICKNAME</label>
-                <div style="display:flex; gap:10px;">
-                    <input type="text" id="setup-nickname" value="${GM_getValue("device_nickname", "")}" placeholder="e.g. Admin" style="flex:1; background:var(--theme-bg0, #111); border:1px solid var(--theme-bg2, #444); color:var(--theme-text, #fff); padding:8px; font-size:12px; border-radius:4px; font-family:inherit;">
-                    <button id="btn-register-nickname" style="background:var(--theme-success, #27ae60); border:none; color:var(--theme-bg0, #fff); padding:8px 15px; font-size:11px; font-weight:bold; cursor:pointer; border-radius:4px; font-family:inherit;">Register</button>
+            <div id="step-2-container" style="margin-bottom:18px; display:none;">
+                <label class="gw-section-title" for="setup-nickname">2. Admin Device Name</label>
+                <div class="gw-input-row">
+                    <input type="text" id="setup-nickname" class="gw-input" value="${safeNick}" placeholder="e.g. Admin">
+                    <button id="btn-register-nickname" class="gw-btn gw-btn-success">Register</button>
                 </div>
-                <div id="step-2-status" style="margin-top:5px; font-size:11px; display:none;"></div>
+                <div id="step-2-status" class="gw-feedback" style="display:none;"></div>
             </div>
 
-            <!-- Admin Passkey Verification -->
-            <div id="step-3-container" style="display:none; border-top:1px solid var(--theme-bg2, #333); padding-top:15px; margin-top:15px;">
-                <label style="display:block; font-size:12px; color:var(--theme-textSecondary, #aaa); margin-bottom:5px; font-weight:bold;">STEP 3: CONFIGURATION COMPLETE</label>
-                <div id="step-3-content" style="font-size:12px; color:var(--theme-textSecondary, #bbb); line-height:1.5;"></div>
+            <div id="step-3-container" style="display:none; border-top:1px solid ${theme.border}; padding-top:14px; margin-top:14px;">
+                <label class="gw-section-title">3. Authenticate Admin Key</label>
+                <div id="step-3-content" class="gw-details-note"></div>
             </div>
         </div>
     `;
@@ -2066,24 +3358,24 @@
       let val = domainInput.value.trim().replace(/\/+$/, "");
       if (!val) {
         step1Status.style.display = "block";
-        step1Status.style.color = "var(--theme-error, #e74c3c)";
-        step1Status.innerHTML = "\u2717 Domain cannot be empty.";
+        step1Status.style.color = `var(--theme-error, ${theme.error})`;
+        step1Status.textContent = "Server URL cannot be empty.";
         return;
       }
       if (!/^https?:\/\//i.test(val)) {
         val = "https://" + val;
       }
       step1Status.style.display = "block";
-      step1Status.style.color = "var(--theme-warning, #f39c12)";
-      step1Status.innerHTML = "Connecting to server...";
+      step1Status.style.color = `var(--theme-warning, ${theme.warning})`;
+      step1Status.textContent = "Connecting to server...";
       try {
         const res = await backgroundRequest({
           method: "GET",
           url: `${val}/auth/status?browser_id=ping`
         });
         if (res.status > 0) {
-          step1Status.style.color = "var(--theme-success, #2ecc71)";
-          step1Status.innerHTML = "\u2713 Connected to GuildWeave!";
+          step1Status.style.color = `var(--theme-success, ${theme.success})`;
+          step1Status.textContent = "Connected to GuildWeave.";
           GM_setValue("vps_host", val);
           validatedHost = val;
           step2Container.style.display = "block";
@@ -2093,21 +3385,21 @@
           throw new Error("Bad response status");
         }
       } catch (err) {
-        step1Status.style.color = "var(--theme-error, #e74c3c)";
-        step1Status.innerHTML = "\u2717 Connection failed. Ensure domain is correct and reachable.";
+        step1Status.style.color = `var(--theme-error, ${theme.error})`;
+        step1Status.textContent = "Connection failed. Check that the domain is reachable.";
       }
     }
     async function registerNicknameAction() {
       const newNickname = nicknameInput.value.trim();
       if (!newNickname || !/^[a-zA-Z0-9_\s]+$/.test(newNickname)) {
         step2Status.style.display = "block";
-        step2Status.style.color = "var(--theme-error, #e74c3c)";
-        step2Status.innerHTML = "\u2717 Invalid nickname characters.";
+        step2Status.style.color = `var(--theme-error, ${theme.error})`;
+        step2Status.textContent = "Use only letters, numbers, spaces, or underscores.";
         return;
       }
       step2Status.style.display = "block";
-      step2Status.style.color = "var(--theme-warning, #f39c12)";
-      step2Status.innerHTML = "Registering device...";
+      step2Status.style.color = `var(--theme-warning, ${theme.warning})`;
+      step2Status.textContent = "Registering device...";
       try {
         const tempSecret = GM_getValue("admin_token", "temp_passkey");
         const res = await backgroundRequest({
@@ -2117,8 +3409,8 @@
           data: JSON.stringify({ browser_id: browserId, device_secret: tempSecret, label: newNickname })
         });
         if (res.status === 200) {
-          step2Status.style.color = "var(--theme-success, #2ecc71)";
-          step2Status.innerHTML = "\u2713 Registered nickname successfully!";
+          step2Status.style.color = `var(--theme-success, ${theme.success})`;
+          step2Status.textContent = "Device registered.";
           GM_setValue("device_nickname", newNickname);
           validatedNickname = newNickname;
           nicknameInput.disabled = true;
@@ -2129,18 +3421,18 @@
           throw new Error("Registration failed");
         }
       } catch (err) {
-        step2Status.style.color = "var(--theme-error, #e74c3c)";
-        step2Status.innerHTML = "\u2717 Registration failed on server.";
+        step2Status.style.color = `var(--theme-error, ${theme.error})`;
+        step2Status.textContent = "Registration failed on server.";
       }
     }
     function showStep3() {
       step3Content.innerHTML = `
-            <div style="margin-bottom:10px;">Your device is registered! Enter your Admin Passkey to authenticate this admin terminal:</div>
-            <div style="display:flex; gap:10px; margin-bottom:10px;">
-                <input type="password" id="setup-admin-key" placeholder="Enter admin passkey..." style="flex:1; background:var(--theme-bg0, #111); border:1px solid var(--theme-bg2, #444); color:var(--theme-text, #fff); padding:8px; font-size:12px; border-radius:4px; font-family:inherit;">
-                <button id="btn-verify-admin" style="background:var(--theme-error, #e74c3c); border:none; color:#fff; padding:8px 15px; font-size:11px; font-weight:bold; cursor:pointer; border-radius:4px; font-family:inherit;">Verify</button>
+            <div style="margin-bottom:10px;">Enter your administrator passkey to unlock management controls:</div>
+            <div class="gw-input-row" style="margin-bottom:8px;">
+                <input type="password" id="setup-admin-key" class="gw-input" placeholder="Enter admin passkey...">
+                <button id="btn-verify-admin" class="gw-btn gw-btn-danger">Verify</button>
             </div>
-            <div id="admin-verify-status" style="font-size:11px; margin-top:5px; display:none;"></div>
+            <div id="admin-verify-status" class="gw-feedback" style="display:none;"></div>
         `;
       const adminKeyInput = step3Content.querySelector("#setup-admin-key");
       const verifyAdminBtn = step3Content.querySelector("#btn-verify-admin");
@@ -2149,13 +3441,13 @@
         const passkey = adminKeyInput.value.trim();
         if (!passkey) {
           adminStatus.style.display = "block";
-          adminStatus.style.color = "var(--theme-error, #e74c3c)";
-          adminStatus.innerHTML = "\u2717 Passkey cannot be empty.";
+          adminStatus.style.color = `var(--theme-error, ${theme.error})`;
+          adminStatus.textContent = "Passkey cannot be empty.";
           return;
         }
         adminStatus.style.display = "block";
-        adminStatus.style.color = "var(--theme-warning, #f39c12)";
-        adminStatus.innerHTML = "Verifying passkey...";
+        adminStatus.style.color = `var(--theme-warning, ${theme.warning})`;
+        adminStatus.textContent = "Verifying passkey...";
         try {
           const res = await backgroundRequest({
             method: "GET",
@@ -2163,8 +3455,8 @@
             headers: { "Authorization": `Bearer ${passkey}` }
           });
           if (res.status === 200) {
-            adminStatus.style.color = "var(--theme-success, #2ecc71)";
-            adminStatus.innerHTML = "\u2713 Authenticated! Reloading...";
+            adminStatus.style.color = `var(--theme-success, ${theme.success})`;
+            adminStatus.textContent = "Authenticated. Reloading...";
             GM_setValue("admin_token", passkey);
             GM_setValue("approved", true);
             setTimeout(() => window.location.reload(), 1500);
@@ -2172,8 +3464,8 @@
             throw new Error("Invalid key");
           }
         } catch (err) {
-          adminStatus.style.color = "var(--theme-error, #e74c3c)";
-          adminStatus.innerHTML = "\u2717 Invalid Admin Passkey.";
+          adminStatus.style.color = `var(--theme-error, ${theme.error})`;
+          adminStatus.textContent = "Invalid admin passkey.";
         }
       };
     }
@@ -2182,16 +3474,16 @@
     if (validatedHost) {
       domainInput.value = validatedHost;
       step1Status.style.display = "block";
-      step1Status.style.color = "var(--theme-success, #2ecc71)";
-      step1Status.innerHTML = "\u2713 Connected";
+      step1Status.style.color = `var(--theme-success, ${theme.success})`;
+      step1Status.textContent = "Connected";
       domainInput.disabled = true;
       verifyBtn.disabled = true;
       step2Container.style.display = "block";
       if (validatedNickname) {
         nicknameInput.value = validatedNickname;
         step2Status.style.display = "block";
-        step2Status.style.color = "var(--theme-success, #2ecc71)";
-        step2Status.innerHTML = "\u2713 Registered";
+        step2Status.style.color = `var(--theme-success, ${theme.success})`;
+        step2Status.textContent = "Registered";
         nicknameInput.disabled = true;
         registerBtn.disabled = true;
         step3Container.style.display = "block";
@@ -2210,9 +3502,10 @@
         if (backdrop) backdrop.remove();
         return;
       }
+      const theme = ensureGuildWeaveStyles();
       backdrop = document.createElement("div");
       backdrop.id = "vps-admin-backdrop";
-      backdrop.style.cssText = "position:fixed; top:0; left:0; width:100vw; height:100vh; background:rgba(0,0,0,0.65); backdrop-filter:blur(2px); z-index:99998;";
+      backdrop.style.cssText = "position:fixed; top:0; left:0; width:100vw; height:100vh; background:rgba(0,0,0,0.65); backdrop-filter:blur(3px); z-index:99998;";
       backdrop.onclick = () => {
         modal.remove();
         backdrop.remove();
@@ -2225,16 +3518,16 @@
           top: 50%;
           left: 50%;
           transform: translate(-50%, -50%);
-          width: 90vw;
-          max-width: 480px;
-          background: var(--theme-bg0, rgb(14, 15, 33));
-          border: 1px solid var(--theme-bg2, rgb(34, 37, 63));
-          border-radius: 8px;
+          width: 92vw;
+          max-width: 500px;
+          background: var(--theme-bg0, ${theme.bg0});
+          border: 1px solid var(--theme-bg2, ${theme.borderStrong});
+          border-radius: 12px;
           z-index: 99999;
-          color: var(--theme-text, rgb(245, 243, 194));
+          color: var(--theme-text, ${theme.text});
           padding: 20px;
-          font-family: inherit;
-          box-shadow: 0 10px 40px rgba(0,0,0,0.7);
+          font-family: ${theme.font};
+          box-shadow: 0 16px 48px rgba(0,0,0,0.65);
           max-height: 85vh;
           overflow-y: auto;
           box-sizing: border-box;
@@ -2248,17 +3541,16 @@
       if (!container) return;
       const isGovernance = activeSubTab === "governance";
       container.innerHTML = `
-            <div style="display:flex; justify-content:space-between; align-items:center; border-bottom:1px solid var(--theme-bg2, #333); padding-bottom:10px; margin-bottom:12px;">
-                <h4 style="margin:0; color:var(--theme-accent, #00bc8c); font-size:15px; font-weight:bold; letter-spacing:0.5px;">GUILDWEAVE (ADMIN)</h4>
-                ${onClose ? `<button id="admin-close-modal-btn" style="background:none; border:none; color:var(--theme-textSecondary, #888); font-size:18px; cursor:pointer; line-height:1;">\u2715</button>` : ""}
+            <div class="gw-modal-header">
+                <h4 class="gw-modal-title">GuildWeave <span class="gw-pill-tag">Admin</span></h4>
+                ${onClose ? `<button id="admin-close-modal-btn" class="gw-close-btn" aria-label="Close">\u2715</button>` : ""}
             </div>
 
-            <!-- Sub-Tab Navigation Bar -->
-            <div style="display:flex; gap:8px; margin-bottom:15px; border-bottom:1px solid var(--theme-bg2, #222); padding-bottom:8px;">
-                <button id="admin-tab-governance" style="flex:1; padding:6px 10px; font-size:11px; font-weight:bold; cursor:pointer; border-radius:4px; border:1px solid ${isGovernance ? "var(--theme-accent, #c0392b)" : "transparent"}; background:${isGovernance ? "var(--theme-bg2, #222)" : "var(--theme-bg1, #111)"}; color:var(--theme-text, #fff); transition:background 0.2s; font-family:inherit;">
-                    Device Governance
+            <div class="gw-tabs">
+                <button id="admin-tab-governance" class="gw-tab-btn ${isGovernance ? "is-active" : ""}">
+                    Account Governance
                 </button>
-                <button id="admin-tab-settings" style="flex:1; padding:6px 10px; font-size:11px; font-weight:bold; cursor:pointer; border-radius:4px; border:1px solid ${!isGovernance ? "var(--theme-accent, #c0392b)" : "transparent"}; background:${!isGovernance ? "var(--theme-bg2, #222)" : "var(--theme-bg1, #111)"}; color:var(--theme-text, #fff); transition:background 0.2s; font-family:inherit;">
+                <button id="admin-tab-settings" class="gw-tab-btn ${!isGovernance ? "is-active" : ""}">
                     Operator Settings
                 </button>
             </div>
@@ -2286,66 +3578,87 @@
         renderOperatorSettingsTab(contentHost, onClose);
       }
     }, renderOperatorSettingsTab = function(contentHost, onClose) {
+      const theme = ensureGuildWeaveStyles();
       const nickname = GM_getValue("device_nickname", "Admin");
       const domain = GM_getValue("vps_host", "");
       const debugActive = GM_getValue("debug_mode", false);
-      const imageCount = GM_getValue("count_image_gens", 0);
-      const textCount = GM_getValue("count_text_gens", 0);
       const bypassChecked = Boolean(GM_getValue("anlas_bypass_enabled", false));
       contentHost.innerHTML = `
-            <div style="background:var(--theme-bg1, #111); padding:12px; border-radius:6px; margin-bottom:12px; border:1px solid var(--theme-bg2, #333); font-size:11px; line-height:1.6;">
-                <label style="display:block; font-size:9px; color:var(--theme-textSecondary, #888); font-weight:bold; margin-bottom:6px; text-transform:uppercase;">Operator Telemetry & Profile</label>
-                <div style="display:grid; grid-template-columns:1fr 1fr; gap:8px;">
-                    <div>Assigned Tier: <span style="color:var(--theme-accent, #00bc8c); font-weight:bold;">Admin</span></div>
-                    <div>Precise Ref Limit: <span id="operator-precise-limit" style="color:var(--theme-warning, #f39c12); font-weight:bold;">Unlimited</span></div>
-                    <div>Master Battery: <span id="operator-v5-battery" style="color:var(--theme-accent, #00bc8c); font-weight:bold;">--%</span></div>
-                    <div>Cluster Surplus: <span id="operator-v5-surplus" style="font-weight:bold;">-- NCP</span></div>
-                    <div>Cycle Consumed: <span id="operator-period-usage" style="font-weight:bold;">0A / 0 V5</span></div>
-                    <div>Lifetime Anlas: <span id="operator-anlas-consumed" style="color:var(--theme-error, #e74c3c); font-weight:bold;">0 Anlas</span></div>
-                    <div>Rolling Allowance: <span style="color:var(--theme-accent, #00bc8c); font-weight:bold;">Exempt (Unlimited)</span></div>
-                    <div>Local Gens (I / T): <span style="font-weight:bold;">${imageCount} / ${textCount}</span></div>
+            <div class="gw-card">
+                <span class="gw-section-title">Operator Overview</span>
+                <div class="gw-stat-grid">
+                    <div class="gw-stat-item">
+                        <span class="gw-stat-label">Tier</span>
+                        <span class="gw-stat-val" style="color:var(--theme-accent, ${theme.accent});">Admin</span>
+                    </div>
+                    <div class="gw-stat-item">
+                        <span class="gw-stat-label">Character Reference Limit</span>
+                        <span id="operator-precise-limit" class="gw-stat-val">Unlimited</span>
+                    </div>
+                    <div class="gw-stat-item">
+                        <span class="gw-stat-label">Shared V5 Capacity</span>
+                        <span id="operator-v5-battery" class="gw-stat-val">--%</span>
+                    </div>
+                    <div class="gw-stat-item">
+                        <span class="gw-stat-label">Shared Bonus Pool</span>
+                        <span id="operator-v5-surplus" class="gw-stat-val">--</span>
+                    </div>
+                    <div class="gw-stat-item">
+                        <span class="gw-stat-label">This Billing Cycle</span>
+                        <span id="operator-period-usage" class="gw-stat-val">0 Anlas \xB7 0 images</span>
+                    </div>
+                    <div class="gw-stat-item">
+                        <span class="gw-stat-label">Total Anlas Used</span>
+                        <span id="operator-anlas-consumed" class="gw-stat-val">0 Anlas</span>
+                    </div>
                 </div>
             </div>
 
-            <div style="background:var(--theme-bg1, #111); padding:10px; border-radius:6px; margin-bottom:12px; border:1px solid var(--theme-bg2, #333); font-size:11px;">
-                <label style="display:flex; align-items:center; gap:8px; cursor:pointer; font-weight:bold; color:var(--theme-warning, #f39c12);">
-                    <input type="checkbox" id="settings-anlas-bypass" ${bypassChecked ? "checked" : ""} style="cursor:pointer;">
-                    Enable Anlas Bypass (High-Res / Steps / Samples)
+            <div class="gw-card">
+                <label class="gw-toggle-row" for="settings-anlas-bypass">
+                    <div class="gw-toggle-copy">
+                        <span class="gw-toggle-title">Use Anlas for Extra Specs</span>
+                        <span class="gw-toggle-desc">Enables sizes &gt;1MP, batches (&gt;1), and &gt;28 steps.</span>
+                    </div>
+                    <input type="checkbox" id="settings-anlas-bypass" class="gw-switch" ${bypassChecked ? "checked" : ""}>
                 </label>
             </div>
 
-            <div style="margin-bottom:12px;">
-                <label style="display:block; font-size:10px; color:var(--theme-textSecondary, #aaa); margin-bottom:5px; font-weight:bold;">ADMIN NICKNAME</label>
-                <div style="display:flex; gap:8px;">
-                    <input type="text" id="settings-nickname" value="${nickname}" style="flex:1; background:var(--theme-bg0, #111); border:1px solid var(--theme-bg2, #444); color:var(--theme-text, #fff); padding:6px; font-size:11px; border-radius:4px; font-family:inherit;">
-                    <button id="btn-save-nickname" style="background:var(--theme-success, #27ae60); border:none; color:var(--theme-bg0, #fff); padding:6px 12px; font-size:10px; font-weight:bold; cursor:pointer; border-radius:4px; font-family:inherit;">Save</button>
+            <div class="gw-card">
+                <span class="gw-section-title">Terminal Settings</span>
+                <div style="margin-bottom:12px;">
+                    <label class="gw-stat-label" for="settings-nickname" style="display:block; margin-bottom:5px;">Admin Device Name</label>
+                    <div class="gw-input-row">
+                        <input type="text" id="settings-nickname" class="gw-input" value="${escapeHtml(nickname)}">
+                        <button id="btn-save-nickname" class="gw-btn gw-btn-success">Save</button>
+                    </div>
+                    <div id="settings-nickname-status" class="gw-feedback" style="display:none;"></div>
                 </div>
-                <div id="settings-nickname-status" style="font-size:10px; margin-top:3px; display:none;"></div>
+
+                <div style="margin-bottom:12px;">
+                    <label class="gw-stat-label" for="settings-domain" style="display:block; margin-bottom:5px;">GuildWeave Server URL</label>
+                    <div class="gw-input-row">
+                        <input type="text" id="settings-domain" class="gw-input" value="${escapeHtml(domain)}">
+                        <button id="btn-save-domain" class="gw-btn">Save &amp; Reset</button>
+                    </div>
+                </div>
+
+                <div style="padding-top:10px; border-top:1px solid ${theme.border};">
+                    <span class="gw-stat-label" style="display:block; margin-bottom:5px;">Linked Browsers (Up to 3)</span>
+                    <div id="operator-linked-devices" class="gw-details-note" style="margin-top:0;">
+                        No other active links.
+                    </div>
+                </div>
             </div>
 
-            <div style="margin-bottom:12px;">
-                <label style="display:block; font-size:10px; color:var(--theme-textSecondary, #aaa); margin-bottom:5px; font-weight:bold;">GUILDWEAVE DOMAIN</label>
-                <div style="display:flex; gap:8px;">
-                    <input type="text" id="settings-domain" value="${domain}" style="flex:1; background:var(--theme-bg0, #111); border:1px solid var(--theme-bg2, #444); color:var(--theme-text, #fff); padding:6px; font-size:11px; border-radius:4px; font-family:inherit;">
-                    <button id="btn-save-domain" style="background:#2980b9; border:none; color:#fff; padding:6px 12px; font-size:10px; font-weight:bold; cursor:pointer; border-radius:4px; white-space:nowrap; font-family:inherit;">Save & Reset</button>
-                </div>
-            </div>
-
-            <div style="background:var(--theme-bg1, #111); padding:10px; border-radius:6px; margin-bottom:12px; border:1px solid var(--theme-bg2, #333); font-size:10px;">
-                <label style="display:block; font-size:9px; color:var(--theme-textSecondary, #888); font-weight:bold; margin-bottom:4px; text-transform:uppercase;">Hardware Footprints Linked (Max 3)</label>
-                <div id="operator-linked-devices" style="color:var(--theme-textSecondary, #ccc); font-family:monospace; line-height:1.4;">
-                    No other active links.
-                </div>
-            </div>
-
-            <div style="border-top:1px solid var(--theme-bg2, #333); padding-top:10px; margin-top:10px; font-size:11px;">
-                <label style="display:flex; align-items:center; gap:8px; font-size:11px; cursor:pointer; font-weight:bold; color:var(--theme-warning, #f39c12);">
-                    <input type="checkbox" id="settings-debug" ${debugActive ? "checked" : ""} style="cursor:pointer;">
-                    ENABLE OPERATOR PROMPT DEBUGGING
+            <div class="gw-card" style="margin-bottom:0;">
+                <label class="gw-toggle-row" for="settings-debug">
+                    <div class="gw-toggle-copy">
+                        <span class="gw-toggle-title">Log Generation Payloads</span>
+                        <span class="gw-toggle-desc">Prints prompts and generation parameters from this terminal to server logs for troubleshooting. Master and personal tokens stay isolated.</span>
+                    </div>
+                    <input type="checkbox" id="settings-debug" class="gw-switch" ${debugActive ? "checked" : ""}>
                 </label>
-                <div id="debug-consent" style="font-size:10px; color:var(--theme-textSecondary, #999); margin-top:6px; line-height:1.4; background:var(--theme-bg1, #222); padding:8px; border-radius:4px; border-left:2px solid var(--theme-warning, #f39c12);">
-                    <strong>Consent Form:</strong> Enabling Debug Mode logs full outbound API request payloads (including prompts and image parameters) to GuildWeave telemetry. Personal session tokens remain strictly isolated.
-                </div>
             </div>
         `;
       const bypassCheckbox = contentHost.querySelector("#settings-anlas-bypass");
@@ -2370,30 +3683,35 @@
             if (anlasEl) anlasEl.textContent = `${data.anlas_consumed || 0} Anlas`;
             const periodEl = contentHost.querySelector("#operator-period-usage");
             if (periodEl && data.subscription_period) {
-              periodEl.textContent = `${data.subscription_period.anlas_consumed || 0}A / ${data.subscription_period.v5_consumed || 0} V5`;
+              const sp = data.subscription_period;
+              const totalImgs = (sp.v5_consumed || 0) + (sp.legacy_image_gens || 0) + (sp.upscale_gens || 0);
+              const parts = [`${sp.anlas_consumed || 0} Anlas`, `${totalImgs} images`];
+              if ((sp.text_gens || 0) > 0) parts.push(`${sp.text_gens} text`);
+              periodEl.textContent = parts.join(" \xB7 ");
             }
             const refEl = contentHost.querySelector("#operator-precise-limit");
-            if (refEl) refEl.textContent = data.precise_limit === "Unlimited" ? "Unlimited" : `${data.precise_limit} Refs`;
+            if (refEl) refEl.textContent = data.precise_limit === "Unlimited" ? "Unlimited" : `${data.precise_limit} max`;
             const batEl = contentHost.querySelector("#operator-v5-battery");
             if (batEl && data.telemetry) {
               if (data.telemetry.master_token_expired) {
-                batEl.style.color = "var(--theme-error, #e74c3c)";
+                batEl.style.color = `var(--theme-error, ${theme.error})`;
                 batEl.textContent = "[TOKEN EXPIRED]";
               } else if (data.telemetry.last_fetched_at === 0) {
-                batEl.style.color = "var(--theme-warning, #f39c12)";
+                batEl.style.color = `var(--theme-warning, ${theme.warning})`;
                 batEl.textContent = "[OFFLINE]";
               } else if (typeof data.telemetry.master_v5_percent === "number") {
                 const subSuffix = data.telemetry.subscription_active === false ? " [INACTIVE]" : "";
-                batEl.textContent = `${data.telemetry.master_v5_percent.toFixed(1)}% [${data.telemetry.cluster_state || "ok"}]${subSuffix}`;
+                batEl.textContent = `${data.telemetry.master_v5_percent.toFixed(1)}%${subSuffix}`;
               }
             }
             const surEl = contentHost.querySelector("#operator-v5-surplus");
             if (surEl && data.v5) {
-              surEl.textContent = `${data.v5.surplus_available_ncp ?? 0} NCP`;
+              const surHigh = Math.floor((data.v5.surplus_available_ncp || 0) / V5_HIGH_NCP_COST);
+              surEl.textContent = surHigh > 0 ? `+${surHigh} High (${data.v5.surplus_available_ncp} pts)` : "0 shared";
             }
             const devicesEl = contentHost.querySelector("#operator-linked-devices");
             if (devicesEl && data.linked_devices && data.linked_devices.length > 0) {
-              devicesEl.innerHTML = data.linked_devices.map((d) => `- \`${d.id.substring(0, 10)}...\` (${d.label})`).join("<br>");
+              devicesEl.innerHTML = data.linked_devices.map((d) => `<div><span class="gw-code-chip">${escapeHtml((d.id || "").substring(0, 10))}...</span> ${escapeHtml(d.label)}</div>`).join("");
             }
           }
         }).catch(() => {
@@ -2409,13 +3727,13 @@
         const newNickname = nickInput.value.trim();
         if (!newNickname || !/^[a-zA-Z0-9_\s]+$/.test(newNickname)) {
           nickStatus.style.display = "block";
-          nickStatus.style.color = "var(--theme-error, #e74c3c)";
-          nickStatus.innerHTML = "\u2717 Invalid nickname characters.";
+          nickStatus.style.color = `var(--theme-error, ${theme.error})`;
+          nickStatus.textContent = "Use only letters, numbers, spaces, or underscores.";
           return;
         }
         nickStatus.style.display = "block";
-        nickStatus.style.color = "var(--theme-warning, #f39c12)";
-        nickStatus.innerHTML = "Updating nickname...";
+        nickStatus.style.color = `var(--theme-warning, ${theme.warning})`;
+        nickStatus.textContent = "Saving...";
         try {
           const res = await backgroundRequest({
             method: "POST",
@@ -2424,15 +3742,15 @@
             data: JSON.stringify({ browser_id: browserId, label: newNickname })
           });
           if (res.status === 200) {
-            nickStatus.style.color = "var(--theme-success, #2ecc71)";
-            nickStatus.innerHTML = "\u2713 Nickname updated successfully!";
+            nickStatus.style.color = `var(--theme-success, ${theme.success})`;
+            nickStatus.textContent = "Saved.";
             GM_setValue("device_nickname", newNickname);
           } else {
             throw new Error("Update failed");
           }
         } catch (err) {
-          nickStatus.style.color = "var(--theme-error, #e74c3c)";
-          nickStatus.innerHTML = "\u2717 Failed to update nickname on GuildWeave.";
+          nickStatus.style.color = `var(--theme-error, ${theme.error})`;
+          nickStatus.textContent = "Failed to save device name.";
         }
       };
       saveDomBtn.onclick = () => {
@@ -2447,7 +3765,7 @@
       debugCheckbox.onchange = () => {
         const checked = debugCheckbox.checked;
         GM_setValue("debug_mode", checked);
-        if (checked) injectWarningBadge("\u26A0\uFE0F GUILDWEAVE DEBUG MODE ACTIVE", "var(--theme-error, #e74c3c)");
+        if (checked) injectWarningBadge("GuildWeave Operator Logging Active", `var(--theme-error, ${theme.error})`);
         else removeWarningBadge();
       };
     };
@@ -2483,32 +3801,45 @@
       onTelemetryRefresh: pollAdminTelemetryState
     });
     async function renderGovernanceTab(contentHost, parentContainer, onClose) {
+      const theme = ensureGuildWeaveStyles();
+      const cycleQuery = selectedCycleEpoch ? `?cycle_epoch=${encodeURIComponent(selectedCycleEpoch)}` : "";
       contentHost.innerHTML = `
-            <div style="margin-bottom:12px;">
-                <label style="display:block; font-size:10px; color:var(--theme-textSecondary, #888); font-weight:bold; margin-bottom:5px; text-transform:uppercase;">MASTER NOVELAI SESSION TOKEN</label>
-                <input type="password" id="vps-master-token-input" placeholder="Paste NovelAI Opus token (JWT / pst-...)" style="width:100%; background:var(--theme-bg1, #111); border:1px solid var(--theme-bg2, #444); color:var(--theme-text, #fff); padding:8px; font-size:11px; border-radius:4px; box-sizing:border-box; font-family:inherit;">
-                <button id="vps-btn-push-token" style="background:var(--theme-success, #27ae60); border:none; color:var(--theme-bg0, #fff); padding:8px 12px; margin-top:8px; font-size:11px; font-weight:bold; cursor:pointer; border-radius:4px; width:100%; font-family:inherit;">PUSH TO GUILDWEAVE STORAGE</button>
+            <div class="gw-card">
+                <span class="gw-section-title">Master NovelAI Session Token</span>
+                <div class="gw-input-row">
+                    <input type="password" id="vps-master-token-input" class="gw-input" placeholder="Paste Opus token (JWT / pst-...)">
+                    <button id="vps-btn-push-token" class="gw-btn gw-btn-success">Save Token</button>
+                </div>
             </div>
 
-            <div id="admin-cluster-telemetry" style="background:var(--theme-bg1, #111); padding:8px 10px; border-radius:4px; border:1px solid var(--theme-bg2, #333); margin-bottom:12px; font-size:10px; display:flex; justify-content:space-between; gap:6px; flex-wrap:wrap; color:var(--theme-textSecondary, #aaa);">
-                <span>Battery: <strong id="admin-stat-battery" style="color:var(--theme-accent, #00bc8c);">--%</strong></span>
-                <span>Surplus: <strong id="admin-stat-surplus" style="color:var(--theme-warning, #f39c12);">-- NCP</strong></span>
-                <span>Master Anlas: <strong id="admin-stat-anlas" style="color:var(--theme-text, #fff);">--</strong></span>
+            <div id="admin-cluster-telemetry" class="gw-card" style="padding:10px 14px;">
+                <div style="display:flex; justify-content:space-between; align-items:center; gap:8px; flex-wrap:wrap; font-size:11px;">
+                    <span>Pool: <strong id="admin-stat-battery" style="color:var(--theme-accent, ${theme.accent});">--%</strong></span>
+                    <span>Shared Bonus: <strong id="admin-stat-surplus" style="color:var(--theme-warning, ${theme.warning});">-- pts</strong></span>
+                    <span>Master Anlas: <strong id="admin-stat-anlas">--</strong></span>
+                </div>
+                <div style="display:flex; justify-content:space-between; align-items:center; gap:8px; margin-top:8px; padding-top:8px; border-top:1px solid ${theme.border}; font-size:11px;">
+                    <span style="color:var(--theme-textSecondary, ${theme.textMuted});">Telemetry Period:</span>
+                    <select id="admin-cycle-select" class="gw-select" style="padding:3px 6px; font-size:11px;">
+                        <option value="" ${selectedCycleEpoch === "" ? "selected" : ""}>Current Billing Cycle</option>
+                        <option value="all" ${selectedCycleEpoch === "all" ? "selected" : ""}>All Time</option>
+                    </select>
+                </div>
             </div>
 
-            <div style="border-top:1px solid var(--theme-bg2, #333); padding-top:12px;">
-                <label style="display:block; font-size:10px; color:var(--theme-textSecondary, #888); font-weight:bold; margin-bottom:8px; text-transform:uppercase;">VERIFIED SYSTEM ACCOUNTS</label>
-                
-                <div style="display:flex; justify-content:space-between; margin-bottom:10px; font-size:10px; background:var(--theme-bg1, #111); padding:6px; border-radius:4px; border:1px solid var(--theme-bg2, #222);">
-                    <span style="color:var(--theme-textSecondary, #666);">Sort by:</span>
-                    <a href="#" class="sort-trigger" data-sort="anlas" style="color: ${currentSort === "anlas" ? "var(--theme-accent, #00bc8c); font-weight:bold" : "var(--theme-textSecondary, #999)"}; text-decoration:none;">Anlas</a> |
-                    <a href="#" class="sort-trigger" data-sort="reqs" style="color: ${currentSort === "reqs" ? "var(--theme-accent, #00bc8c); font-weight:bold" : "var(--theme-textSecondary, #999)"}; text-decoration:none;">Reqs</a> |
-                    <a href="#" class="sort-trigger" data-sort="active" style="color: ${currentSort === "active" ? "var(--theme-accent, #00bc8c); font-weight:bold" : "var(--theme-textSecondary, #999)"}; text-decoration:none;">Active</a> |
-                    <a href="#" class="sort-trigger" data-sort="status" style="color: ${currentSort === "status" ? "var(--theme-accent, #00bc8c); font-weight:bold" : "var(--theme-textSecondary, #999)"}; text-decoration:none;">Status</a>
+            <div style="padding-top:4px;">
+                <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:8px;">
+                    <span class="gw-section-title" style="margin:0;">Accounts</span>
+                    <div style="display:flex; gap:8px; font-size:11px;">
+                        <a href="#" class="sort-trigger" data-sort="anlas" style="color:${currentSort === "anlas" ? `var(--theme-accent, ${theme.accent}); font-weight:700` : `var(--theme-textSecondary, ${theme.textMuted})`}; text-decoration:none;">Anlas</a>
+                        <a href="#" class="sort-trigger" data-sort="reqs" style="color:${currentSort === "reqs" ? `var(--theme-accent, ${theme.accent}); font-weight:700` : `var(--theme-textSecondary, ${theme.textMuted})`}; text-decoration:none;">Requests</a>
+                        <a href="#" class="sort-trigger" data-sort="active" style="color:${currentSort === "active" ? `var(--theme-accent, ${theme.accent}); font-weight:700` : `var(--theme-textSecondary, ${theme.textMuted})`}; text-decoration:none;">Active</a>
+                        <a href="#" class="sort-trigger" data-sort="status" style="color:${currentSort === "status" ? `var(--theme-accent, ${theme.accent}); font-weight:700` : `var(--theme-textSecondary, ${theme.textMuted})`}; text-decoration:none;">Online</a>
+                    </div>
                 </div>
 
-                <div id="vps-client-list" style="font-size:11px; display:flex; flex-direction:column; gap:8px;">
-                    Loading system records...
+                <div id="vps-client-list" style="font-size:12px; display:flex; flex-direction:column; gap:8px;">
+                    Loading accounts...
                 </div>
             </div>
         `;
@@ -2536,6 +3867,34 @@
           }
         };
       }
+      const cycleSelect = contentHost.querySelector("#admin-cycle-select");
+      if (cycleSelect) {
+        cycleSelect.onchange = () => {
+          selectedCycleEpoch = cycleSelect.value;
+          renderGovernanceTab(contentHost, parentContainer, onClose);
+        };
+        backgroundRequest({
+          method: "GET",
+          url: `${VPS_HOST}/admin/cycles`,
+          headers: { "Authorization": `Bearer ${deviceSecret}` }
+        }).then((cRes) => {
+          if (cRes && cRes.status === 200 && cRes.responseText) {
+            const parsed = JSON.parse(cRes.responseText);
+            const cycles = Array.isArray(parsed.cycles) ? parsed.cycles : [];
+            const opts = [
+              `<option value="" ${selectedCycleEpoch === "" ? "selected" : ""}>Current Billing Cycle</option>`,
+              ...cycles.map((c) => {
+                const val = String(c.cycle_epoch);
+                const sel = selectedCycleEpoch === val ? "selected" : "";
+                return `<option value="${escapeHtml(val)}" ${sel}>${escapeHtml(formatCycleLabel(c))}</option>`;
+              }),
+              `<option value="all" ${selectedCycleEpoch === "all" ? "selected" : ""}>All Time</option>`
+            ];
+            cycleSelect.innerHTML = opts.join("");
+          }
+        }).catch(() => {
+        });
+      }
       contentHost.querySelectorAll(".sort-trigger").forEach((el) => {
         el.onclick = (e) => {
           e.preventDefault();
@@ -2547,7 +3906,7 @@
       try {
         const res = await backgroundRequest({
           method: "GET",
-          url: `${VPS_HOST}/admin/devices`,
+          url: `${VPS_HOST}/admin/devices${cycleQuery}`,
           headers: { "Authorization": `Bearer ${deviceSecret}` }
         });
         if (res.status === 200) {
@@ -2556,7 +3915,7 @@
           if (!container) return;
           backgroundRequest({
             method: "GET",
-            url: `${VPS_HOST}/admin/global-stats`,
+            url: `${VPS_HOST}/admin/global-stats${cycleQuery}`,
             headers: { "Authorization": `Bearer ${deviceSecret}` }
           }).then((statsRes) => {
             if (statsRes && statsRes.status === 200 && statsRes.responseText) {
@@ -2565,25 +3924,25 @@
               if (batEl && stats.telemetry) {
                 const pctStr = typeof stats.telemetry.master_v5_percent === "number" ? `${stats.telemetry.master_v5_percent.toFixed(1)}%` : "--%";
                 if (stats.telemetry.master_token_expired) {
-                  batEl.style.color = "var(--theme-error, #e74c3c)";
+                  batEl.style.color = `var(--theme-error, ${theme.error})`;
                   batEl.textContent = "[TOKEN EXPIRED]";
                 } else if (stats.telemetry.last_fetched_at === 0) {
-                  batEl.style.color = "var(--theme-warning, #f39c12)";
+                  batEl.style.color = `var(--theme-warning, ${theme.warning})`;
                   batEl.textContent = "[OFFLINE]";
                 } else if (stats.telemetry.subscription_active === false) {
-                  batEl.style.color = "var(--theme-error, #e74c3c)";
+                  batEl.style.color = `var(--theme-error, ${theme.error})`;
                   batEl.textContent = `${pctStr} [INACTIVE]`;
                 } else if (stats.telemetry.is_grace_period) {
-                  batEl.style.color = "var(--theme-warning, #f39c12)";
+                  batEl.style.color = `var(--theme-warning, ${theme.warning})`;
                   batEl.textContent = `${pctStr} [GRACE]`;
                 } else {
-                  batEl.style.color = "var(--theme-accent, #00bc8c)";
+                  batEl.style.color = `var(--theme-accent, ${theme.accent})`;
                   batEl.textContent = pctStr;
                 }
               }
               const surEl = contentHost.querySelector("#admin-stat-surplus");
               if (surEl && typeof stats.v5_surplus_available === "number") {
-                surEl.textContent = `${stats.v5_surplus_available}/${stats.v5_surplus_pool} NCP`;
+                surEl.textContent = `${stats.v5_surplus_available}/${stats.v5_surplus_pool} pts`;
               }
               const anlasStatEl = contentHost.querySelector("#admin-stat-anlas");
               if (anlasStatEl && stats.telemetry) {
@@ -2597,12 +3956,21 @@
           }).catch(() => {
           });
           if (groups.length === 0) {
-            container.innerHTML = "No clients pending registration.";
+            container.textContent = "No clients pending registration.";
             return;
           }
+          const usePeriodSort = selectedCycleEpoch !== "all";
           groups.sort((a, b) => {
-            if (currentSort === "anlas") return b.anlas_consumed - a.anlas_consumed;
-            if (currentSort === "reqs") return b.total_requests - a.total_requests;
+            if (currentSort === "anlas") {
+              const valA = usePeriodSort ? a.subscription_period_anlas ?? a.anlas_consumed : a.anlas_consumed;
+              const valB = usePeriodSort ? b.subscription_period_anlas ?? b.anlas_consumed : b.anlas_consumed;
+              return valB - valA;
+            }
+            if (currentSort === "reqs") {
+              const reqA = usePeriodSort ? a.subscription_period_requests ?? a.total_requests : a.total_requests;
+              const reqB = usePeriodSort ? b.subscription_period_requests ?? b.total_requests : b.total_requests;
+              return reqB - reqA;
+            }
             if (currentSort === "active") return b.last_active_at - a.last_active_at;
             if (currentSort === "status") return (b.is_online ? 1 : 0) - (a.is_online ? 1 : 0);
             return 0;
@@ -2610,104 +3978,119 @@
           container.innerHTML = "";
           groups.forEach((group) => {
             const selectorId = group.user_id || group.discord_id || (group.devices && group.devices[0] ? group.devices[0].browser_id : "");
+            const safeSelectorId = escapeHtml(selectorId);
+            const safeName = escapeHtml(group.discord_username || "Guest");
             const isLinked = !!group.discord_id;
             const isExpanded = expandedKeys.has(selectorId);
             const el = document.createElement("div");
-            el.style.cssText = `background:var(--theme-bg1, #222); border-radius:4px; border:1px solid ${group.banned === 1 ? "var(--theme-error, #c0392b)" : "var(--theme-bg2, #333)"}; overflow:hidden; display:flex; flex-direction:column; transition: border-color 0.2s;`;
-            const statusDotColor = group.is_online ? "var(--theme-success, #2ecc71)" : "var(--theme-textSecondary, #7f8c8d)";
+            el.style.cssText = `background:var(--theme-bg1, ${theme.bg1}); border-radius:8px; border:1px solid ${group.banned === 1 ? `var(--theme-error, ${theme.error})` : `var(--theme-bg2, ${theme.border})`}; overflow:hidden; display:flex; flex-direction:column; transition:border-color 0.2s;`;
+            const statusDotColor = group.is_online ? `var(--theme-success, ${theme.success})` : `var(--theme-textSecondary, ${theme.textMuted})`;
             const statusTitle = group.is_online ? "Online" : "Offline";
-            const bannedBadge = group.banned === 1 ? `<span style="background:var(--theme-error, #c0392b); color:#fff; font-size:8px; padding:1px 4px; border-radius:2px; font-weight:bold; margin-left:6px;">BANNED</span>` : "";
-            const debtBadge = group.is_in_debt ? `<span style="background:var(--theme-error, #e74c3c); color:#fff; font-size:8px; padding:1px 4px; border-radius:2px; font-weight:bold; margin-left:4px;">DEBT</span>` : "";
+            const bannedBadge = group.banned === 1 ? `<span style="background:var(--theme-error, ${theme.error}); color:#fff; font-size:9px; padding:1px 5px; border-radius:999px; font-weight:700; margin-left:4px;">BANNED</span>` : "";
+            const debtBadge = group.is_in_debt ? `<span style="background:var(--theme-error, ${theme.error}); color:#fff; font-size:9px; padding:1px 5px; border-radius:999px; font-weight:700; margin-left:4px;">DEBT</span>` : "";
             let headerDebugBadge = "";
             if (group.has_debug_authorized) {
-              headerDebugBadge = `<span style="background:var(--theme-success, #27ae60); color:#fff; font-size:8px; padding:1px 4px; border-radius:2px; font-weight:bold; margin-left:6px;">DEBUG ACTIVE</span>`;
+              headerDebugBadge = `<span style="background:var(--theme-success, ${theme.success}); color:#0b1912; font-size:9px; padding:1px 5px; border-radius:999px; font-weight:700; margin-left:4px;">LOGS ON</span>`;
             } else if (group.has_debug_intent) {
-              headerDebugBadge = `<span style="background:var(--theme-warning, #e67e22); color:#fff; font-size:8px; padding:1px 4px; border-radius:2px; font-weight:bold; margin-left:6px;">DEBUG REQUESTED</span>`;
+              headerDebugBadge = `<span style="background:var(--theme-warning, ${theme.warning}); color:#1f1404; font-size:9px; padding:1px 5px; border-radius:999px; font-weight:700; margin-left:4px;">LOGS REQ</span>`;
             }
+            const headerAnlas = usePeriodSort ? group.subscription_period_anlas ?? group.anlas_consumed ?? 0 : group.anlas_consumed ?? 0;
+            const headerReqs = usePeriodSort ? group.subscription_period_requests ?? (group.subscription_period_v5 || 0) + (group.subscription_period_legacy_images || 0) ?? group.total_requests ?? 0 : group.total_requests ?? 0;
             el.innerHTML = `
-                        <div class="client-card-header" data-key="${selectorId}" style="padding:10px 12px; cursor:pointer; display:flex; align-items:center; justify-content:space-between; background:var(--theme-bg0, #1e1e1e); user-select:none;">
-                            <div style="display:flex; align-items:center; gap:8px; max-width:60%;">
-                                <div style="width:7px; height:7px; border-radius:50%; background:${statusDotColor};" title="${statusTitle}"></div>
-                                <span style="font-weight:bold; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; color:var(--theme-text, #fff);">${group.discord_username}</span>
+                        <div class="client-card-header" data-key="${safeSelectorId}" style="padding:10px 12px; cursor:pointer; display:flex; align-items:center; justify-content:space-between; background:var(--theme-bg0, ${theme.bg0}); user-select:none;">
+                            <div style="display:flex; align-items:center; gap:8px; max-width:65%; min-width:0;">
+                                <div style="width:7px; height:7px; border-radius:50%; background:${statusDotColor}; flex-shrink:0;" title="${statusTitle}"></div>
+                                <span style="font-weight:600; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; color:var(--theme-text, ${theme.text});">${safeName}</span>
                                 ${bannedBadge}
                                 ${debtBadge}
                                 ${headerDebugBadge}
                             </div>
-                            <div style="font-size:10px; color:var(--theme-textSecondary, #aaa); display:flex; gap:10px; align-items:center;">
-                                <span style="color:var(--theme-accent, #00bc8c); font-weight:bold;">${group.anlas_consumed}A</span>
-                                <span style="color:#3498db; font-weight:bold;">${group.total_requests}R</span>
-                                <span style="font-size:8px; color:var(--theme-textSecondary, #555);">${isExpanded ? "\u25B2" : "\u25BC"}</span>
+                            <div style="font-size:11px; color:var(--theme-textSecondary, ${theme.textMuted}); display:flex; gap:10px; align-items:center; font-variant-numeric:tabular-nums;">
+                                <span style="color:var(--theme-accent, ${theme.accent}); font-weight:600;">${headerAnlas}A</span>
+                                <span style="font-weight:600;">${headerReqs}R</span>
+                                <span style="font-size:9px;">${isExpanded ? "\u25B2" : "\u25BC"}</span>
                             </div>
                         </div>
                     `;
             if (isExpanded) {
               const body = document.createElement("div");
-              body.style.cssText = "padding:12px; border-top:1px solid var(--theme-bg2, #333); background:var(--theme-bg1, #252525); display:flex; flex-direction:column; gap:10px;";
+              body.style.cssText = `padding:12px; border-top:1px solid ${theme.border}; background:var(--theme-bg1, ${theme.bg1}); display:flex; flex-direction:column; gap:10px;`;
               let devicesHtml = "";
               (group.devices || []).forEach((d) => {
-                const devOnlineColor = d.is_online ? "var(--theme-success, #2ecc71)" : "var(--theme-textSecondary, #7f8c8d)";
-                const devBannedBadge = d.banned === 1 ? `<span style="color:var(--theme-error, #e74c3c); font-weight:bold; margin-left:4px;">(BANNED)</span>` : "";
-                const allowanceBadge = d.metered_allowance !== null ? `<span style="color:var(--theme-warning, #f39c12); font-weight:bold; margin-left:6px;">[${d.metered_allowance}/100 Imgs]</span>` : "";
+                const safeBid = escapeHtml(d.browser_id);
+                const safeBidShort = escapeHtml((d.browser_id || "").substring(0, 8));
+                const safeDevLabel = escapeHtml(d.label || "Unnamed Browser");
+                const devOnlineColor = d.is_online ? `var(--theme-success, ${theme.success})` : `var(--theme-textSecondary, ${theme.textMuted})`;
+                const devBannedBadge = d.banned === 1 ? `<span style="color:var(--theme-error, ${theme.error}); font-weight:700; margin-left:4px;">(Banned)</span>` : "";
+                const allowanceBadge = d.metered_allowance !== null ? `<span style="color:var(--theme-warning, ${theme.warning}); font-weight:600; margin-left:6px;">[${escapeHtml(d.metered_allowance)}/100]</span>` : "";
                 let devDebugBadge = "";
                 let devDebugBtn = "";
                 if (d.debug_authorized) {
                   const minsLeft = (d.debug_expires_in_ms / 6e4).toFixed(1);
-                  devDebugBadge = `<span style="background:var(--theme-success, #27ae60); color:#fff; font-size:8px; padding:1px 4px; border-radius:2px; font-weight:bold; margin-left:4px;">DEBUG ACTIVE (${minsLeft}m)</span>`;
-                  devDebugBtn = `<button class="btn-toggle-debug" data-id="${d.browser_id}" data-action="disarm" style="background:var(--theme-warning, #e67e22); border:none; color:#fff; padding:2px 6px; font-size:9px; cursor:pointer; border-radius:3px; font-weight:bold; font-family:inherit;">DISARM</button>`;
+                  devDebugBadge = `<span style="background:var(--theme-success, ${theme.success}); color:#0b1912; font-size:9px; padding:1px 5px; border-radius:999px; font-weight:700; margin-left:4px;">Logs (${minsLeft}m)</span>`;
+                  devDebugBtn = `<button class="btn-toggle-debug gw-btn gw-btn-warning gw-btn-sm" data-id="${safeBid}" data-action="disarm">Disarm</button>`;
                 } else if (d.debug_intent) {
-                  devDebugBadge = `<span style="background:var(--theme-error, #e74c3c); color:#fff; font-size:8px; padding:1px 4px; border-radius:2px; font-weight:bold; margin-left:4px;">\u26A0\uFE0F DEBUG REQUESTED</span>`;
-                  devDebugBtn = `<button class="btn-toggle-debug" data-id="${d.browser_id}" data-action="arm" style="background:#2980b9; border:none; color:#fff; padding:2px 6px; font-size:9px; cursor:pointer; border-radius:3px; font-weight:bold; font-family:inherit;">AUTHORIZE (10M)</button>`;
+                  devDebugBadge = `<span style="background:var(--theme-warning, ${theme.warning}); color:#1f1404; font-size:9px; padding:1px 5px; border-radius:999px; font-weight:700; margin-left:4px;">Logs Requested</span>`;
+                  devDebugBtn = `<button class="btn-toggle-debug gw-btn gw-btn-primary gw-btn-sm" data-id="${safeBid}" data-action="arm">Authorize (10m)</button>`;
                 }
                 devicesHtml += `
-                                <div style="font-size:10px; color:var(--theme-textSecondary, #ccc); padding:6px 0; border-bottom:1px solid var(--theme-bg2, #444); display:flex; justify-content:space-between; align-items:center; gap:10px;">
+                                <div style="font-size:11px; color:var(--theme-textSecondary, ${theme.textMuted}); padding:6px 0; border-bottom:1px solid ${theme.border}; display:flex; justify-content:space-between; align-items:center; gap:8px;">
                                     <div style="display:flex; align-items:center; gap:6px; min-width:0; flex:1;">
-                                        <div style="width:5px; height:5px; border-radius:50%; background:${devOnlineColor};"></div>
-                                        <span style="overflow:hidden; text-overflow:ellipsis; white-space:nowrap;"><strong>${d.label}</strong> ${devBannedBadge}${allowanceBadge}${devDebugBadge} <code style="color:var(--theme-textSecondary, #666);">(${d.browser_id.substring(0, 8)}...)</code></span>
+                                        <div style="width:6px; height:6px; border-radius:50%; background:${devOnlineColor}; flex-shrink:0;"></div>
+                                        <span style="overflow:hidden; text-overflow:ellipsis; white-space:nowrap; color:var(--theme-text, ${theme.text});"><strong>${safeDevLabel}</strong> ${devBannedBadge}${allowanceBadge}${devDebugBadge} <span class="gw-code-chip">${safeBidShort}...</span></span>
                                     </div>
                                     <div style="display:flex; gap:4px; align-items:center;">
                                         ${devDebugBtn}
-                                        <button class="btn-prune-dev" data-id="${d.browser_id}" style="background:#8e44ad; border:none; color:#fff; padding:2px 6px; font-size:9px; cursor:pointer; border-radius:3px; font-weight:bold; font-family:inherit;">PRUNE</button>
+                                        <button class="btn-prune-dev gw-btn gw-btn-sm" data-id="${safeBid}">Prune</button>
                                     </div>
                                 </div>
                             `;
               });
               const lastActiveDate = group.last_active_at > 0 ? new Date(group.last_active_at).toLocaleTimeString() : "Never";
               const virtualAnlasStr = group.anlas_unlimited ? "Unlimited" : group.virtual_anlas_balance !== void 0 ? `${group.available_anlas_balance ?? group.virtual_anlas_balance}/${group.virtual_anlas_balance}` : "--";
-              const v5BankStr = group.v5_banked_balance !== void 0 ? `${group.v5_available_balance ?? group.v5_banked_balance}/${group.v5_banked_balance} NCP` : "-- NCP";
-              const periodStr = `${group.subscription_period_anlas ?? 0}A / ${group.subscription_period_v5 ?? 0} V5`;
-              const banToggleBtn = group.banned === 1 ? `<button class="btn-unban-group" data-key="${selectorId}" data-is-discord="${isLinked}" style="background:var(--theme-success, #27ae60); border:none; color:#fff; padding:5px 10px; font-size:10px; cursor:pointer; border-radius:3px; font-weight:bold; flex:1; font-family:inherit;">UNBAN USER</button>` : `<button class="btn-ban-group" data-key="${selectorId}" data-is-discord="${isLinked}" style="background:var(--theme-error, #c0392b); border:none; color:#fff; padding:5px 10px; font-size:10px; cursor:pointer; border-radius:3px; font-weight:bold; flex:1; font-family:inherit;">BAN USER</button>`;
-              const forgiveBtn = group.is_in_debt ? `<button class="btn-reconcile-debt" data-key="${selectorId}" data-is-discord="${isLinked}" style="background:var(--theme-warning, #e67e22); border:none; color:#fff; padding:4px 8px; font-size:9px; cursor:pointer; border-radius:3px; font-weight:bold; font-family:inherit;">FORGIVE DEBT</button>` : "";
+              const v5Avail = group.v5_available_balance ?? group.v5_banked_balance ?? 0;
+              const v5BankStr = group.v5_banked_balance !== void 0 ? `${Math.floor(v5Avail / V5_HIGH_NCP_COST)}H / ${Math.floor(v5Avail / V5_MEDIUM_NCP_COST)}M (${v5Avail}/${group.v5_banked_balance} pts)` : "--";
+              const periodParts = [
+                `${group.subscription_period_anlas ?? 0}A`,
+                `${group.subscription_period_v5 ?? 0} V5`
+              ];
+              if ((group.subscription_period_legacy_images || 0) > 0) periodParts.push(`${group.subscription_period_legacy_images} Leg`);
+              if ((group.subscription_period_upscales || 0) > 0) periodParts.push(`${group.subscription_period_upscales} Up`);
+              if ((group.subscription_period_text_gens || 0) > 0) periodParts.push(`${group.subscription_period_text_gens} Txt`);
+              const periodStr = periodParts.join(" \xB7 ");
+              const banToggleBtn = group.banned === 1 ? `<button class="btn-unban-group gw-btn gw-btn-success" data-key="${safeSelectorId}" data-is-discord="${isLinked}" style="flex:1;">UNBAN USER</button>` : `<button class="btn-ban-group gw-btn gw-btn-danger" data-key="${safeSelectorId}" data-is-discord="${isLinked}" style="flex:1;">BAN USER</button>`;
+              const forgiveBtn = group.is_in_debt ? `<button class="btn-reconcile-debt gw-btn gw-btn-warning gw-btn-sm" data-key="${safeSelectorId}" data-is-discord="${isLinked}">FORGIVE DEBT</button>` : "";
               body.innerHTML = `
-                            <div style="display:grid; grid-template-columns:1fr 1fr; gap:6px; font-size:10px; color:var(--theme-textSecondary, #aaa); margin-bottom:4px;">
-                                <div>Tier: <strong style="color:var(--theme-accent, #00bc8c);">${group.priority_tier}</strong></div>
-                                <div>Last Active: <strong style="color:var(--theme-text, #fff);">${lastActiveDate}</strong></div>
-                                <div>Virtual Anlas: <strong style="color:${group.is_in_debt ? "var(--theme-error, #e74c3c)" : "var(--theme-accent, #00bc8c)"};">${virtualAnlasStr}</strong></div>
-                                <div>V5 Bank: <strong style="color:var(--theme-text, #fff);">${v5BankStr}</strong></div>
-                                <div>Cycle Usage: <strong style="color:var(--theme-text, #fff);">${periodStr}</strong></div>
-                                <div>Discord ID: <code style="background:var(--theme-bg0, #111); padding:2px 4px; border-radius:2px; color:var(--theme-textSecondary, #888);">${group.discord_id || "Unlinked"}</code></div>
+                            <div class="gw-stat-grid" style="font-size:11px;">
+                                <div class="gw-stat-item"><span class="gw-stat-label">Tier</span><span class="gw-stat-val" style="color:var(--theme-accent, ${theme.accent});">${escapeHtml(group.priority_tier)}</span></div>
+                                <div class="gw-stat-item"><span class="gw-stat-label">Last Active</span><span class="gw-stat-val">${escapeHtml(lastActiveDate)}</span></div>
+                                <div class="gw-stat-item"><span class="gw-stat-label">Monthly Anlas</span><span class="gw-stat-val" style="color:${group.is_in_debt ? `var(--theme-error, ${theme.error})` : `var(--theme-accent, ${theme.accent})`};">${escapeHtml(virtualAnlasStr)}</span></div>
+                                <div class="gw-stat-item"><span class="gw-stat-label">V5 Reserve</span><span class="gw-stat-val">${escapeHtml(v5BankStr)}</span></div>
+                                <div class="gw-stat-item"><span class="gw-stat-label">Period Activity</span><span class="gw-stat-val">${escapeHtml(periodStr)}</span></div>
+                                <div class="gw-stat-item"><span class="gw-stat-label">Discord ID</span><span class="gw-code-chip">${escapeHtml(group.discord_id || "Unlinked")}</span></div>
                             </div>
 
-                            <div style="display:flex; gap:6px; align-items:center;">
-                                ${!group.anlas_unlimited ? `<button class="btn-adjust-anlas" data-key="${selectorId}" data-is-discord="${isLinked}" style="background:#16a085; border:none; color:#fff; padding:4px 8px; font-size:9px; cursor:pointer; border-radius:3px; font-weight:bold; font-family:inherit;">ADJUST ANLAS</button>` : ""}
-                                <button class="btn-adjust-v5" data-key="${selectorId}" data-is-discord="${isLinked}" style="background:#2980b9; border:none; color:#fff; padding:4px 8px; font-size:9px; cursor:pointer; border-radius:3px; font-weight:bold; font-family:inherit;">ADJUST V5 NCP</button>
+                            <div style="display:flex; gap:6px; align-items:center; flex-wrap:wrap;">
+                                ${!group.anlas_unlimited ? `<button class="btn-adjust-anlas gw-btn gw-btn-sm" data-key="${safeSelectorId}" data-is-discord="${isLinked}">ADJUST ANLAS</button>` : ""}
+                                <button class="btn-adjust-v5 gw-btn gw-btn-sm" data-key="${safeSelectorId}" data-is-discord="${isLinked}">ADJUST V5 NCP</button>
                                 ${forgiveBtn}
                             </div>
 
-                            <div style="background:var(--theme-bg0, #1a1a1a); padding:8px; border-radius:4px; border:1px solid var(--theme-bg2, #333);">
-                                <div style="font-weight:bold; font-size:9px; color:var(--theme-textSecondary, #555); text-transform:uppercase; margin-bottom:5px;">Hardware Footprints</div>
-                                ${devicesHtml || '<div style="color:var(--theme-textSecondary, #666); font-style:italic; font-size:10px;">No hardware linked.</div>'}
+                            <div style="background:var(--theme-bg0, ${theme.bg0}); padding:8px 10px; border-radius:6px; border:1px solid ${theme.border};">
+                                <span class="gw-section-title" style="margin-bottom:4px;">Linked Browsers</span>
+                                ${devicesHtml || `<div class="gw-details-note" style="margin:0;">No browsers linked.</div>`}
                             </div>
 
-                            <div style="display:flex; gap:6px; margin-top:4px;">
-                                <select id="tier-select-${selectorId}" style="background:var(--theme-bg0, #111); border:1px solid var(--theme-bg2, #444); color:var(--theme-text, #fff); font-size:10px; padding:4px 6px; border-radius:3px; font-family:inherit;">
+                            <div style="display:flex; gap:6px; margin-top:2px;">
+                                <select id="tier-select-${safeSelectorId}" class="gw-select" style="padding:5px 8px; font-size:11px;">
                                     <option value="Metered" ${group.priority_tier === "Metered" ? "selected" : ""}>Metered</option>
                                     <option value="Low" ${group.priority_tier === "Low" ? "selected" : ""}>Low</option>
                                     <option value="Normal" ${group.priority_tier === "Normal" ? "selected" : ""}>Normal</option>
                                     <option value="High" ${group.priority_tier === "High" ? "selected" : ""}>High</option>
                                     <option value="Admin" ${group.priority_tier === "Admin" ? "selected" : ""}>Admin</option>
                                 </select>
-                                <button class="btn-approve-group" data-key="${selectorId}" data-is-discord="${isLinked}" style="background:#2980b9; border:none; color:#fff; padding:5px 10px; font-size:10px; cursor:pointer; border-radius:3px; font-weight:bold; flex:1; font-family:inherit;">APPROVE & SET</button>
-                                <button class="btn-revoke-group" data-key="${selectorId}" data-is-discord="${isLinked}" style="background:var(--theme-bg2, #7f8c8d); border:none; color:#fff; padding:5px 10px; font-size:10px; cursor:pointer; border-radius:3px; font-weight:bold; flex:1; font-family:inherit;">REVOKE</button>
+                                <button class="btn-approve-group gw-btn gw-btn-primary" data-key="${safeSelectorId}" data-is-discord="${isLinked}" style="flex:1;">APPROVE &amp; SET</button>
+                                <button class="btn-revoke-group gw-btn" data-key="${safeSelectorId}" data-is-discord="${isLinked}" style="flex:1;">REVOKE</button>
                                 ${banToggleBtn}
                             </div>
                         `;
@@ -2748,7 +4131,7 @@
               const target = e.currentTarget;
               const key = target.getAttribute("data-key");
               const isDiscord = target.getAttribute("data-is-discord") === "true";
-              const rawDelta = prompt("Enter signed integer V5 NCP delta (e.g. 36 or -18):");
+              const rawDelta = prompt("Enter signed integer V5 credit delta (18 per High, 10 per Med):");
               if (rawDelta === null) return;
               const delta = parseStrictPromptInt(rawDelta);
               if (delta === null) return alert("Invalid integer delta.");
@@ -2760,7 +4143,7 @@
                 data: JSON.stringify(payload)
               });
               if (actionRes.status === 200) renderGovernanceTab(contentHost, parentContainer, onClose);
-              else alert("Failed to adjust V5 NCP balance.");
+              else alert("Failed to adjust V5 credits.");
             };
           });
           contentHost.querySelectorAll(".btn-reconcile-debt").forEach((b) => {
@@ -2799,7 +4182,7 @@
               const target = e.currentTarget;
               const key = target.getAttribute("data-key");
               const isDiscord = target.getAttribute("data-is-discord") === "true";
-              const tierSelect = contentHost.querySelector(`#tier-select-${key}`);
+              const tierSelect = document.getElementById(`tier-select-${key}`) || contentHost.querySelector(`#tier-select-${key}`);
               const tier = tierSelect ? tierSelect.value : "Normal";
               const payload = isDiscord ? { discord_id: key, priority_tier: tier } : { user_id: key, priority_tier: tier };
               const actionRes = await backgroundRequest({
@@ -2875,7 +4258,7 @@
         }
       } catch (e) {
         const container = contentHost.querySelector("#vps-client-list");
-        if (container) container.innerHTML = "Error retrieving system data records.";
+        if (container) container.textContent = "Error retrieving system data records.";
       }
     }
     initDOMObserver({

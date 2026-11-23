@@ -7,33 +7,45 @@
  *    - Compiles bundles via `scripts/build-userscripts.js`.
  *    - Asserts zero `require(`, `process`, or `Buffer` references or leaks in compiled artifacts.
  *    - Verifies Tampermonkey metadata blocks, IIFE boundaries, and zero Node globals inside VM.
- * 2. Pricing & Stage 5 Parity (Module 643656 & Module 875333):
+ * 2. Pricing & Stage 5 Parity (Module 643656, Module 875333 & `/ai/upscale`):
  *    - Verifies client-side `pricing.js` matches `auditEngine.js` across baseline Opus, multi-sample,
  *      V5 Full `1.5x` (`1536x2048` -> `90` Anlas, `1024x1024 @ 29` -> `32`, `1472x1472 @ 28` -> `63`),
  *      V5 Medium un-ceiled `/ 1.75` + `1.5x` (`1024x1024, 2 samples` -> `15`, `4 samples` -> `45`,
  *      `1472x1472, 1 sample` -> `31`, `1536x2048, 1 sample` -> `44`), `usageNegative` V5 discount
  *      suppression (`30` / `52`), SMEA/SMEA-DYN, Img2Img/Inpaint strength, Character Refs
  *      (`director_reference_images*`), V4.5 Vibe Transfer (`reference_image_multiple`),
- *      `>140` Anlas cap, `strength: 0` 3MP/50-step hard limits, and `.5` non-V5 parity (`3-5`, `1-5`).
+ *      `>140` Anlas cap, `strength: 0` 3MP/50-step hard limits, `.5` non-V5 parity (`3-5`, `1-5`),
+ *      and `/ai/upscale` pixel buckets (`1..4` Anlas + PNG/JPEG/WebP binary + multi-segment >64KB EXIF JPEG extraction).
  *    - Verifies Stage 5 `X-Gen-Steps` invariant: exact body integer forwarded (`25` stays `25`;
  *      absent steps default to `14` on Medium and `28` otherwise) while pricing V5 Medium via Module 643656.
  *    - Verifies `params.js` matches `auditEngine.extractParametersFromRawBody` 1-to-1, routing
  *      `reference_image_multiple` into `vibe_reference_count` and counting strictly Character References
  *      in `precise_refs` so `X-Precise-Refs` never diverges from Stage 5.
- * 3. Happy Path: Dual Meters, Cluster States, Native Selection Cost Display, Canary Scraper,
- *    /user/subscription GET Routing, /ai/encode-vibe Counter Isolation & Bypass Headers:
- *    - Polls `/auth/status` with full Commit 9 payload and verifies `#gw-v5-bar` mounts above
- *      `#gw-allowance-bar` while preserving `allowanceBar.nextElementSibling === genBtn`.
+ * 3. Happy Path & Theme Inheritance:
+ *    - Polls `/auth/status` with full Commit 9 + cycle-segregated payload and verifies `#gw-v5-bar`
+ *      mounts above `#gw-allowance-bar` while preserving `allowanceBar.nextElementSibling === genBtn`.
+ *    - Verifies `scrapeNovelAITheme()` skips stale navy `document.body` CSS (`rgb(19, 21, 44)`),
+ *      ignores low-alpha translucent overlays (`rgba(255,255,255,0.08)`), extracts `#__next`/ancestor
+ *      backgrounds & `linear-gradient(...)` `backgroundImage` stops, card container `borderTopColor`,
+ *      and active effort fills, keeps dark-button bright-text themes legible, refreshes `#gw-nav-badge`
+ *      classes & computed colors when `button[aria-label="menu"]` transitions post-hydration, reacts to
+ *      `document.head` `<style>` swaps while ignoring `#gw-ui-styles`, locks `.gw-switch` dimensions,
+ *      and hides `#gw-allowance-bar` for unlimited tiers.
+ *    - Verifies `/user/data` injects live `availableAnlas` into `trainingStepsLeft` after `/auth/status` arrives.
  *    - Verifies `#gw-effort-select` is absent (relies strictly on NovelAI's native `.image-gen-model-mode-row`).
+ *    - Verifies `#gw-v5-cost` hides when configured for non-addon Anlas bypass (`1536x2048`, `2` samples,
+ *      or `29` steps) while ignoring arbitrary `"1536x2048"` prompt text and keeping V5 credits on addon-only `1024x1024`.
  *    - Verifies `/user/subscription` without explicit `config.method` defaults to `GET`, leaves
  *      `count_text_gens` untouched, and suppresses unprompted `/auth/status` polling.
  *    - Verifies `/ai/encode-vibe` uses `POST`, leaves `count_text_gens` at 0, and triggers HUD telemetry refresh.
+ *    - Verifies `/ai/upscale` FormData binary PNG extraction (`1024x1024 -> 1` Anlas), Channel A queue
+ *      join (`is_upscale: true`), and proxy header transmission (`x-gen-width`, `x-gen-height`, `x-declared-anlas`).
  *    - Verifies nested sample-count spans (`<span>Generate <span>1</span> Image</span>`) never hijack
  *      `X-Scraped-Anlas` or trigger false canary drift warnings when cost is `90` (`90 Anlas`).
  *    - Verifies V4.5 pre-encoded Vibe Transfer (`reference_image_multiple` 2 vibes) declares 0 Anlas and 0 refs.
  *    - Verifies `master_v5_is_negative: true` propagates into `X-Declared-Anlas: 30` on `1024x1024, 2 samples` Medium.
- *    - Verifies live countdown ETA (`+1% in Xm`), cluster state colors, personal NCP (`180/540 NCP`),
- *      surplus pool, zero-rollover Anlas display, native NCP cost badge, and Guest Settings modal fields.
+ *    - Verifies live countdown ETA (`+1% in Xm`), readable cluster state labels, V5 High/Med counts,
+ *      bonus pool availability, Anlas display, native V5 credit badge, and Guest Settings modal fields (no backticks).
  *    - Verifies high-res (`1536x2048`) generation with Anlas Bypass armed sends full Commit 6
  *      `POST /queue/join` metadata and sends `X-Base-Paid: true`, `X-Declared-Anlas: 90`,
  *      `X-Scraped-Anlas`, `X-Gen-Model: V5` without mutating the payload body.
@@ -50,7 +62,7 @@
  *    - Verifies `strength: 0` on `100000x100000` or `steps: 100000` is blocked client-side (`400`) with zero network calls.
  *    - Switching native `.image-gen-model-mode-row` Effort between `Medium` and `High` (and Model
  *      to `V4.5 Full`, `NAI Diffusion 3.5`, `SD 1.5`, or `Model V50`) dynamically updates `#gw-v5-cost`
- *      (`Cost: 10 NCP (Med)`, `Cost: 18 NCP (High)`, `Legacy (0 NCP)`), updates step slider max bounds
+ *      (`Uses 10 V5 pts (Med)`, `Uses 18 V5 pts (High)`, `Legacy (0 V5 pts)`), updates step slider max bounds
  *      (`23` vs `28`), clears deadband alerts, and never misclassifies `3.5` / `1.5` / `V50` as V5.
  *    - `FormData` with a `Blob` `request` part passes through untouched with matching `X-Gen-Model: V5-medium`.
  *    - High-res / >28 steps with bypass DISARMED is blocked client-side (`400`) with zero network calls.
@@ -59,31 +71,34 @@
  * 5. Hell Path: Debt State UI Lockout & Ephemeral Telemetry Isolation:
  *    - Feeds `/auth/status` with negative Anlas balance (`virtual_balance: -40`, `is_in_debt: true`).
  *    - Asserts bypass toggle is forced unchecked & disabled in both HUD and settings modal,
- *      and HUD displays `Anlas Balance: -40 (Bypass Locked)`.
+ *      HUD displays `Anlas Overdrawn: -40 (Paid Paused)`, and `/user/data` clamps `fixedTrainingStepsLeft` to `0`.
  *    - Asserts stale `gw_policy_state` in `GM_setValue` cannot poison a fresh page boot into locking out
  *      generations before `/auth/status` polls.
  *    - Asserts toggling `#settings-anlas-bypass` preserves `v5` and `telemetry` HUD fields,
  *      and clearing debt restores normal modal bypass hint text.
- *    - Asserts Anlas-consuming bypass request is blocked (`403`) with zero network calls while
- *      free Opus/V5 generation (`1024x1024, 23 steps, 1 sample`) succeeds.
+ *    - Asserts Anlas-consuming bypass request and `/ai/upscale` are blocked (`403 DEBT_LOCKED`) with
+ *      zero network calls while free Opus/V5 generation (`1024x1024, 23 steps, 1 sample`) succeeds.
  * 6. Hell Path: V5 Capacity Depletion, 5.5% Circuit Breaker, Token-Expired Immediate Recovery, Native Effort Shield Sync & Server Error HUD Propagation:
- *    - Feeds `/auth/status` with `is_hard_locked: true` or depleted NCP; asserts HUD locks V5
- *      (`Battery Recharging` / `V5 Quota Depleted`) immediately across both Guest and Admin.
+ *    - Feeds `/auth/status` with `is_hard_locked: true` or depleted allowance; asserts HUD locks V5
+ *      (`V5 Recharging` / `V5 Allowance Reached`) immediately across both Guest and Admin.
  *    - Feeds `/auth/status` with `master_token_expired: true` AND `is_hard_locked: true`; asserts HUD
  *      displays `Master Token Expired (Awaiting Admin)` without locking Generate button AND does NOT
- *      falsely reject V5 clicks locally as `V5_BATTERY_CRITICAL` ("Battery Recharging"), allowing
- *      immediate post-token-push recovery or propagating `503 MASTER_TOKEN_EXPIRED` from server.
- *    - Toggling `#gw-bypass-toggle` or switching native Effort from `High` (`18 NCP`) to `Medium`
- *      (`10 NCP`) with `12 NCP` banked clears `#gw-button-shield` immediately without requiring a fetch.
- *    - Allows legacy V4.5 while blocking free V5 during battery recharging.
+ *      falsely reject V5 clicks locally as `V5_BATTERY_CRITICAL`, allowing immediate post-token-push
+ *      recovery or propagating `503 MASTER_TOKEN_EXPIRED` from server.
+ *    - Toggling `#gw-bypass-toggle` or switching native Effort from `High` (`18 pts`) to `Medium`
+ *      (`10 pts`) with `12 pts` banked clears `#gw-button-shield` immediately without requiring a fetch.
+ *    - Allows legacy V4.5 and `/ai/upscale` while blocking free V5 during V5 recharging.
  *    - Simulates `/queue/join` returning `403 ALLOWANCE_EXHAUSTED` and `429 V5_CAPACITY_DEPLETED`, plus
  *      `/proxy/image/*` returning `503 MASTER_SUBSCRIPTION_INACTIVE` and `503 MASTER_TOKEN_EXPIRED`;
- *      asserts exact status, `#gw-hud-alert` update, and telemetry refresh.
- * 7. Happy Path & Hell Path: Admin Governance Dual-Ledger Controls, Unlinked `user_id` Actions, Post-Push Refresh, Operator Cycle Telemetry & Strict Prompt Validation:
- *    - Verifies Admin panel renders dual-ledger fields, `[TOKEN EXPIRED]` / `[INACTIVE]` subscription alerts,
- *      Operator Settings `Cycle Consumed` (`#operator-period-usage`), sends `{ user_id: ... }` for unlinked principals
- *      across approve/revoke/ban/unban, verifies `<select>` setter syncs `<option>` selections, rejects
- *      malformed deltas (`"12.5"`, `"50abc"`) without dispatching requests, and dispatches
+ *      asserts exact status, `#gw-hud-alert` update, `approved` preservation, and telemetry refresh.
+ * 7. Happy Path & Hell Path: Admin Governance Cycle Selector, Stored XSS Escaping, Dual-Ledger Controls, Unlinked `user_id` Actions, Post-Push Refresh, Operator Cycle Telemetry & Strict Prompt Validation:
+ *    - Verifies Admin panel renders `/admin/cycles` dropdown, filters `/admin/devices?cycle_epoch=...` and
+ *      `/admin/global-stats?cycle_epoch=...`, escapes stored XSS payloads (`<img>`, `<svg>`) across usernames
+ *      and device labels, renders `[TOKEN EXPIRED]` / `[INACTIVE]` subscription alerts, handles `sortReqs`,
+ *      triggers immediate HUD + governance refresh on `Save Token`, omits Rolling Allowance & backticks in
+ *      Operator Settings while displaying `This Billing Cycle` (`#operator-period-usage`), sends `{ user_id: ... }`
+ *      for unlinked principals across approve/revoke/ban, verifies `<select>` setter syncs `<option>` selections,
+ *      rejects malformed deltas (`"12.5"`, `"50abc"`) without dispatching requests, and dispatches
  *      `POST /admin/adjust-balance` and `POST /admin/reconcile-debt`.
  */
 
@@ -105,6 +120,61 @@ function extractMetadataVersion(source) {
   return versionMatch ? versionMatch[1].trim() : '0.0.0';
 }
 
+function createPngHeaderBlob(width, height) {
+  const bytes = new Uint8Array(24);
+  bytes.set([0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A], 0);
+  const view = new DataView(bytes.buffer);
+  view.setUint32(8, 13, false);
+  bytes.set([0x49, 0x48, 0x44, 0x52], 12); // IHDR
+  view.setUint32(16, width, false);
+  view.setUint32(20, height, false);
+  return new Blob([bytes], { type: 'image/png' });
+}
+
+function createLargeExifJpegUint8Array(width, height, exifPaddingBytes = 90000) {
+  const app1Segments = [];
+  let remaining = exifPaddingBytes;
+  while (remaining > 0) {
+    const chunk = Math.min(remaining, 45000);
+    app1Segments.push(chunk);
+    remaining -= chunk;
+  }
+  const app1TotalBytes = app1Segments.reduce((sum, len) => sum + 4 + len, 0);
+  const bytes = new Uint8Array(2 + app1TotalBytes + 13);
+  const view = new DataView(bytes.buffer);
+  let pos = 0;
+  bytes[pos++] = 0xFF; bytes[pos++] = 0xD8; // SOI
+  for (const chunkLen of app1Segments) {
+    bytes[pos++] = 0xFF; bytes[pos++] = 0xE1; // APP1
+    view.setUint16(pos, chunkLen + 2, false);
+    pos += 2 + chunkLen;
+  }
+  bytes[pos++] = 0xFF; bytes[pos++] = 0xC0; // SOF0
+  view.setUint16(pos, 11, false);
+  bytes[pos + 2] = 8;
+  view.setUint16(pos + 3, height, false);
+  view.setUint16(pos + 5, width, false);
+  bytes[pos + 7] = 1;
+  return bytes;
+}
+
+function escapeMockAttr(value) {
+  return String(value === undefined || value === null ? '' : value)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;');
+}
+
+function decodeBasicEntities(str) {
+  return String(str || '')
+    .replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>')
+    .replace(/&quot;/g, '"')
+    .replace(/&#39;/g, "'")
+    .replace(/&amp;/g, '&');
+}
+
 function createBrowserSandbox(initialStorage = {}, scriptSource = null) {
   const storage = new Map(Object.entries(initialStorage));
   const networkCalls = [];
@@ -114,6 +184,7 @@ function createBrowserSandbox(initialStorage = {}, scriptSource = null) {
   const promptQueue = [];
   const confirmQueue = [];
   const alertLog = [];
+  const voidTags = new Set(['input', 'img', 'br', 'hr', 'meta', 'link']);
 
   const resolvedVersion = extractMetadataVersion(scriptSource);
 
@@ -154,7 +225,6 @@ function createBrowserSandbox(initialStorage = {}, scriptSource = null) {
     const trimmed = sel.trim();
     if (!trimmed) return false;
 
-    // Check attributes first if present: e.g. [data-sort="reqs"] or .sort-trigger[data-sort="reqs"]
     const attrRegex = /\[([a-zA-Z0-9\-_:]+)(?:=(?:"([^"]*)"|'([^']*)'|([^\]]+)))?\]/g;
     let attrMatch;
     let hasAttrCheck = false;
@@ -172,7 +242,6 @@ function createBrowserSandbox(initialStorage = {}, scriptSource = null) {
       }
     }
 
-    // Strip bracketed attribute selectors to evaluate base tag/id/class prefix
     const baseSelector = trimmed.replace(attrRegex, '').trim();
     if (!baseSelector) {
       return hasAttrCheck;
@@ -198,6 +267,15 @@ function createBrowserSandbox(initialStorage = {}, scriptSource = null) {
   }
 
   function findSelector(root, sel, singleOnly, results = []) {
+    const commaParts = sel.split(',').map(s => s.trim()).filter(Boolean);
+    if (commaParts.length > 1) {
+      for (const sub of commaParts) {
+        const hit = findSelector(root, sub, singleOnly, results);
+        if (singleOnly && hit) return hit;
+      }
+      return singleOnly ? null : results;
+    }
+
     const parts = splitSelectorParts(sel);
     if (parts.length > 1) {
       let currentSet = [root];
@@ -208,13 +286,19 @@ function createBrowserSandbox(initialStorage = {}, scriptSource = null) {
         }
         currentSet = nextSet;
       }
-      return singleOnly ? (currentSet[0] || null) : currentSet;
+      if (!singleOnly) {
+        for (const item of currentSet) {
+          if (!results.includes(item)) results.push(item);
+        }
+        return results;
+      }
+      return currentSet[0] || null;
     }
 
     for (const child of root.children) {
       if (matchesSelector(child, sel)) {
         if (singleOnly) return child;
-        results.push(child);
+        if (!results.includes(child)) results.push(child);
       }
       const found = findSelector(child, sel, singleOnly, results);
       if (singleOnly && found) return found;
@@ -232,7 +316,6 @@ function createBrowserSandbox(initialStorage = {}, scriptSource = null) {
     if (!html || typeof html !== 'string') return;
     const tokens = html.match(/<[^>]+>|[^<]+/g) || [];
     const stack = [parent];
-    const voidTags = new Set(['input', 'img', 'br', 'hr', 'meta', 'link']);
 
     for (const token of tokens) {
       if (token.startsWith('</')) {
@@ -266,15 +349,38 @@ function createBrowserSandbox(initialStorage = {}, scriptSource = null) {
         if (!isSelfClosing) stack.push(childEl);
       } else {
         const currentParent = stack[stack.length - 1];
-        currentParent._rawText += token;
+        currentParent._nodes.push({
+          isText: true,
+          html: token,
+          text: decodeBasicEntities(token)
+        });
       }
     }
   }
 
+  function serializeElementOuterHTML(el) {
+    const tag = el.tagName.toLowerCase();
+    const attrMap = new Map(el.attributes.entries());
+    if (el.id && !attrMap.has('id')) {
+      attrMap.set('id', el.id);
+    }
+    if (el.style && el.style.cssText && !attrMap.has('style')) {
+      attrMap.set('style', el.style.cssText);
+    }
+    let attrOut = '';
+    for (const [k, v] of attrMap.entries()) {
+      attrOut += v === '' ? ` ${k}` : ` ${k}="${escapeMockAttr(v)}"`;
+    }
+    if (voidTags.has(tag)) {
+      return `<${tag}${attrOut}>`;
+    }
+    return `<${tag}${attrOut}>${el.innerHTML}</${tag}>`;
+  }
+
   function createMockElement(tagName = 'div') {
     let _id = '';
-    let _innerHTML = '';
     let _children = [];
+    let _nodes = [];
     let _value = '';
     const attributes = new Map();
     const listeners = new Map();
@@ -295,6 +401,9 @@ function createBrowserSandbox(initialStorage = {}, scriptSource = null) {
               target[k] = v;
             }
           }
+        } else {
+          const kebab = String(prop).replace(/[A-Z]/g, m => '-' + m.toLowerCase());
+          target[kebab] = String(val);
         }
         return true;
       }
@@ -310,7 +419,7 @@ function createBrowserSandbox(initialStorage = {}, scriptSource = null) {
       onclick: null,
       onchange: null,
       parentElement: null,
-      _rawText: '',
+      _nodes,
 
       get id() { return _id; },
       set id(val) {
@@ -348,20 +457,24 @@ function createBrowserSandbox(initialStorage = {}, scriptSource = null) {
       },
 
       get textContent() {
-        if (_children.length > 0) {
-          let out = el._rawText || '';
-          for (const ch of _children) {
-            out += ch.textContent;
-          }
-          return out || _innerHTML.replace(/<[^>]*>?/gm, '');
+        let out = '';
+        for (const node of el._nodes) {
+          out += node.isText ? node.text : node.textContent;
         }
-        return el._rawText || _innerHTML.replace(/<[^>]*>?/gm, '');
+        return out;
       },
       set textContent(val) {
-        _innerHTML = String(val || '');
-        el._rawText = _innerHTML;
         for (const c of [..._children]) c.remove();
         _children = [];
+        el._nodes = [];
+        const strVal = val !== undefined && val !== null ? String(val) : '';
+        if (strVal.length > 0) {
+          el._nodes.push({
+            isText: true,
+            html: escapeMockAttr(strVal),
+            text: strVal
+          });
+        }
       },
 
       get children() { return _children; },
@@ -381,6 +494,7 @@ function createBrowserSandbox(initialStorage = {}, scriptSource = null) {
         let cur = el;
         while (cur) {
           if (sel === '[id^="gw-"]' && cur.id && cur.id.startsWith('gw-')) return cur;
+          if (sel === '[id^="vps-"]' && cur.id && cur.id.startsWith('vps-')) return cur;
           if (matchesSelector(cur, sel)) return cur;
           cur = cur.parentElement;
         }
@@ -389,6 +503,7 @@ function createBrowserSandbox(initialStorage = {}, scriptSource = null) {
 
       appendChild(child) {
         _children.push(child);
+        el._nodes.push(child);
         child.parentElement = el;
         notifyMutation(el, 'childList', [child], []);
         return child;
@@ -398,6 +513,11 @@ function createBrowserSandbox(initialStorage = {}, scriptSource = null) {
         const idx = _children.indexOf(refChild);
         if (idx === -1) _children.push(newChild);
         else _children.splice(idx, 0, newChild);
+
+        const nodeIdx = el._nodes.indexOf(refChild);
+        if (nodeIdx === -1) el._nodes.push(newChild);
+        else el._nodes.splice(nodeIdx, 0, newChild);
+
         newChild.parentElement = el;
         notifyMutation(el, 'childList', [newChild], []);
         return newChild;
@@ -408,6 +528,8 @@ function createBrowserSandbox(initialStorage = {}, scriptSource = null) {
         if (el.parentElement) {
           const idx = el.parentElement.children.indexOf(el);
           if (idx !== -1) el.parentElement.children.splice(idx, 1);
+          const nodeIdx = el.parentElement._nodes.indexOf(el);
+          if (nodeIdx !== -1) el.parentElement._nodes.splice(nodeIdx, 1);
           notifyMutation(el.parentElement, 'childList', [], [el]);
           el.parentElement = null;
         }
@@ -426,13 +548,19 @@ function createBrowserSandbox(initialStorage = {}, scriptSource = null) {
         return attributes.has(k) ? attributes.get(k) : null;
       },
 
-      get innerHTML() { return _innerHTML; },
+      get innerHTML() {
+        let out = '';
+        for (const node of el._nodes) {
+          out += node.isText ? node.html : serializeElementOuterHTML(node);
+        }
+        return out;
+      },
       set innerHTML(html) {
-        _innerHTML = String(html || '');
-        el._rawText = '';
         for (const c of [..._children]) c.remove();
         _children = [];
-        parseHTMLIntoChildren(el, _innerHTML);
+        el._nodes = [];
+        const rawHtml = String(html || '');
+        parseHTMLIntoChildren(el, rawHtml);
         notifyMutation(el, 'childList', _children, []);
       },
 
@@ -473,6 +601,7 @@ function createBrowserSandbox(initialStorage = {}, scriptSource = null) {
 
   const documentMock = {
     body: createMockElement('body'),
+    head: createMockElement('head'),
     documentElement: createMockElement('html'),
     createElement: (tag) => createMockElement(tag),
     createElementNS: (_, tag) => createMockElement(tag),
@@ -487,6 +616,7 @@ function createBrowserSandbox(initialStorage = {}, scriptSource = null) {
       return results;
     }
   };
+  documentMock.documentElement.appendChild(documentMock.head);
   documentMock.documentElement.appendChild(documentMock.body);
 
   let originalPageFetch = async () => new Response('{}', { status: 200 });
@@ -506,7 +636,14 @@ function createBrowserSandbox(initialStorage = {}, scriptSource = null) {
     location: { reloaded: false, reload() { this.reloaded = true; } },
     requestAnimationFrame: (fn) => setTimeout(fn, 0),
     getComputedStyle: (el) => ({
-      backgroundColor: (el && el.style && el.style.backgroundColor) ? el.style.backgroundColor : 'rgba(0, 0, 0, 0)'
+      backgroundColor: (el && el.style && el.style.backgroundColor) ? el.style.backgroundColor : 'rgba(0, 0, 0, 0)',
+      backgroundImage: (el && el.style && el.style.backgroundImage) ? el.style.backgroundImage : 'none',
+      color: (el && el.style && el.style.color) ? el.style.color : '',
+      fontFamily: (el && el.style && el.style.fontFamily) ? el.style.fontFamily : '',
+      borderTopColor: (el && el.style && (el.style.borderTopColor || el.style.borderColor)) ? (el.style.borderTopColor || el.style.borderColor) : '',
+      borderColor: (el && el.style && (el.style.borderColor || el.style.borderTopColor)) ? (el.style.borderColor || el.style.borderTopColor) : '',
+      borderTopWidth: (el && el.style && el.style.borderTopWidth) ? el.style.borderTopWidth : '',
+      borderTopStyle: (el && el.style && el.style.borderTopStyle) ? el.style.borderTopStyle : ''
     })
   };
 
@@ -541,6 +678,8 @@ function createBrowserSandbox(initialStorage = {}, scriptSource = null) {
     TextDecoder,
     TextEncoder,
     URL,
+    atob,
+    btoa,
     crypto: cryptoMock,
     MutationObserver: MockMutationObserver,
     setInterval: (fn, ms) => {
@@ -575,6 +714,7 @@ function createBrowserSandbox(initialStorage = {}, scriptSource = null) {
     promptQueue,
     confirmQueue,
     alertLog,
+    setPageFetch: (fn) => { originalPageFetch = fn; },
     triggerIntervalAtMs: (ms) => {
       for (const entry of intervals) {
         if (entry.ms === ms) entry.fn();
@@ -583,6 +723,11 @@ function createBrowserSandbox(initialStorage = {}, scriptSource = null) {
     triggerObserverSync: () => {
       for (const cb of observerCallbacks) {
         cb([{ target: documentMock.body, type: 'childList', addedNodes: [documentMock.body], removedNodes: [] }]);
+      }
+    },
+    triggerHeadStyleMutation: (styleEl) => {
+      for (const cb of observerCallbacks) {
+        cb([{ target: styleEl || documentMock.head, type: 'childList', addedNodes: [], removedNodes: [] }]);
       }
     }
   };
@@ -622,7 +767,7 @@ test('Phase 8 Commit 10: Client UserScript Runtime, Dynamic Design Engine & Prod
   // ---------------------------------------------------------------------------
   // 2. PRICING ENGINE & PARAMS PARITY WITH SERVER `auditEngine.js`
   // ---------------------------------------------------------------------------
-  await t.test('Pricing Parity: Client pricing.js and params.js match auditEngine.js (Module 643656 & Vibe Segregation)', async () => {
+  await t.test('Pricing Parity: Client pricing.js and params.js match auditEngine.js (Module 643656, Vibe Segregation & Upscale)', async () => {
     const vectors = [
       { width: 1024, height: 1024, steps: 28, n_samples: 1, model: 'nai-diffusion-4-5-full' },
       { width: 1024, height: 1024, steps: 28, n_samples: 2, model: 'nai-diffusion-4-5-full' },
@@ -656,6 +801,30 @@ test('Phase 8 Commit 10: Client UserScript Runtime, Dynamic Design Engine & Prod
       const serverCost = auditEngine.calculateAnlasCost(vec, { isOpus: true });
       assert.strictEqual(clientCost, serverCost, `Client/server price mismatch for ${JSON.stringify(vec)}`);
     }
+
+    // Upscale pixel-bucket parity
+    for (const [w, h] of [[512, 512], [1024, 1024], [1280, 1280], [1536, 1536], [1536, 2048]]) {
+      assert.strictEqual(
+        pricingMod.calculateUpscaleAnlasCost(w, h),
+        auditEngine.calculateUpscaleAnlasCost(w, h),
+        `Upscale bucket mismatch for ${w}x${h}`
+      );
+    }
+    assert.throws(() => pricingMod.calculateUpscaleAnlasCost(2048, 2048), /3145728px/);
+    assert.throws(() => auditEngine.calculateUpscaleAnlasCost(2048, 2048), /3145728px/);
+
+    // Large EXIF (>64KB chained APP1) JPEG extraction in both FormData Blob and whitespace-padded Base64 JSON
+    const largeExifJpeg = createLargeExifJpegUint8Array(1280, 1280, 90000);
+    const largeJpegFd = new FormData();
+    largeJpegFd.append('image', new Blob([largeExifJpeg], { type: 'image/jpeg' }), 'photo.jpg');
+    const fdJpegDims = await pricingMod.extractUpscaleBodyParams(largeJpegFd);
+    assert.deepStrictEqual(fdJpegDims, { width: 1280, height: 1280, format: 'jpeg' });
+
+    const b64WithNewlines = Buffer.from(largeExifJpeg).toString('base64').replace(/(.{76})/g, '$1\n');
+    const jsonJpegDims = await pricingMod.extractUpscaleBodyParams(JSON.stringify({
+      image: `data:image/jpeg;base64,${b64WithNewlines}`
+    }));
+    assert.deepStrictEqual(jsonJpegDims, { width: 1280, height: 1280, format: 'jpeg' });
 
     assert.strictEqual(auditEngine.isV5ModelFamily('nai-diffusion-3-5'), false);
     assert.strictEqual(auditEngine.isV5ModelFamily('sd-1-5'), false);
@@ -712,10 +881,11 @@ test('Phase 8 Commit 10: Client UserScript Runtime, Dynamic Design Engine & Prod
   });
 
   // ---------------------------------------------------------------------------
-  // 3. HAPPY PATH: DUAL METERS, /user/subscription GET, ENCODE-VIBE ISOLATION, CANARY & HEADERS
+  // 3. HAPPY PATH: LIVE THEME SCRAPING (TRANSPARENT BODY + NEXT WRAPPER), HIDDEN ALLOWANCE,
+  //    BASE-BYPASS NCP SUPPRESSION, NATIVE ANLAS VIRTUALIZATION, /user/subscription GET & /ai/upscale
   // ---------------------------------------------------------------------------
-  await t.test('Happy Path: Renders dual meters, preserves GET /user/subscription & counter isolation, scrapes canary & bypass headers', async () => {
-    const { context, storage, networkCalls, triggerIntervalAtMs, triggerObserverSync } = createBrowserSandbox({
+  await t.test('Happy Path: Inherits live Next.js wrapper theme on transparent body, hides exempt allowance & base-bypass NCP cost, virtualizes Anlas & proxies /ai/upscale', async () => {
+    const { context, storage, networkCalls, setPageFetch, triggerIntervalAtMs, triggerObserverSync } = createBrowserSandbox({
       approved: true,
       vps_host: 'https://vps.example.duckdns.org',
       device_secret: 'sec_guest_10',
@@ -723,27 +893,57 @@ test('Phase 8 Commit 10: Client UserScript Runtime, Dynamic Design Engine & Prod
       anlas_bypass_enabled: true
     }, guestCode);
 
-    // Deliberately nest <span>1</span> inside "Generate <span>1</span> Image" to verify canary scraper ignores sample count
+    // Simulate real NovelAI DOM: transparent body, opaque #__next wrapper, opaque textarea card,
+    // dark-teal menu button + border, active teal Effort button, cream Generate button,
+    // prompt text containing "1536x2048" (must NOT trigger false base-bypass), and nested <span>1</span> sample count.
     context.document.body.innerHTML = `
-      <div class="image-gen-nav-row">
-        <div style="display:flex;">
-          <button aria-label="menu" class="nav-btn"></button>
+      <div id="__next" style="background-color: rgb(6, 9, 9); color: rgb(245, 243, 194);">
+        <div class="image-gen-nav-row" style="background-color: rgba(0, 0, 0, 0);">
+          <div style="display:flex;">
+            <button aria-label="menu" class="nav-btn" style="background-color: rgb(12, 36, 36); border-top-color: rgb(29, 93, 91); border-top-width: 1px;"></button>
+          </div>
         </div>
-      </div>
-      <div class="image-gen-model-mode-row">
-        <div><span>Model</span><div class="css-icpgrc"><div id="native-model-val" class="css-19vwdf1-singleValue">V5 Full</div><input aria-label="Select the Model" value="" /></div></div>
-        <div><span>Effort</span><div><button id="native-med-btn" style="background-color: rgb(25, 90, 95);">Medium</button><button id="native-high-btn" style="background-color: rgba(0, 0, 0, 0);">High</button></div></div>
-      </div>
-      <div class="image-gen-footer">
-        <button class="image-gen-generate-button">
-          <span>Generate <span>1</span> Image</span>
-          <div class="native-anlas-container"><span id="native-anlas-val">90 Anlas</span></div>
-        </button>
+        <div style="background-color: rgb(13, 18, 18);">
+          <textarea>1536x2048 masterpiece prompt tag</textarea>
+        </div>
+        <div class="image-gen-model-mode-row">
+          <div><span>Model</span><div class="css-icpgrc"><div id="native-model-val" class="css-19vwdf1-singleValue">V5 Full</div><input aria-label="Select the Model" value="" /></div></div>
+          <div><span>Effort</span><div><button id="native-med-btn" style="background-color: rgb(20, 76, 74); color: rgb(245, 243, 194);">Medium</button><button id="native-high-btn" style="background-color: rgba(0, 0, 0, 0);">High</button></div></div>
+        </div>
+        <div class="image-gen-footer" style="background-color: rgba(0, 0, 0, 0);">
+          <input type="number" id="native-width-input" aria-label="Width" value="1024" />
+          <input type="number" id="native-height-input" aria-label="Height" value="1024" />
+          <button class="image-gen-generate-button" style="background-color: rgb(245, 243, 194); color: rgb(18, 18, 22);">
+            <span>Generate <span>1</span> Image</span>
+            <div class="native-anlas-container"><span id="native-anlas-val">90 Anlas</span></div>
+          </button>
+        </div>
       </div>
     `;
 
+    setPageFetch(async (url) => {
+      if (url.includes('/user/data')) {
+        return new Response(JSON.stringify({
+          subscription: { tier: 0, active: false, expiresAt: 0 },
+          keystore: { keystore: 'E2EE_OK' }
+        }), { status: 200 });
+      }
+      return new Response('{}', { status: 404 });
+    });
+
     vm.runInContext(guestCode, context);
     triggerObserverSync();
+
+    // Scoped stylesheet must inherit live #__next background, textarea card, teal border, teal control & cream accent
+    const styleSheet = context.document.getElementById('gw-ui-styles');
+    assert.ok(styleSheet, '#gw-ui-styles must mount');
+    assert.match(styleSheet.textContent, /--theme-bg0:\s*rgb\(6,\s*9,\s*9\)/, 'Scoped --theme-bg0 must override stale :root variables');
+    assert.match(styleSheet.textContent, /--gw-bg0:\s*var\(--theme-bg0,\s*rgb\(6,\s*9,\s*9\)\)/, 'Must inherit #__next background when document.body is transparent');
+    assert.match(styleSheet.textContent, /--gw-bg1:\s*var\(--theme-bg1,\s*rgb\(13,\s*18,\s*18\)\)/, 'Must inherit textarea card surface');
+    assert.match(styleSheet.textContent, /--gw-control-bg:\s*rgb\(20,\s*76,\s*74\)/, 'Must inherit active teal Effort button as control fill');
+    assert.match(styleSheet.textContent, /--gw-border-strong:\s*rgb\(29,\s*93,\s*91\)/, 'Must inherit teal border color');
+    assert.match(styleSheet.textContent, /rgb\(245,\s*243,\s*194\)/, 'Must inherit cream primary accent');
+    assert.match(styleSheet.textContent, /input\[type="checkbox"\]\.gw-switch/, 'Stylesheet must isolate switch sizing');
 
     // No redundant #gw-effort-select dropdown should exist
     assert.strictEqual(context.document.getElementById('gw-effort-select'), null, 'Must not inject redundant #gw-effort-select');
@@ -835,7 +1035,7 @@ test('Phase 8 Commit 10: Client UserScript Runtime, Dynamic Design Engine & Prod
           subscription_active: true,
           last_fetched_at: Date.now()
         },
-        subscription_period: { anlas_consumed: 90, v5_consumed: 4 }
+        subscription_period: { anlas_consumed: 90, v5_consumed: 4, legacy_image_gens: 1, upscale_gens: 0, text_gens: 2 }
       })
     });
     await new Promise(r => setTimeout(r, 20));
@@ -847,25 +1047,45 @@ test('Phase 8 Commit 10: Client UserScript Runtime, Dynamic Design Engine & Prod
     assert.ok(allowanceBar, '#gw-allowance-bar must mount');
     assert.strictEqual(v5Bar.nextElementSibling, allowanceBar, '#gw-v5-bar must sit above #gw-allowance-bar');
     assert.strictEqual(allowanceBar.nextElementSibling, genBtn, 'Must preserve #gw-allowance-bar.nextElementSibling === genBtn');
+    assert.strictEqual(allowanceBar.style.display, 'none', '#gw-allowance-bar must hide when exempt (session === null)');
+    assert.match(v5Bar.style.backgroundColor, /rgb\(6,\s*9,\s*9\)/, '#gw-v5-bar must inherit live app background color');
 
     const v5Label = context.document.getElementById('gw-v5-label');
     const v5Eta = context.document.getElementById('gw-v5-eta');
     const v5Cost = context.document.getElementById('gw-v5-cost');
     const anlasLabel = context.document.getElementById('gw-anlas-label');
-    assert.match(v5Label.textContent, /180\/540 NCP/);
-    assert.match(v5Label.textContent, /\+450 Surplus/);
+    assert.match(v5Label.textContent, /10 High \/ 18 Med/);
+    assert.match(v5Label.textContent, /\+25 Bonus/);
     assert.match(v5Label.textContent, /82\.5%/);
-    assert.match(v5Eta.textContent, /SURPLUS ACTIVE/);
+    assert.match(v5Eta.textContent, /Shared Bonus Open/);
     assert.match(v5Eta.textContent, /\+1% in 30\.0m/);
-    assert.strictEqual(v5Cost.textContent, 'Cost: 10 NCP (Med)', 'HUD must display 10 NCP for native V5 Medium selection');
-    assert.match(anlasLabel.textContent, /500\/500 \(No Rollover\)/);
+    assert.strictEqual(v5Cost.style.display, '', 'Prompt text 1536x2048 must NOT falsely hide V5 credit cost');
+    assert.strictEqual(v5Cost.textContent, 'Uses 10 V5 pts (Med)', '1024x1024 + Anlas enabled (addon-only) must still show V5 credit cost');
+    assert.match(anlasLabel.textContent, /Monthly Anlas: 500\/500/);
 
-    // Toggle native Effort to High in NovelAI's DOM -> HUD updates to 18 NCP immediately
-    context.document.getElementById('native-med-btn').style.backgroundColor = 'rgba(0, 0, 0, 0)';
-    context.document.getElementById('native-high-btn').style.backgroundColor = 'rgb(25, 90, 95)';
+    // Once /auth/status populated available_balance = 500, /user/data injects live virtual Anlas into native Anlas bar
+    const userDataResp = await vm.runInContext(`unsafeWindow.fetch('https://image.novelai.net/user/data')`, context);
+    const userDataJson = await userDataResp.json();
+    assert.strictEqual(userDataJson.subscription.trainingStepsLeft.fixedTrainingStepsLeft, 500);
+    assert.strictEqual(userDataJson.subscription.trainingStepsLeft.purchasedTrainingSteps, 0);
+    assert.strictEqual(userDataJson.keystore.keystore, 'E2EE_OK');
+
+    // Setting width=1536, height=2048 with bypass enabled -> NON-ADDON Anlas bypass -> V5 cost badge MUST hide!
+    context.document.getElementById('native-width-input').value = '1536';
+    context.document.getElementById('native-height-input').value = '2048';
     triggerObserverSync();
     await new Promise(r => setTimeout(r, 20));
-    assert.strictEqual(v5Cost.textContent, 'Cost: 18 NCP (High)', 'HUD must display 18 NCP for native V5 High selection');
+    assert.strictEqual(v5Cost.style.display, 'none', 'V5 credit cost must hide when configured for non-addon Anlas bypass');
+
+    // Restore 1024x1024 and toggle native Effort to High in NovelAI's DOM -> cost badge reappears at 18 V5 pts immediately
+    context.document.getElementById('native-width-input').value = '1024';
+    context.document.getElementById('native-height-input').value = '1024';
+    context.document.getElementById('native-med-btn').style.backgroundColor = 'rgba(0, 0, 0, 0)';
+    context.document.getElementById('native-high-btn').style.backgroundColor = 'rgb(20, 76, 74)';
+    triggerObserverSync();
+    await new Promise(r => setTimeout(r, 20));
+    assert.strictEqual(v5Cost.style.display, '');
+    assert.strictEqual(v5Cost.textContent, 'Uses 18 V5 pts (High)', 'HUD must display 18 V5 pts for native V5 High selection');
 
     // 1. Matching scraped cost (90 Anlas with nested <span>1</span> inside Generate label):
     //    must report X-Scraped-Anlas: 90 (NOT 1) and must NOT show a false drift warning!
@@ -1011,7 +1231,52 @@ test('Phase 8 Commit 10: Client UserScript Runtime, Dynamic Design Engine & Prod
     });
     await vibe45Promise;
 
-    // 5. master_v5_is_negative: true revokes Opus 1-sample discount -> X-Declared-Anlas: 30
+    // 5. /ai/upscale FormData interception: extracts PNG IHDR (1024x1024 -> 1 Anlas), queues via Channel A
+    networkCalls.length = 0;
+    context._testPngBlob = createPngHeaderBlob(1024, 1024);
+    const upscalePromise = vm.runInContext(`
+      (() => {
+        const fd = new FormData();
+        fd.append('image', globalThis._testPngBlob, 'blob');
+        fd.append('request', new Blob([JSON.stringify({
+          image: 'image',
+          model: 'nai-diffusion-5-curated',
+          declared_blur_sigma: 0
+        })], { type: 'application/json' }));
+        return unsafeWindow.fetch('https://image.novelai.net/ai/upscale', {
+          method: 'POST',
+          body: fd
+        });
+      })()
+    `, context);
+
+    await new Promise(r => setTimeout(r, 20));
+    const upJoin = networkCalls[0];
+    assert.strictEqual(upJoin.url, 'https://vps.example.duckdns.org/queue/join');
+    const upJoinBody = JSON.parse(upJoin.data);
+    assert.strictEqual(upJoinBody.is_upscale, true);
+    assert.strictEqual(upJoinBody.width, 1024);
+    assert.strictEqual(upJoinBody.height, 1024);
+    assert.strictEqual(upJoinBody.declared_anlas, 1);
+
+    upJoin.onload({ status: 200, responseText: '{"success":true}' });
+    await new Promise(r => setTimeout(r, 1050));
+    networkCalls[1].onload({ status: 200, responseText: '{"status":"your_turn"}' });
+    await new Promise(r => setTimeout(r, 20));
+
+    const upProxy = networkCalls[2];
+    assert.strictEqual(upProxy.url, 'https://vps.example.duckdns.org/proxy/image/ai/upscale');
+    assert.strictEqual(upProxy.headers['x-gen-width'], '1024');
+    assert.strictEqual(upProxy.headers['x-gen-height'], '1024');
+    assert.strictEqual(upProxy.headers['x-declared-anlas'], '1');
+    upProxy.onloadstart({
+      status: 200,
+      response: new ReadableStream({ start(c) { c.enqueue(new TextEncoder().encode('PNG_UPSCALED')); c.close(); } }),
+      responseHeaders: 'HTTP/1.1 200 OK\r\nContent-Type: image/png'
+    });
+    assert.strictEqual((await upscalePromise).status, 200);
+
+    // 6. master_v5_is_negative: true revokes Opus 1-sample discount -> X-Declared-Anlas: 30
     networkCalls.length = 0;
     triggerIntervalAtMs(10000);
     await new Promise(r => setTimeout(r, 20));
@@ -1051,14 +1316,157 @@ test('Phase 8 Commit 10: Client UserScript Runtime, Dynamic Design Engine & Prod
     });
     await negMultiPromise;
 
-    // 6. Guest Settings Modal renders dual-ledger fields & bypass toggle
+    // 7. Guest Settings Modal renders dual-ledger fields, hides Rolling Allowance when exempt & contains zero backticks
     const badge = context.document.getElementById('gw-nav-badge');
     badge.onclick({ preventDefault: () => {}, stopPropagation: () => {} });
+    await new Promise(r => setTimeout(r, 20));
     const modal = context.document.getElementById('vps-settings-modal');
     assert.ok(modal);
+    assert.doesNotMatch(modal.innerHTML, /`/, 'Settings modal must not render literal Markdown backticks');
     assert.ok(modal.querySelector('#settings-anlas-bypass'));
     assert.ok(modal.querySelector('#guest-virtual-anlas'));
     assert.ok(modal.querySelector('#guest-v5-bank'));
+    assert.strictEqual(context.document.getElementById('guest-rolling-allowance-row').style.display, 'none');
+
+    // Simulate Metered session payload -> both #gw-allowance-bar and #guest-rolling-allowance-row become visible
+    networkCalls[networkCalls.length - 1].onload({
+      status: 200,
+      responseText: JSON.stringify({
+        approved: true,
+        tier: 'Metered',
+        session: { allowance: 42, max: 100, next_refill_in: 60000 },
+        anlas: { virtual_balance: 0, available_balance: 0, monthly_quota: 0, is_unlimited: false, is_in_debt: false },
+        v5: { banked_ncp: 0, available_ncp: 0, max_bank_ncp: 0, surplus_available_ncp: 0, surplus_eligible: false, is_unlimited: false },
+        telemetry: { master_v5_percent: 80, cluster_state: 'reserve_mode', is_hard_locked: false, subscription_active: true, last_fetched_at: Date.now() },
+        subscription_period: { anlas_consumed: 0, v5_consumed: 0, legacy_image_gens: 3, upscale_gens: 0, text_gens: 1 }
+      })
+    });
+    await new Promise(r => setTimeout(r, 20));
+    assert.strictEqual(context.document.getElementById('guest-rolling-allowance-row').style.display, 'flex');
+    assert.strictEqual(context.document.getElementById('guest-period-usage').textContent, '0 Anlas · 3 images · 1 text');
+
+    triggerIntervalAtMs(10000);
+    await new Promise(r => setTimeout(r, 20));
+    networkCalls[networkCalls.length - 1].onload({
+      status: 200,
+      responseText: JSON.stringify({
+        approved: true,
+        tier: 'Metered',
+        session: { allowance: 42, max: 100, next_refill_in: 60000 }
+      })
+    });
+    await new Promise(r => setTimeout(r, 20));
+    assert.strictEqual(context.document.getElementById('gw-allowance-bar').style.display, 'flex');
+    assert.match(context.document.getElementById('gw-allowance-label').textContent, /42\/100/);
+  });
+
+  // ---------------------------------------------------------------------------
+  // 3b. HELL PATH: STALE NAVY BODY + LINEAR GRADIENT + TRANSLUCENT TINTS + DELAYED NAV BADGE SWAP
+  // ---------------------------------------------------------------------------
+  await t.test('Theme Scraping Hell Paths: Skips stale navy body, translucent overlays, extracts gradients & syncs delayed nav badge theme swap', async () => {
+    const { context, triggerObserverSync, triggerHeadStyleMutation } = createBrowserSandbox({
+      approved: true,
+      vps_host: 'https://vps.example.duckdns.org',
+      device_secret: 'sec_brown_theme',
+      browser_id: 'b_brown_theme'
+    }, guestCode);
+
+    // 1. Stale navy CSS on body (rgb(19, 21, 44)) + translucent white hover tint overlay +
+    //    real warm-brown theme painted via linear-gradient on layout wrapper + card container border +
+    //    delayed teal->brown transition on button[aria-label="menu"].
+    context.document.body.style.backgroundColor = 'rgb(19, 21, 44)';
+    context.document.body.style.color = 'rgb(245, 243, 194)';
+    context.document.body.innerHTML = `
+      <div id="__next">
+        <div id="theme-canvas" style="background-image: linear-gradient(180deg, rgba(0, 0, 0, 0) 0%, rgb(50, 27, 15) 100%);">
+          <div style="background-color: rgba(255, 255, 255, 0.08);">
+            <div class="image-gen-nav-row" style="background-color: rgba(0, 0, 0, 0.15);">
+              <div style="display:flex;">
+                <button id="menu-btn" aria-label="menu" class="nav-btn-teal" style="background-color: rgb(12, 36, 36); color: rgb(255, 255, 255);"></button>
+              </div>
+              <div style="border-top-color: rgb(91, 56, 36); border-top-width: 1px;">Anlas: 112</div>
+            </div>
+            <div style="background-color: rgb(33, 8, 4); border-top-color: rgb(91, 56, 36); border-top-width: 1px;">
+              <textarea>prompt</textarea>
+            </div>
+            <div class="image-gen-footer">
+              <button class="image-gen-generate-button" style="background-color: rgb(245, 203, 92); color: rgb(26, 15, 10);">
+                <span>Generate 1 Image</span>
+              </button>
+            </div>
+          </div>
+        </div>
+      </div>
+    `;
+
+    vm.runInContext(guestCode, context);
+    triggerObserverSync();
+
+    const styleSheet = context.document.getElementById('gw-ui-styles');
+    const v5Bar = context.document.getElementById('gw-v5-bar');
+    const navBadge = context.document.getElementById('gw-nav-badge');
+    assert.ok(styleSheet && v5Bar && navBadge);
+
+    // Must ignore stale body rgb(19, 21, 44) AND ignore rgba(255,255,255,0.08)/rgba(0,0,0,0.15) tints,
+    // scraping warm-brown gradient stop rgb(50, 27, 15) and card border rgb(91, 56, 36)!
+    assert.match(styleSheet.textContent, /--theme-bg0:\s*rgb\(50,\s*27,\s*15\)/, 'Must inherit inner warm-brown gradient instead of stale navy body');
+    assert.match(styleSheet.textContent, /--theme-bg2:\s*rgb\(91,\s*56,\s*36\)/, 'Must inherit card/pill borderTopColor instead of translucent white fallback');
+    assert.match(v5Bar.style.backgroundColor, /rgb\(50,\s*27,\s*15\)/);
+    assert.match(v5Bar.style.border, /rgb\(91,\s*56,\s*36\)/);
+    assert.strictEqual(navBadge.className, 'nav-btn-teal');
+
+    // Simulate NovelAI async /user/clientsettings hydrating the warm-brown theme onto menu-btn + layout wrapper
+    const menuBtn = context.document.getElementById('menu-btn');
+    menuBtn.className = 'nav-btn-brown';
+    menuBtn.style.backgroundColor = 'rgb(75, 43, 26)';
+    menuBtn.style.color = 'rgb(245, 243, 194)';
+    menuBtn.style.borderTopColor = 'rgb(91, 56, 36)';
+    context.document.getElementById('theme-canvas').style.backgroundImage = 'none';
+    context.document.getElementById('theme-canvas').style.backgroundColor = 'rgb(56, 30, 17)';
+
+    // Verify head <style> swap triggers immediate theme + nav-badge refresh!
+    const headStyle = context.document.createElement('style');
+    context.document.head.appendChild(headStyle);
+    triggerHeadStyleMutation(headStyle);
+    await new Promise(r => setTimeout(r, 20));
+
+    assert.strictEqual(navBadge.className, 'nav-btn-brown', 'Delayed theme hydration must sync #gw-nav-badge className');
+    assert.strictEqual(navBadge.style.backgroundColor, 'rgb(75, 43, 26)', 'Delayed theme hydration must sync #gw-nav-badge backgroundColor');
+    assert.strictEqual(navBadge.style.color, 'rgb(245, 243, 194)', 'Delayed theme hydration must sync #gw-nav-badge color');
+    assert.match(styleSheet.textContent, /--theme-bg0:\s*rgb\(56,\s*30,\s*17\)/, 'Head style mutation must refresh live scraped theme');
+  });
+
+  // ---------------------------------------------------------------------------
+  // 3c. HELL PATH: DARK BUTTON SURFACE + BRIGHT TEXT CONTRAST IN THEME SCRAPER
+  // ---------------------------------------------------------------------------
+  await t.test('Theme Contrast: Dark Generate button surface adopts bright text color as accent (never dark-on-dark)', () => {
+    const { context, triggerObserverSync } = createBrowserSandbox({
+      approved: true,
+      vps_host: 'https://vps.example.duckdns.org',
+      device_secret: 'sec_theme',
+      browser_id: 'b_theme'
+    }, guestCode);
+
+    context.document.body.style.backgroundColor = 'rgb(14, 15, 33)';
+    context.document.body.style.color = 'rgb(245, 243, 194)';
+    context.document.body.innerHTML = `
+      <div class="image-gen-footer">
+        <button class="image-gen-generate-button" style="background-color: rgb(24, 27, 54); color: rgb(245, 243, 194);">
+          <span>Generate 1 Image</span>
+        </button>
+      </div>
+    `;
+
+    vm.runInContext(guestCode, context);
+    triggerObserverSync();
+
+    const styleSheet = context.document.getElementById('gw-ui-styles');
+    assert.ok(styleSheet);
+    assert.match(
+      styleSheet.textContent,
+      /--gw-accent:\s*var\(--theme-accent,\s*rgb\(245,\s*243,\s*194\)\)/,
+      'Dark Generate button surface must fall back to bright button text color instead of creating dark-on-dark accent'
+    );
   });
 
   // ---------------------------------------------------------------------------
@@ -1090,7 +1498,7 @@ test('Phase 8 Commit 10: Client UserScript Runtime, Dynamic Design Engine & Prod
 
     const stepSlider = context.document.getElementById('step-slider');
     const v5Cost = context.document.getElementById('gw-v5-cost');
-    assert.strictEqual(v5Cost.textContent, 'Cost: 18 NCP (High)');
+    assert.strictEqual(v5Cost.textContent, 'Uses 18 V5 pts (High)');
     assert.strictEqual(stepSlider.getAttribute('max'), '23');
     assert.strictEqual(context.document.getElementById('gw-hud-alert').style.display, 'none');
 
@@ -1098,7 +1506,7 @@ test('Phase 8 Commit 10: Client UserScript Runtime, Dynamic Design Engine & Prod
     stepSlider.value = '25';
     stepSlider.dispatchEvent({ type: 'input', target: stepSlider });
     assert.strictEqual(context.document.getElementById('gw-hud-alert').style.display, 'block', 'Live input event to step 25 must trigger deadband warning immediately');
-    assert.match(context.document.getElementById('gw-hud-alert').textContent, /battery deadband/i);
+    assert.match(context.document.getElementById('gw-hud-alert').textContent, /Steps 24–28 are blocked/);
 
     // Arming Anlas Bypass while steps remain 25 on V5 High -> clicking Generate sets deadband alert,
     // and subsequent MutationObserver ticks MUST NOT erase that deadband alert until steps change
@@ -1147,16 +1555,16 @@ test('Phase 8 Commit 10: Client UserScript Runtime, Dynamic Design Engine & Prod
       `, context);
       assert.strictEqual(resp.status, 400, `V5 High step ${badStep} must block client-side`);
       const errBody = await resp.json();
-      assert.match(errBody.message, /battery deadband/i);
+      assert.match(errBody.message, /Steps 24–28 are blocked/);
     }
     assert.strictEqual(networkCalls.length, 0, 'Deadband requests must never hit /queue/join');
 
-    // 2. Switch NovelAI's native Effort pill to Medium -> clears deadband alert, updates cost to 10 NCP, restores slider max=28
+    // 2. Switch NovelAI's native Effort pill to Medium -> clears deadband alert, updates cost to 10 V5 pts, restores slider max=28
     context.document.getElementById('native-med-btn').style.backgroundColor = 'rgb(25, 90, 95)';
     context.document.getElementById('native-high-btn').style.backgroundColor = 'rgba(0, 0, 0, 0)';
     triggerObserverSync();
     await new Promise(r => setTimeout(r, 20));
-    assert.strictEqual(v5Cost.textContent, 'Cost: 10 NCP (Med)');
+    assert.strictEqual(v5Cost.textContent, 'Uses 10 V5 pts (Med)');
     assert.strictEqual(stepSlider.getAttribute('max'), '28');
     assert.strictEqual(context.document.getElementById('gw-hud-alert').style.display, 'none', 'Switching to Medium must clear deadband alert');
 
@@ -1185,6 +1593,7 @@ test('Phase 8 Commit 10: Client UserScript Runtime, Dynamic Design Engine & Prod
     await new Promise(r => setTimeout(r, 1050));
     networkCalls[1].onload({ status: 200, responseText: '{"status":"your_turn"}' });
     await new Promise(r => setTimeout(r, 20));
+
     const fdProxyCall = networkCalls[2];
     assert.strictEqual(fdProxyCall.headers['x-gen-model'], 'V5-medium');
     assert.strictEqual(fdProxyCall.headers['x-gen-steps'], '14');
@@ -1213,12 +1622,12 @@ test('Phase 8 Commit 10: Client UserScript Runtime, Dynamic Design Engine & Prod
     assert.strictEqual(unbypassedJson.error, 'BYPASS_DISABLED');
     assert.strictEqual(networkCalls.length, 0);
 
-    // 5. Switch native Model dropdown to V4.5 Full, NAI 3.5, SD 1.5, and Model V50 -> must all render Legacy (0 NCP)
+    // 5. Switch native Model dropdown to V4.5 Full, NAI 3.5, SD 1.5, and Model V50 -> must all render Legacy (0 V5 pts)
     for (const legacyLabel of ['V4.5 Full', 'NAI Diffusion 3.5', 'SD 1.5', 'Model V50']) {
       context.document.getElementById('native-model-val').textContent = legacyLabel;
       triggerObserverSync();
       await new Promise(r => setTimeout(r, 20));
-      assert.strictEqual(v5Cost.textContent, 'Legacy (0 NCP)', `Model "${legacyLabel}" must not be misclassified as V5`);
+      assert.strictEqual(v5Cost.textContent, 'Legacy (0 V5 pts)', `Model "${legacyLabel}" must not be misclassified as V5`);
       assert.strictEqual(stepSlider.getAttribute('max'), '28');
     }
 
@@ -1258,9 +1667,9 @@ test('Phase 8 Commit 10: Client UserScript Runtime, Dynamic Design Engine & Prod
   // ---------------------------------------------------------------------------
   // 5. HELL PATH: DEBT STATE UI LOCKOUT & EPHEMERAL TELEMETRY ISOLATION
   // ---------------------------------------------------------------------------
-  await t.test('Hell Path: Negative Anlas debt locks bypass, stale GM telemetry never poisons boot & forgiveness restores modal hint', async () => {
+  await t.test('Hell Path: Negative Anlas debt locks bypass & upscale, stale GM telemetry never poisons boot & forgiveness restores hint', async () => {
     // Seed stale gw_policy_state with isHardLocked: true & subscriptionActive: false to prove fresh boot ignores it
-    const { context, storage, networkCalls, triggerIntervalAtMs, triggerObserverSync } = createBrowserSandbox({
+    const { context, storage, networkCalls, setPageFetch, triggerIntervalAtMs, triggerObserverSync } = createBrowserSandbox({
       approved: true,
       vps_host: 'https://vps.example.duckdns.org',
       device_secret: 'sec_debt10',
@@ -1284,6 +1693,13 @@ test('Phase 8 Commit 10: Client UserScript Runtime, Dynamic Design Engine & Prod
         <button class="image-gen-generate-button"><span>Generate 1 Image</span></button>
       </div>
     `;
+
+    setPageFetch(async (url) => {
+      if (url.includes('/user/data')) {
+        return new Response(JSON.stringify({ subscription: { tier: 0, active: false } }), { status: 200 });
+      }
+      return new Response('{}', { status: 404 });
+    });
 
     vm.runInContext(guestCode, context);
     triggerObserverSync();
@@ -1344,9 +1760,29 @@ test('Phase 8 Commit 10: Client UserScript Runtime, Dynamic Design Engine & Prod
     assert.strictEqual(storage.get('anlas_bypass_enabled'), false, 'Debt state must wipe stored bypass toggle');
     assert.strictEqual(bypassToggle.checked, false);
     assert.strictEqual(bypassToggle.disabled, true);
-    assert.strictEqual(context.document.getElementById('gw-bypass-text').textContent, 'Bypass Locked');
-    assert.match(context.document.getElementById('gw-anlas-label').textContent, /Anlas Balance: -40 \(Bypass Locked\)/);
+    assert.strictEqual(context.document.getElementById('gw-bypass-text').textContent, 'Anlas Paused');
+    assert.match(context.document.getElementById('gw-anlas-label').textContent, /Anlas Overdrawn: -40 \(Paid Paused\)/);
 
+    // Negative debt clamps /user/data native Anlas bar to 0
+    const debtUserData = await (await vm.runInContext(`unsafeWindow.fetch('https://image.novelai.net/user/data')`, context)).json();
+    assert.strictEqual(debtUserData.subscription.trainingStepsLeft.fixedTrainingStepsLeft, 0);
+
+    // Debt also blocks /ai/upscale locally (403 DEBT_LOCKED)
+    networkCalls.length = 0;
+    context._debtPng = createPngHeaderBlob(1024, 1024);
+    const blockedUpscale = await vm.runInContext(`
+      (() => {
+        const fd = new FormData();
+        fd.append('image', globalThis._debtPng, 'blob');
+        fd.append('request', new Blob(['{"image":"image"}'], { type: 'application/json' }));
+        return unsafeWindow.fetch('https://image.novelai.net/ai/upscale', { method: 'POST', body: fd });
+      })()
+    `, context);
+    assert.strictEqual(blockedUpscale.status, 403);
+    assert.strictEqual((await blockedUpscale.json()).error, 'DEBT_LOCKED');
+    assert.strictEqual(networkCalls.length, 0);
+
+    // Open settings modal and reconcile debt -> restores normal hint & HUD sync
     context.document.getElementById('gw-nav-badge').onclick({ preventDefault: () => {}, stopPropagation: () => {} });
     await new Promise(r => setTimeout(r, 20));
     networkCalls[networkCalls.length - 1].onload({
@@ -1364,13 +1800,13 @@ test('Phase 8 Commit 10: Client UserScript Runtime, Dynamic Design Engine & Prod
     const modalBypass = context.document.getElementById('settings-anlas-bypass');
     const modalStatusEl = context.document.getElementById('settings-bypass-status');
     assert.strictEqual(modalBypass.disabled, false);
-    assert.doesNotMatch(modalStatusEl.textContent, /Bypass Locked/);
+    assert.doesNotMatch(modalStatusEl.textContent, /Paid Features Paused/);
 
     modalBypass.checked = true;
     modalBypass.onchange();
     assert.match(
       context.document.getElementById('gw-v5-label').textContent,
-      /180\/540 NCP/,
+      /10 High \/ 18 Med/,
       'Modal bypass toggle must preserve V5/telemetry state in HUD'
     );
     assert.strictEqual(bypassToggle.checked, true, 'Modal bypass toggle must sync HUD checkbox');
@@ -1434,8 +1870,8 @@ test('Phase 8 Commit 10: Client UserScript Runtime, Dynamic Design Engine & Prod
   // ---------------------------------------------------------------------------
   // 6. HELL PATH: V5 BATTERY LOCKOUT, TOKEN EXPIRED DISPLAY/RECOVERY & SERVER ERRORS
   // ---------------------------------------------------------------------------
-  await t.test('Hell Path: Enforces 5.5% Battery Recharging lockout, lets token_expired reach server immediately, and propagates errors', async () => {
-    const { context, networkCalls, triggerIntervalAtMs, triggerObserverSync } = createBrowserSandbox({
+  await t.test('Hell Path: Enforces 5.5% V5 Recharging lockout, lets token_expired reach server immediately, and propagates errors', async () => {
+    const { context, storage, networkCalls, triggerIntervalAtMs, triggerObserverSync } = createBrowserSandbox({
       approved: true,
       vps_host: 'https://vps.example.duckdns.org',
       device_secret: 'sec_lock10',
@@ -1472,7 +1908,7 @@ test('Phase 8 Commit 10: Client UserScript Runtime, Dynamic Design Engine & Prod
     });
     await new Promise(r => setTimeout(r, 20));
     assert.match(context.document.getElementById('gw-v5-label').textContent, /Master Token Expired/);
-    assert.match(context.document.getElementById('gw-v5-eta').textContent, /TOKEN EXPIRED/);
+    assert.match(context.document.getElementById('gw-v5-eta').textContent, /Session Expired/);
     assert.strictEqual(context.document.getElementById('gw-button-shield').style.display, 'none', 'Token expired must not lock Generate button behind client shield');
 
     networkCalls.length = 0;
@@ -1499,7 +1935,7 @@ test('Phase 8 Commit 10: Client UserScript Runtime, Dynamic Design Engine & Prod
     assert.strictEqual((await expiredJoinResp.json()).error, 'MASTER_TOKEN_EXPIRED');
     assert.match(context.document.getElementById('gw-hud-alert').textContent, /session token was rejected/);
 
-    // Switch to 5.0% Battery Recharging circuit breaker
+    // Switch to 5.0% V5 Recharging circuit breaker
     networkCalls.length = 0;
     triggerIntervalAtMs(10000);
     await new Promise(r => setTimeout(r, 20));
@@ -1516,25 +1952,25 @@ test('Phase 8 Commit 10: Client UserScript Runtime, Dynamic Design Engine & Prod
     await new Promise(r => setTimeout(r, 20));
 
     assert.strictEqual(context.document.getElementById('gw-button-shield').style.display, 'flex');
-    assert.strictEqual(context.document.getElementById('gw-shield-text').textContent, 'Battery Recharging');
+    assert.strictEqual(context.document.getElementById('gw-shield-text').textContent, 'V5 Recharging');
 
-    // Toggling #gw-bypass-toggle ON directly while sitting on Battery Recharging shield MUST clear shield immediately
+    // Toggling #gw-bypass-toggle ON directly while sitting on V5 Recharging shield MUST clear shield immediately
     const bypassToggle = context.document.getElementById('gw-bypass-toggle');
     bypassToggle.checked = true;
     bypassToggle.onchange();
     assert.strictEqual(
       context.document.getElementById('gw-button-shield').style.display,
       'none',
-      'Arming Anlas Bypass while Battery Recharging shield is shown must unlock Generate button immediately'
+      'Arming Use Anlas while V5 Recharging shield is shown must unlock Generate button immediately'
     );
 
-    // Toggling back OFF must restore Battery Recharging shield immediately
+    // Toggling back OFF must restore V5 Recharging shield immediately
     bypassToggle.checked = false;
     bypassToggle.onchange();
     assert.strictEqual(context.document.getElementById('gw-button-shield').style.display, 'flex');
-    assert.strictEqual(context.document.getElementById('gw-shield-text').textContent, 'Battery Recharging');
+    assert.strictEqual(context.document.getElementById('gw-shield-text').textContent, 'V5 Recharging');
 
-    // Test V5 Quota Depleted switching native Effort from High (18 NCP) to Medium (10 NCP) with 12 NCP available
+    // Test V5 Allowance Reached switching native Effort from High (18 pts) to Medium (10 pts) with 12 pts available
     triggerIntervalAtMs(10000);
     await new Promise(r => setTimeout(r, 20));
     networkCalls[networkCalls.length - 1].onload({
@@ -1548,7 +1984,7 @@ test('Phase 8 Commit 10: Client UserScript Runtime, Dynamic Design Engine & Prod
       })
     });
     await new Promise(r => setTimeout(r, 20));
-    assert.strictEqual(context.document.getElementById('gw-shield-text').textContent, 'V5 Quota Depleted');
+    assert.strictEqual(context.document.getElementById('gw-shield-text').textContent, 'V5 Allowance Reached');
 
     context.document.getElementById('native-med-btn').style.backgroundColor = 'rgb(25, 90, 95)';
     context.document.getElementById('native-high-btn').style.backgroundColor = 'rgba(0, 0, 0, 0)';
@@ -1557,10 +1993,10 @@ test('Phase 8 Commit 10: Client UserScript Runtime, Dynamic Design Engine & Prod
     assert.strictEqual(
       context.document.getElementById('gw-button-shield').style.display,
       'none',
-      'Switching native Effort from High (18 NCP) to Medium (10 NCP) with 12 NCP available must clear V5 Quota Depleted shield'
+      'Switching native Effort from High (18 pts) to Medium (10 pts) with 12 pts available must clear V5 Allowance Reached shield'
     );
 
-    // Restore 5.0% circuit breaker lock on High for free-V5 vs legacy/base-paid verification
+    // Restore 5.0% circuit breaker lock on High for free-V5 vs upscale/legacy verification
     context.document.getElementById('native-med-btn').style.backgroundColor = 'rgba(0, 0, 0, 0)';
     context.document.getElementById('native-high-btn').style.backgroundColor = 'rgb(25, 90, 95)';
     triggerObserverSync();
@@ -1590,7 +2026,31 @@ test('Phase 8 Commit 10: Client UserScript Runtime, Dynamic Design Engine & Prod
     assert.strictEqual((await lockedV5Resp.json()).error, 'V5_BATTERY_CRITICAL');
     assert.strictEqual(networkCalls.length, 0);
 
+    // /ai/upscale passes through untouched even during 5.0% V5 battery circuit breaker
+    context._upscaleWhileBreakerPng = createPngHeaderBlob(1024, 1024);
+    const upscaleDuringBreakerPromise = vm.runInContext(`
+      (() => {
+        const fd = new FormData();
+        fd.append('image', globalThis._upscaleWhileBreakerPng, 'blob');
+        fd.append('request', new Blob(['{"image":"image","model":"nai-diffusion-5-curated"}'], { type: 'application/json' }));
+        return unsafeWindow.fetch('https://image.novelai.net/ai/upscale', { method: 'POST', body: fd });
+      })()
+    `, context);
+    await new Promise(r => setTimeout(r, 20));
+    assert.strictEqual(networkCalls.length, 1);
+    networkCalls[0].onload({ status: 200, responseText: '{"success":true}' });
+    await new Promise(r => setTimeout(r, 1050));
+    networkCalls[1].onload({ status: 200, responseText: '{"status":"your_turn"}' });
+    await new Promise(r => setTimeout(r, 20));
+    networkCalls[2].onloadstart({
+      status: 200,
+      response: new ReadableStream({ start(c) { c.close(); } }),
+      responseHeaders: 'HTTP/1.1 200 OK\r\nContent-Type: image/png'
+    });
+    assert.strictEqual((await upscaleDuringBreakerPromise).status, 200);
+
     // Legacy V4.5 passes untouched during V5 circuit breaker
+    networkCalls.length = 0;
     const legacyPromise = vm.runInContext(`
       unsafeWindow.fetch('https://image.novelai.net/ai/generate-image-stream', {
         method: 'POST',
@@ -1702,14 +2162,15 @@ test('Phase 8 Commit 10: Client UserScript Runtime, Dynamic Design Engine & Prod
     });
     const proxyFailResp = await proxyFailPromise;
     assert.strictEqual(proxyFailResp.status, 503);
+    assert.strictEqual(storage.get('approved'), true, 'Upstream 503 MASTER_TOKEN_EXPIRED must NOT wipe guest approved flag');
     assert.match(context.document.getElementById('gw-hud-alert').textContent, /session token was rejected/);
     assert.ok(networkCalls.some(c => c.url.includes('/auth/status')));
   });
 
   // ---------------------------------------------------------------------------
-  // 7. ADMIN DUAL-LEDGER GOVERNANCE, UNLINKED `user_id` & IMMEDIATE TOKEN REFRESH
+  // 7. ADMIN DUAL-LEDGER GOVERNANCE, XSS ESCAPING, CYCLE FILTER, UNLINKED `user_id` & OPERATOR SETTINGS
   // ---------------------------------------------------------------------------
-  await t.test('Admin Governance: Renders expired/inactive badges, operator cycle usage, unlinked user_id payloads & post-token-push refresh', async () => {
+  await t.test('Admin Governance: Escapes XSS payloads, populates cycle selector, handles sort/token-push refresh, omits Rolling Allowance & validates strict deltas', async () => {
     const { context, networkCalls, promptQueue, alertLog, triggerIntervalAtMs, triggerObserverSync } = createBrowserSandbox({
       approved: true,
       vps_host: 'https://vps.example.duckdns.org',
@@ -1727,7 +2188,7 @@ test('Phase 8 Commit 10: Client UserScript Runtime, Dynamic Design Engine & Prod
     vm.runInContext(adminCode, context);
     triggerObserverSync();
 
-    // Verify Admin HUD displays Battery Recharging when isHardLocked is true (<= 5.5%)
+    // Verify Admin HUD displays V5 Recharging when isHardLocked is true (<= 5.5%)
     triggerIntervalAtMs(10000);
     await new Promise(r => setTimeout(r, 20));
     networkCalls[0].onload({
@@ -1741,14 +2202,15 @@ test('Phase 8 Commit 10: Client UserScript Runtime, Dynamic Design Engine & Prod
       })
     });
     await new Promise(r => setTimeout(r, 20));
-    assert.match(context.document.getElementById('gw-v5-label').textContent, /Battery Recharging/);
+    assert.match(context.document.getElementById('gw-v5-label').textContent, /V5 Recharging/);
 
     networkCalls.length = 0;
+    const xssPayloadName = '<img src=x onerror=alert(1)>';
     const mockDeviceGroups = [
       {
         user_id: 'discord_debtor',
         discord_id: 'discord_debtor',
-        discord_username: 'DebtorUser',
+        discord_username: xssPayloadName,
         priority_tier: 'Normal',
         approved: 1,
         banned: 0,
@@ -1761,12 +2223,16 @@ test('Phase 8 Commit 10: Client UserScript Runtime, Dynamic Design Engine & Prod
         v5_available_balance: 90,
         subscription_period_anlas: 90,
         subscription_period_v5: 4,
+        subscription_period_legacy_images: 1,
+        subscription_period_upscales: 0,
+        subscription_period_text_gens: 0,
+        subscription_period_requests: 5,
         total_requests: 12,
         last_active_at: Date.now(),
         is_online: true,
         devices: [{
           browser_id: 'b_debtor_dev',
-          label: 'Laptop',
+          label: '<svg onload=alert(2)>Laptop',
           approved: 1,
           banned: 0,
           anlas_consumed: 200,
@@ -1795,6 +2261,7 @@ test('Phase 8 Commit 10: Client UserScript Runtime, Dynamic Design Engine & Prod
         v5_available_balance: 50,
         subscription_period_anlas: 10,
         subscription_period_v5: 1,
+        subscription_period_requests: 1,
         total_requests: 2,
         last_active_at: Date.now() - 1000,
         is_online: false,
@@ -1805,10 +2272,30 @@ test('Phase 8 Commit 10: Client UserScript Runtime, Dynamic Design Engine & Prod
     context.document.getElementById('gw-nav-badge').onclick({ preventDefault: () => {}, stopPropagation: () => {} });
     await new Promise(r => setTimeout(r, 20));
 
+    // Cycles dropdown populates from /admin/cycles
+    const cyclesCall1 = networkCalls.find(c => c.url.includes('/admin/cycles'));
+    assert.ok(cyclesCall1, 'Governance panel must fetch /admin/cycles');
+    cyclesCall1.onload({
+      status: 200,
+      responseText: JSON.stringify({
+        active_cycle_epoch: 1762000000000,
+        cycles: [
+          { cycle_epoch: 1762000000000, is_active: true },
+          { cycle_epoch: 1759400000000, is_active: false }
+        ]
+      })
+    });
+
     const devCall1 = networkCalls.find(c => c.url.includes('/admin/devices'));
     assert.ok(devCall1);
     devCall1.onload({ status: 200, responseText: JSON.stringify(mockDeviceGroups) });
     await new Promise(r => setTimeout(r, 20));
+
+    // Stored XSS payload must be escaped cleanly (zero live <img> elements and escaped HTML entities)
+    const clientListEl = context.document.getElementById('vps-client-list');
+    assert.strictEqual(clientListEl.querySelectorAll('img').length, 0, 'XSS <img> node must never mount in DOM');
+    assert.doesNotMatch(clientListEl.innerHTML, /<img\s/i, 'XSS <img> tag must be escaped');
+    assert.match(clientListEl.innerHTML, /&lt;img src=x onerror=alert\(1\)&gt;/);
 
     // First global-stats response verifies [TOKEN EXPIRED]
     const statsCall1 = networkCalls.find(c => c.url.includes('/admin/global-stats'));
@@ -1831,6 +2318,20 @@ test('Phase 8 Commit 10: Client UserScript Runtime, Dynamic Design Engine & Prod
     sortReqs.onclick({ preventDefault: () => {}, currentTarget: sortReqs });
     await new Promise(r => setTimeout(r, 20));
 
+    const cyclesCall2 = networkCalls.find(c => c.url.includes('/admin/cycles'));
+    if (cyclesCall2) {
+      cyclesCall2.onload({
+        status: 200,
+        responseText: JSON.stringify({
+          active_cycle_epoch: 1762000000000,
+          cycles: [
+            { cycle_epoch: 1762000000000, is_active: true },
+            { cycle_epoch: 1759400000000, is_active: false }
+          ]
+        })
+      });
+    }
+
     let currentDeviceCalls = networkCalls.filter(c => c.url.includes('/admin/devices'));
     currentDeviceCalls[currentDeviceCalls.length - 1].onload({ status: 200, responseText: JSON.stringify(mockDeviceGroups) });
     await new Promise(r => setTimeout(r, 20));
@@ -1850,7 +2351,19 @@ test('Phase 8 Commit 10: Client UserScript Runtime, Dynamic Design Engine & Prod
     await new Promise(r => setTimeout(r, 20));
     assert.match(context.document.getElementById('admin-stat-battery').textContent, /\[INACTIVE\]/);
 
-    // Pushing fresh token via PUSH TO GUILDWEAVE STORAGE triggers immediate HUD poll + modal refresh
+    // Cycle selector triggers filtered /admin/devices?cycle_epoch=... & /admin/global-stats?cycle_epoch=...
+    const cycleSelect = context.document.getElementById('admin-cycle-select');
+    assert.ok(cycleSelect.querySelectorAll('option').length >= 3);
+    networkCalls.length = 0;
+    cycleSelect.value = '1759400000000';
+    cycleSelect.onchange();
+    await new Promise(r => setTimeout(r, 20));
+    assert.ok(networkCalls.some(c => c.url.includes('/admin/devices?cycle_epoch=1759400000000')));
+    networkCalls.filter(c => c.url.includes('/admin/devices')).pop().onload({ status: 200, responseText: JSON.stringify(mockDeviceGroups) });
+    await new Promise(r => setTimeout(r, 20));
+    assert.ok(networkCalls.some(c => c.url.includes('/admin/global-stats?cycle_epoch=1759400000000')));
+
+    // Pushing fresh token via Save Token button triggers immediate HUD poll + modal refresh
     networkCalls.length = 0;
     context.document.getElementById('vps-master-token-input').value = 'fresh_master_jwt';
     context.document.getElementById('vps-btn-push-token').onclick();
@@ -1860,7 +2373,7 @@ test('Phase 8 Commit 10: Client UserScript Runtime, Dynamic Design Engine & Prod
     await new Promise(r => setTimeout(r, 20));
     assert.ok(networkCalls.some(c => c.url.includes('/auth/status')), 'Token push must refresh operator HUD immediately');
     assert.ok(networkCalls.some(c => c.url.includes('/admin/devices')), 'Token push must refresh governance view immediately');
-    const refreshedDevCall = networkCalls.find(c => c.url.includes('/admin/devices'));
+    const refreshedDevCall = networkCalls.filter(c => c.url.includes('/admin/devices')).pop();
     refreshedDevCall.onload({ status: 200, responseText: JSON.stringify(mockDeviceGroups) });
     await new Promise(r => setTimeout(r, 20));
 
@@ -1872,6 +2385,9 @@ test('Phase 8 Commit 10: Client UserScript Runtime, Dynamic Design Engine & Prod
     deviceCalls[deviceCalls.length - 1].onload({ status: 200, responseText: JSON.stringify(mockDeviceGroups) });
     await new Promise(r => setTimeout(r, 20));
 
+    assert.strictEqual(clientListEl.querySelectorAll('svg').length, 0, 'XSS <svg> node must never mount in DOM');
+    assert.doesNotMatch(context.document.getElementById('vps-client-list').innerHTML, /<svg\s/i, 'XSS <svg> device label must be escaped');
+
     const headers2 = context.document.querySelectorAll('.client-card-header');
     headers2[1].onclick({ currentTarget: headers2[1] });
     await new Promise(r => setTimeout(r, 20));
@@ -1879,6 +2395,8 @@ test('Phase 8 Commit 10: Client UserScript Runtime, Dynamic Design Engine & Prod
     deviceCalls[deviceCalls.length - 1].onload({ status: 200, responseText: JSON.stringify(mockDeviceGroups) });
     await new Promise(r => setTimeout(r, 20));
 
+    alertLog.length = 0;
+    networkCalls.length = 0;
     const adjBtns = context.document.querySelectorAll('.btn-adjust-anlas');
     const forgiveBtn = context.document.querySelector('.btn-reconcile-debt');
     assert.strictEqual(adjBtns.length, 2, 'Both expanded cards must expose ADJUST ANLAS buttons');
@@ -1935,7 +2453,7 @@ test('Phase 8 Commit 10: Client UserScript Runtime, Dynamic Design Engine & Prod
     assert.ok(recCall);
     assert.deepStrictEqual(JSON.parse(recCall.data), { discord_id: 'discord_debtor' });
 
-    // Operator Settings tab must render Cycle Consumed (subscription_period) alongside Lifetime Anlas
+    // Operator Settings tab: omits Rolling Allowance completely and displays cycle-segregated usage without backticks
     networkCalls.length = 0;
     context.document.getElementById('admin-tab-settings').onclick();
     await new Promise(r => setTimeout(r, 20));
@@ -1951,11 +2469,14 @@ test('Phase 8 Commit 10: Client UserScript Runtime, Dynamic Design Engine & Prod
         anlas: { is_unlimited: true, is_in_debt: false },
         v5: { is_unlimited: true, surplus_available_ncp: 320, surplus_eligible: true },
         telemetry: { master_v5_percent: 72.0, cluster_state: 'surplus_active', subscription_active: true, last_fetched_at: Date.now() },
-        subscription_period: { anlas_consumed: 65, v5_consumed: 9 }
+        subscription_period: { anlas_consumed: 65, v5_consumed: 9, legacy_image_gens: 2, upscale_gens: 1, text_gens: 4 }
       })
     });
     await new Promise(r => setTimeout(r, 20));
-    assert.strictEqual(context.document.getElementById('operator-period-usage').textContent, '65A / 9 V5');
+    const adminPanelHtml = context.document.getElementById('vps-admin-panel').innerHTML;
+    assert.doesNotMatch(adminPanelHtml, /Rolling Allowance/i, 'Admin Operator Settings must omit Rolling Allowance row');
+    assert.doesNotMatch(adminPanelHtml, /`/, 'Admin Operator Settings must contain zero literal Markdown backticks');
+    assert.strictEqual(context.document.getElementById('operator-period-usage').textContent, '65 Anlas · 12 images · 4 text');
     assert.strictEqual(context.document.getElementById('operator-anlas-consumed').textContent, '240 Anlas');
   });
 });

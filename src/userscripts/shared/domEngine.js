@@ -2,41 +2,55 @@
  * DYNAMIC CLASS HARVESTER & DOM INJECTION ENGINE (src/userscripts/shared/domEngine.js)
  * 
  * ARCHITECTURAL MANDATE:
- * Implements the runtime "Anchor -> Scrape -> Inject" paradigm with strict visual parity.
- * 1. Semantic Query Anchoring: Targets unstyled, permanent semantic anchors (.image-gen-nav-row,
+ * Implements the runtime "Anchor -> Scrape -> Inject" paradigm with live NovelAI theme parity.
+ * 1. Semantic Query Anchoring: Targets permanent semantic anchors (.image-gen-nav-row,
  *    .image-gen-footer, .image-gen-model-mode-row) to locate mount targets and observe native
- *    Model / Effort selections without coupling to transient sc-* hashes.
- * 2. Point-in-Time Class Harvester: Extracts compiled styled-components class strings from native
- *    DOM nodes (like the nav hamburger button) and caches them in memory.
- * 3. Exact Design System Parity via CSS Custom Properties:
- *    - Injects the Guild Badge into the 3-column flex layout of .image-gen-nav-row without layout shifts,
- *      importing the vector asset as an inlined text bundle via esbuild's text loader.
- *    - Renders the ACS-1 Dual-Ledger HUD (`#gw-v5-bar`) directly ABOVE `#gw-allowance-bar` so that
+ *    Model, Effort, Width/Height, Steps, and Sample selections without coupling to transient sc-* hashes.
+ * 2. Point-in-Time Class & Style Synchronization: Extracts compiled styled-components class strings
+ *    from native DOM nodes (like `button[aria-label="menu"]`) AND continuously synchronizes class
+ *    and computed color changes onto `#gw-nav-badge` when NovelAI loads user theme preferences
+ *    asynchronously or swaps themes live.
+ * 3. Live Theme Parity & Human-Readable Dual-Ledger HUD:
+ *    - Scrapes active NovelAI surface, text, border, control, and accent colors via `theme.js`,
+ *      dynamically refreshing `#gw-v5-bar`, `#gw-allowance-bar`, and `#gw-button-shield` inline
+ *      surfaces while preserving `var(--theme-bg0, <scraped>)` and `var(--theme-bg2, <scraped>)`
+ *      wrappers for contract safety.
+ *    - Renders the Dual-Ledger HUD (`#gw-v5-bar`) directly ABOVE `#gw-allowance-bar` so that
  *      `#gw-allowance-bar.nextElementSibling === .image-gen-generate-button` always remains intact.
- *    - Displays personal V5 banked NCP (`available / max`), Cluster Surplus Pool NCP, live master
- *      battery replenishment countdown (`next_percent_eta_ms`), color-coded cluster state
- *      (`surplus_active`, `reserve_mode`, `throttled`, `frozen`, `token_expired`, `telemetry_offline`),
- *      virtual Anlas balance with zero-rollover or red debt lockout indicators, active NCP cost for
- *      the natively selected NovelAI Model/Effort (`10 NCP (Med)`, `18 NCP (High)`, `Legacy (0 NCP)`),
- *      inline Anlas Bypass toggle, and contextual drift/deadband/capacity alerts.
+ *    - Translates internal V5 NCP units into human-readable High/Medium generation counts bounded
+ *      against spendable master tank capacity, suppresses V5 generation cost display when configured
+ *      for non-addon Anlas bypass (`>1MP`, `>1` sample, or `>28` steps on V5 High), and hides
+ *      `#gw-allowance-bar` (`display: none`) when exempt from Metered limits.
  *    - Shields the primary Generate button with an opaque, absolute event-gating overlay (`inset: 0`,
  *      `z-index: 9999`), hiding sibling children to prevent text superposition.
- * 4. Single Presentation Portal: Eliminates redundant user settings sidebar tabs, centralizing
- *    all script management into the dedicated standalone modal triggered by the nav badge.
+ * 4. Single Presentation Portal: Centralizes all settings into the dedicated standalone modal
+ *    triggered by `#gw-nav-badge`.
  * 5. Ephemeral Telemetry Isolation: Keeps server telemetry strictly in page RAM (`cachedPolicyState`)
- *    and persists only explicit user preferences (`anlas_bypass_enabled`) in `GM_setValue`, preventing
- *    stale cross-session lockouts on fresh page boots.
- * 6. Guarded MutationObserver & Reactive Input Listeners: Employs requestAnimationFrame debouncing,
- *    strict self-mutation filtering, and guarded step-input listeners for live deadband feedback.
+ *    and persists only explicit user preferences (`anlas_bypass_enabled`) in `GM_setValue`.
+ * 6. Guarded MutationObserver & Head Stylesheet Observer: Employs requestAnimationFrame debouncing,
+ *    strict self-mutation filtering (including `#gw-ui-styles`), and guarded input listeners for
+ *    live deadband, cost, and theme updates.
  * 7. Zero Node.js Leaks: Strictly browser-safe.
  */
 
 'use strict';
 
 import GUILD_BADGE_SVG from './assets/guild_badge.svg';
-import { isV5ModelFamily, isV5MediumModel, V5_HIGH_NCP_COST, V5_MEDIUM_NCP_COST } from './pricing.js';
+import {
+  isV5ModelFamily,
+  isV5MediumModel,
+  V5_HIGH_NCP_COST,
+  V5_MEDIUM_NCP_COST,
+  FIREWALL_MAX_PIXELS,
+  FIREWALL_MAX_STEPS,
+  FIREWALL_MAX_SAMPLES
+} from './pricing.js';
+import { ensureGuildWeaveStyles } from './theme.js';
 
 export { GUILD_BADGE_SVG };
+
+const V5_HIGH_IMAGES_PER_PERCENT = 17.28;
+const V5_CIRCUIT_BREAKER_PERCENT = 5.5;
 
 // In-memory class cache storing last-known-good styled-components class hashes
 const classCache = new Map();
@@ -177,7 +191,6 @@ function detectActiveEffortButton(medBtn, highBtn) {
     return medAttr ? 'medium' : 'high';
   }
 
-  // Real-browser computed style comparison: active pill has non-transparent highlight fill
   const getBg = (btn) => {
     if (typeof window !== 'undefined' && typeof window.getComputedStyle === 'function') {
       try {
@@ -214,6 +227,143 @@ function detectActiveEffortButton(medBtn, highBtn) {
   }
 
   return null;
+}
+
+/**
+ * Evaluates whether an `<input>` node represents NovelAI's native generation step control.
+ *
+ * @param {Element|null} input - Candidate input node.
+ * @returns {boolean} True if target is a step control input.
+ */
+function isStepControlInput(input) {
+  if (!input || input.tagName !== 'INPUT') return false;
+  if (input.id === 'gw-bypass-toggle' || input.id === 'settings-anlas-bypass') return false;
+  const aria = (input.getAttribute('aria-label') || '').toLowerCase();
+  const name = (input.getAttribute('name') || '').toLowerCase();
+  const id = (input.id || '').toLowerCase();
+  const dataCtrl = (input.getAttribute('data-gw-control') || '').toLowerCase();
+  return dataCtrl === 'steps' || aria.includes('step') || name.includes('step') || id.includes('step');
+}
+
+function isInsideGuildWeaveNode(node) {
+  if (!node) return false;
+  if (node.id && (node.id.startsWith('gw-') || node.id.startsWith('vps-'))) return true;
+  if (typeof node.closest === 'function') {
+    return Boolean(node.closest('[id^="gw-"]') || node.closest('[id^="vps-"]'));
+  }
+  return false;
+}
+
+/**
+ * Reads NovelAI's live generation geometry (width, height, steps, sample count) from
+ * native UI controls so `#gw-v5-cost` accurately suppresses V5 credit charges whenever
+ * the user has configured a non-addon Anlas bypass (`>1MP`, `>1` sample, or `>28` steps
+ * on V5 High) while keeping V5 credit charges visible for addon-only Anlas usage.
+ *
+ * @param {string} [activeModel=''] - Active model identifier.
+ * @returns {{ width: number, height: number, area: number, steps: number, samples: number }}
+ */
+export function readNativeGenerationSpecsFromDOM(activeModel = '') {
+  const isMed = isV5MediumModel(activeModel);
+  let width = 1024;
+  let height = 1024;
+  let steps = isMed ? 14 : 23;
+  let samples = 1;
+
+  if (typeof document === 'undefined' || typeof document.querySelectorAll !== 'function') {
+    return { width, height, area: width * height, steps, samples };
+  }
+
+  let foundWidth = null;
+  let foundHeight = null;
+  let foundSteps = null;
+  let foundSamples = null;
+
+  const inputs = document.querySelectorAll('input');
+  for (const input of inputs) {
+    if (!input || isInsideGuildWeaveNode(input)) continue;
+    const aria = (input.getAttribute('aria-label') || '').toLowerCase();
+    const placeholder = (input.getAttribute('placeholder') || '').toLowerCase();
+    const name = (input.getAttribute('name') || '').toLowerCase();
+    const id = (input.id || '').toLowerCase();
+    const numVal = parseInt(input.value, 10);
+    if (!Number.isFinite(numVal) || numVal <= 0) continue;
+
+    if (isStepControlInput(input)) {
+      foundSteps = numVal;
+    } else if (aria === 'width' || placeholder === 'width' || name === 'width' || id.includes('width')) {
+      foundWidth = numVal;
+    } else if (aria === 'height' || placeholder === 'height' || name === 'height' || id.includes('height')) {
+      foundHeight = numVal;
+    } else if (
+      aria.includes('number of images') ||
+      aria.includes('samples') ||
+      name === 'n_samples' ||
+      id.includes('sample')
+    ) {
+      foundSamples = numVal;
+    }
+  }
+
+  // Fallback for sample count inside `.image-gen-generate-button` ("Generate 4 Images")
+  if (foundSamples === null && typeof document.querySelector === 'function') {
+    const genBtn = document.querySelector('.image-gen-generate-button');
+    if (genBtn) {
+      const btnTextParts = [];
+      for (const child of genBtn.children) {
+        if (child && child.id !== 'gw-button-shield' && child.textContent) {
+          btnTextParts.push(child.textContent);
+        }
+      }
+      const btnText = btnTextParts.join(' ');
+      const genMatch = btnText.match(/generate\s+(\d+)\s+image/i);
+      if (genMatch) {
+        const parsedSamples = parseInt(genMatch[1], 10);
+        if (Number.isFinite(parsedSamples) && parsedSamples > 0) {
+          foundSamples = parsedSamples;
+        }
+      }
+    }
+  }
+
+  // Restricted fallback for resolution selector labels (ignores arbitrary prompt/history text in document.body)
+  if (foundWidth === null || foundHeight === null) {
+    const candidateGroups = [];
+    if (typeof document.querySelectorAll === 'function') {
+      candidateGroups.push(...document.querySelectorAll('div, span, button'));
+    }
+    const footerEl = typeof document.querySelector === 'function' ? document.querySelector('.image-gen-footer') : null;
+    for (const el of candidateGroups) {
+      if (!el || isInsideGuildWeaveNode(el)) continue;
+      const cls = el.getAttribute('class') || '';
+      const isControlSurface = cls.includes('singleValue') ||
+        Boolean(el.getAttribute('aria-haspopup')) ||
+        (footerEl && el.parentElement === footerEl);
+      if (!isControlSurface) continue;
+
+      const txt = (el.textContent || '').trim();
+      if (txt.length > 48) continue;
+      const resMatch = txt.match(/\b(\d{3,4})\s*[x×]\s*(\d{3,4})\b/i);
+      if (resMatch) {
+        const w = parseInt(resMatch[1], 10);
+        const h = parseInt(resMatch[2], 10);
+        if (w >= 64 && h >= 64 && w <= 4096 && h <= 4096) {
+          foundWidth = w;
+          foundHeight = h;
+          break;
+        }
+      }
+    }
+  }
+
+  if (foundWidth !== null && foundHeight !== null) {
+    width = foundWidth;
+    height = foundHeight;
+  }
+  if (foundSteps !== null) steps = foundSteps;
+  if (foundSamples !== null) samples = foundSamples;
+
+  return { width, height, area: width * height, steps, samples };
 }
 
 /**
@@ -287,8 +437,6 @@ export function readNativeModelAndEffortFromDOM() {
     return 'nai-diffusion-5-full';
   }
 
-  // Fallback when V5 is selected in dropdown but effort toggle styling is indeterminate:
-  // preserve existing V5 effort if already known, otherwise assume V5 High (18 NCP) safely.
   const current = getClientPolicyState().activeModel || '';
   return isV5ModelFamily(current) ? current : 'nai-diffusion-5-full';
 }
@@ -312,23 +460,65 @@ export function getElementClasses(el, cacheKey) {
 }
 
 /**
- * Injects the Guild Badge trigger button into .image-gen-nav-row.
+ * Keeps `#gw-nav-badge` synchronized with `button[aria-label="menu"]`'s live
+ * classes and computed colors after theme hydration or dynamic theme switching.
+ *
+ * @param {Element} badgeBtn - Injected GuildWeave nav badge button.
+ * @param {Element} menuBtn - Native NovelAI hamburger menu button.
+ */
+function syncNavBadgeAppearance(badgeBtn, menuBtn) {
+  const btnClasses = getElementClasses(menuBtn, 'nav_menu_btn');
+  if (btnClasses && badgeBtn.className !== btnClasses) {
+    badgeBtn.className = btnClasses;
+    badgeBtn.style.backgroundColor = '';
+    badgeBtn.style.borderColor = '';
+    badgeBtn.style.color = '';
+  }
+
+  if (typeof window !== 'undefined' && typeof window.getComputedStyle === 'function') {
+    try {
+      const menuStyle = window.getComputedStyle(menuBtn);
+      const badgeStyle = window.getComputedStyle(badgeBtn);
+      if (menuStyle && badgeStyle) {
+        if (menuStyle.backgroundColor && badgeStyle.backgroundColor !== menuStyle.backgroundColor) {
+          badgeBtn.style.backgroundColor = menuStyle.backgroundColor;
+        }
+        if (menuStyle.color && badgeStyle.color !== menuStyle.color) {
+          badgeBtn.style.color = menuStyle.color;
+        }
+        const mBorder = menuStyle.borderTopColor || menuStyle.borderColor;
+        const bBorder = badgeStyle.borderTopColor || badgeStyle.borderColor;
+        if (mBorder && bBorder !== mBorder) {
+          badgeBtn.style.borderColor = mBorder;
+        }
+      }
+    } catch (_) {}
+  }
+}
+
+/**
+ * Injects the Guild Badge trigger button into `.image-gen-nav-row` and keeps
+ * its classes and computed colors synced to `button[aria-label="menu"]`.
  * Preserves the 3-item flex distribution by nesting inside the hamburger menu's wrapper.
  *
  * @param {Function} onClickHandler - Callback invoked when the badge button is clicked.
- * @returns {boolean} True if element was injected or already present.
+ * @returns {boolean} True if element is mounted and synced.
  */
 export function injectNavBadge(onClickHandler) {
-  if (document.getElementById('gw-nav-badge')) return true;
-
   const menuBtn = document.querySelector('button[aria-label="menu"]');
   if (!menuBtn || !menuBtn.parentElement) return false;
 
-  const btnClasses = getElementClasses(menuBtn, 'nav_menu_btn');
+  const existing = document.getElementById('gw-nav-badge');
+  if (existing) {
+    if (existing.parentElement === menuBtn.parentElement) {
+      syncNavBadgeAppearance(existing, menuBtn);
+      return true;
+    }
+    existing.remove();
+  }
 
   const badgeBtn = document.createElement('button');
   badgeBtn.id = 'gw-nav-badge';
-  badgeBtn.className = btnClasses;
   badgeBtn.setAttribute('aria-label', 'GuildWeave Settings');
   badgeBtn.setAttribute('title', 'GuildWeave Settings');
   badgeBtn.style.marginRight = '8px';
@@ -359,12 +549,15 @@ export function injectNavBadge(onClickHandler) {
   };
 
   menuBtn.parentElement.insertBefore(badgeBtn, menuBtn);
+  syncNavBadgeAppearance(badgeBtn, menuBtn);
   return true;
 }
 
 /**
  * Constructs and injects the standalone Rolling Allowance Bar directly above
  * .image-gen-generate-button inside .image-gen-footer.
+ * Hidden by default (`display: none`) until `/auth/status` confirms a Metered tier (`session !== null`),
+ * preserving `allowanceBar.nextElementSibling === genBtn` without cluttering unlimited tiers.
  *
  * @returns {boolean} True if element was injected or already exists.
  */
@@ -374,16 +567,18 @@ export function injectAllowanceBar() {
   const genBtn = document.querySelector('.image-gen-generate-button');
   if (!genBtn || !genBtn.parentElement) return false;
 
+  const theme = ensureGuildWeaveStyles();
+
   const barRoot = document.createElement('div');
   barRoot.id = 'gw-allowance-bar';
   barRoot.style.cssText = `
-    display: flex;
+    display: none;
     flex-direction: column;
     gap: 4px;
-    padding: 5px 8px 7px;
+    padding: 6px 9px 7px;
     border-radius: 8px;
-    border: 1px solid var(--theme-bg2, rgb(34, 37, 63));
-    background-color: var(--theme-bg0, rgb(14, 15, 33));
+    border: 1px solid var(--theme-bg2, ${theme.borderStrong});
+    background-color: var(--theme-bg0, ${theme.bg0});
     font-size: 0.8125rem;
     font-weight: 600;
     margin-bottom: 0px;
@@ -406,20 +601,21 @@ export function injectAllowanceBar() {
     white-space: nowrap;
     overflow: hidden;
     text-overflow: ellipsis;
-    color: var(--theme-text, rgb(245, 243, 194));
+    color: var(--theme-text, ${theme.text});
     font-size: 0.75rem;
     font-weight: 600;
   `.replace(/\s+/g, ' ').trim();
-  labelSpan.textContent = 'Rolling Allowance: --/100 Images';
+  labelSpan.textContent = 'Image Allowance: --/100';
 
   headerRow.appendChild(labelSpan);
 
   const trackDiv = document.createElement('div');
+  trackDiv.id = 'gw-allowance-track';
   trackDiv.style.cssText = `
     height: 4px;
     width: 100%;
-    background: var(--theme-bg2, rgba(255, 255, 255, 0.1));
-    border-radius: 2px;
+    background: var(--theme-bg2, ${theme.border});
+    border-radius: 999px;
     overflow: hidden;
     position: relative;
   `.replace(/\s+/g, ' ').trim();
@@ -429,8 +625,8 @@ export function injectAllowanceBar() {
   fillDiv.style.cssText = `
     height: 100%;
     width: 100%;
-    background-color: var(--theme-success, #2ecc71);
-    border-radius: 2px;
+    background-color: var(--theme-accent, ${theme.accent});
+    border-radius: 999px;
     transition: width 0.35s ease-in-out, background-color 0.35s ease-in-out;
   `.replace(/\s+/g, ' ').trim();
 
@@ -449,6 +645,7 @@ export function injectAllowanceBar() {
  * @returns {object} Current normalized client policy state.
  */
 export function refreshDualLedgerHud() {
+  ensureGuildWeaveStyles();
   injectDualLedgerBar();
   const nativeModel = readNativeModelAndEffortFromDOM();
   if (nativeModel) {
@@ -473,34 +670,36 @@ export function injectDualLedgerBar() {
   const allowanceBar = document.getElementById('gw-allowance-bar');
   if (!allowanceBar || !allowanceBar.parentElement) return false;
 
+  const theme = ensureGuildWeaveStyles();
+
   const v5Root = document.createElement('div');
   v5Root.id = 'gw-v5-bar';
   v5Root.style.cssText = `
     display: flex;
     flex-direction: column;
     gap: 5px;
-    padding: 6px 8px 7px;
+    padding: 7px 9px 8px;
     border-radius: 8px;
-    border: 1px solid var(--theme-bg2, rgb(34, 37, 63));
-    background-color: var(--theme-bg0, rgb(14, 15, 33));
+    border: 1px solid var(--theme-bg2, ${theme.borderStrong});
+    background-color: var(--theme-bg0, ${theme.bg0});
     font-size: 0.75rem;
     font-weight: 600;
     margin-bottom: 4px;
     box-sizing: border-box;
   `.replace(/\s+/g, ' ').trim();
 
-  // Row 1: V5 Banked NCP + Cluster Battery & ETA
+  // Row 1: V5 Free Allowance (in readable High / Med images) + Shared Pool Status & Recharge ETA
   const v5HeaderRow = document.createElement('div');
   v5HeaderRow.style.cssText = 'display: flex; flex-direction: row; align-items: center; justify-content: space-between; gap: 6px;';
 
   const v5Label = document.createElement('span');
   v5Label.id = 'gw-v5-label';
-  v5Label.style.cssText = 'color: var(--theme-text, rgb(245, 243, 194)); font-size: 0.72rem; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;';
-  v5Label.textContent = 'V5 Bank: --/-- NCP | Tank: --%';
+  v5Label.style.cssText = `color: var(--theme-text, ${theme.text}); font-size: 0.72rem; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;`;
+  v5Label.textContent = 'V5 Allowance: Syncing...';
 
   const v5Eta = document.createElement('span');
   v5Eta.id = 'gw-v5-eta';
-  v5Eta.style.cssText = 'color: var(--theme-textSecondary, #aaa); font-size: 0.68rem; white-space: nowrap;';
+  v5Eta.style.cssText = `color: var(--theme-textSecondary, ${theme.textMuted}); font-size: 0.68rem; white-space: nowrap;`;
   v5Eta.textContent = '';
 
   v5HeaderRow.appendChild(v5Label);
@@ -508,42 +707,46 @@ export function injectDualLedgerBar() {
 
   // V5 Progress Track
   const v5Track = document.createElement('div');
-  v5Track.style.cssText = 'height: 4px; width: 100%; background: var(--theme-bg2, rgba(255, 255, 255, 0.1)); border-radius: 2px; overflow: hidden; position: relative;';
+  v5Track.id = 'gw-v5-track';
+  v5Track.style.cssText = `height: 4px; width: 100%; background: var(--theme-bg2, ${theme.border}); border-radius: 999px; overflow: hidden; position: relative;`;
 
   const v5Fill = document.createElement('div');
   v5Fill.id = 'gw-v5-fill';
-  v5Fill.style.cssText = 'height: 100%; width: 100%; background-color: var(--theme-success, #2ecc71); border-radius: 2px; transition: width 0.35s ease-in-out, background-color 0.35s ease-in-out;';
+  v5Fill.style.cssText = `height: 100%; width: 100%; background-color: var(--theme-accent, ${theme.accent}); border-radius: 999px; transition: width 0.35s ease-in-out, background-color 0.35s ease-in-out;`;
   v5Track.appendChild(v5Fill);
 
-  // Row 2: Anlas Balance / Zero-Rollover / Debt Lockout + Native Selection Cost + Bypass Toggle
+  // Row 2: Monthly Anlas + Active V5 Cost (hidden during non-addon Anlas bypass) + Use Monthly Anlas Toggle
   const controlsRow = document.createElement('div');
   controlsRow.style.cssText = 'display: flex; flex-direction: row; align-items: center; justify-content: space-between; gap: 6px; flex-wrap: wrap;';
 
   const anlasLabel = document.createElement('span');
   anlasLabel.id = 'gw-anlas-label';
-  anlasLabel.style.cssText = 'color: var(--theme-textSecondary, #ccc); font-size: 0.68rem; white-space: nowrap;';
-  anlasLabel.textContent = 'Anlas: -- (No Rollover)';
+  anlasLabel.style.cssText = `color: var(--theme-textSecondary, ${theme.textMuted}); font-size: 0.68rem; white-space: nowrap;`;
+  anlasLabel.textContent = 'Monthly Anlas: --';
+  anlasLabel.setAttribute('title', 'Resets each billing cycle; unused Anlas does not roll over.');
 
   const rightControls = document.createElement('div');
   rightControls.style.cssText = 'display: flex; align-items: center; gap: 8px;';
 
   const costBadge = document.createElement('span');
   costBadge.id = 'gw-v5-cost';
-  costBadge.style.cssText = 'color: var(--theme-textSecondary, #aaa); font-size: 0.68rem; white-space: nowrap;';
+  costBadge.style.cssText = `color: var(--theme-textSecondary, ${theme.textMuted}); font-size: 0.68rem; white-space: nowrap;`;
   costBadge.textContent = '';
 
   const state = getClientPolicyState();
 
   const bypassLabel = document.createElement('label');
   bypassLabel.id = 'gw-bypass-label';
-  bypassLabel.style.cssText = 'display: flex; align-items: center; gap: 4px; font-size: 0.68rem; cursor: pointer; color: var(--theme-warning, #f39c12); white-space: nowrap;';
+  bypassLabel.style.cssText = `display: inline-flex; align-items: center; gap: 5px; font-size: 0.68rem; cursor: pointer; color: var(--theme-textSecondary, ${theme.textMuted}); white-space: nowrap;`;
+  bypassLabel.setAttribute('title', 'Enable spending monthly Anlas for sizes >1MP, >1 image, or >28 steps.');
 
   const bypassCheckbox = document.createElement('input');
   bypassCheckbox.type = 'checkbox';
   bypassCheckbox.id = 'gw-bypass-toggle';
+  bypassCheckbox.className = 'gw-inline-check';
   bypassCheckbox.checked = Boolean(state.bypassEnabled) && !state.isInDebt;
   bypassCheckbox.disabled = Boolean(state.isInDebt);
-  bypassCheckbox.style.cursor = 'pointer';
+  bypassCheckbox.style.cssText = 'width: 14px; min-width: 14px; flex: 0 0 14px; margin: 0; cursor: pointer;';
   bypassCheckbox.onchange = () => {
     const latest = getClientPolicyState();
     if (latest.isInDebt) {
@@ -561,7 +764,7 @@ export function injectDualLedgerBar() {
 
   const bypassText = document.createElement('span');
   bypassText.id = 'gw-bypass-text';
-  bypassText.textContent = state.isInDebt ? 'Bypass Locked' : 'Anlas Bypass';
+  bypassText.textContent = state.isInDebt ? 'Anlas Paused' : 'Use Anlas';
 
   bypassLabel.appendChild(bypassCheckbox);
   bypassLabel.appendChild(bypassText);
@@ -572,10 +775,10 @@ export function injectDualLedgerBar() {
   controlsRow.appendChild(anlasLabel);
   controlsRow.appendChild(rightControls);
 
-  // Row 3: Contextual Alert Line (Drift / Deadband / Battery Recharging)
+  // Row 3: Contextual Alert Line (Drift / Deadband / Recharging)
   const alertDiv = document.createElement('div');
   alertDiv.id = 'gw-hud-alert';
-  alertDiv.style.cssText = 'display: none; font-size: 0.68rem; line-height: 1.3; padding: 3px 6px; border-radius: 4px; background: var(--theme-bg1, #222); color: var(--theme-warning, #f39c12);';
+  alertDiv.style.cssText = `display: none; font-size: 0.68rem; line-height: 1.35; padding: 4px 7px; border-radius: 5px; background: var(--theme-bg1, ${theme.bg1}); border: 1px solid ${theme.border}; color: var(--theme-warning, ${theme.warning});`;
 
   v5Root.appendChild(v5HeaderRow);
   v5Root.appendChild(v5Track);
@@ -610,14 +813,17 @@ export function setHudAlert(message, severity = 'warning') {
     return;
   }
 
+  const theme = ensureGuildWeaveStyles();
   alertEl.style.display = 'block';
   alertEl.textContent = message;
+  alertEl.style.backgroundColor = `var(--theme-bg1, ${theme.bg1})`;
+  alertEl.style.borderColor = theme.border;
   if (severity === 'error') {
-    alertEl.style.color = 'var(--theme-error, #e74c3c)';
+    alertEl.style.color = `var(--theme-error, ${theme.error})`;
   } else if (severity === 'info') {
-    alertEl.style.color = 'var(--theme-accent, #00bc8c)';
+    alertEl.style.color = `var(--theme-accent, ${theme.accent})`;
   } else {
-    alertEl.style.color = 'var(--theme-warning, #f39c12)';
+    alertEl.style.color = `var(--theme-warning, ${theme.warning})`;
   }
 }
 
@@ -638,27 +844,76 @@ function formatNextPercentEta(etaMs) {
 }
 
 /**
- * Maps `cluster_state` to semantic theme CSS colors.
+ * Maps internal cluster state identifiers to plain, user-friendly labels.
  *
- * @param {string|null} clusterState - Cluster state token from `/auth/status`.
- * @returns {string} CSS color expression.
+ * @param {string|null} clusterState - Internal cluster state token.
+ * @returns {string} User-friendly label.
  */
-function resolveClusterStateColor(clusterState) {
-  if (clusterState === 'frozen' || clusterState === 'token_expired') return 'var(--theme-error, #e74c3c)';
-  if (clusterState === 'throttled' || clusterState === 'telemetry_offline') return 'var(--theme-warning, #e67e22)';
-  if (clusterState === 'reserve_mode') return 'var(--theme-warning, #f1c40f)';
-  return 'var(--theme-success, #2ecc71)';
+function formatReadableClusterState(clusterState) {
+  switch (clusterState) {
+    case 'surplus_active':
+      return 'Shared Bonus Open';
+    case 'reserve_mode':
+      return 'Personal Allowance';
+    case 'throttled':
+      return 'Low Shared Pool';
+    case 'frozen':
+      return 'Recharging';
+    case 'token_expired':
+      return 'Session Expired';
+    case 'telemetry_offline':
+      return 'Syncing';
+    default:
+      return '';
+  }
 }
 
 /**
- * Renders the `#gw-v5-bar` labels, native NCP cost indicator, progress fill, debt warnings,
- * and bypass toggle using the normalized client policy state.
- * Evaluates token-expired, subscription-inactive, and 5.5% circuit-breaker states before
- * unlimited-tier shortcuts because those gates apply across all tiers including Admin.
+ * Maps `cluster_state` to theme-matched progress bar fills, reserving warning/error
+ * colors exclusively for degraded states.
+ *
+ * @param {string|null} clusterState - Cluster state token from `/auth/status`.
+ * @param {object} theme - Active scraped NovelAI theme palette.
+ * @returns {string} CSS color expression.
+ */
+function resolveClusterStateColor(clusterState, theme) {
+  if (clusterState === 'frozen' || clusterState === 'token_expired') return `var(--theme-error, ${theme.error})`;
+  if (clusterState === 'throttled' || clusterState === 'telemetry_offline') return `var(--theme-warning, ${theme.warning})`;
+  return `var(--theme-accent, ${theme.accent})`;
+}
+
+/**
+ * Computes spendable master V5 headroom above the 5.5% circuit breaker in NCP
+ * so HUD display never exceeds physical master bucket capacity.
+ *
+ * @param {object} state - Client policy state.
+ * @returns {number|null} Maximum spendable NCP or null when battery telemetry is unknown.
+ */
+function computeClientSpendableMasterNcp(state) {
+  if (typeof state.masterV5Percent !== 'number' || !Number.isFinite(state.masterV5Percent)) {
+    return null;
+  }
+  if (state.isHardLocked || state.subscriptionActive === false || state.masterTokenExpired) {
+    return 0;
+  }
+  const rawPct = (typeof state.masterV5RawPercent === 'number' && Number.isFinite(state.masterV5RawPercent))
+    ? state.masterV5RawPercent
+    : state.masterV5Percent;
+  return Math.floor(Math.max(0, rawPct - V5_CIRCUIT_BREAKER_PERCENT) * V5_HIGH_IMAGES_PER_PERCENT * V5_HIGH_NCP_COST);
+}
+
+/**
+ * Renders the `#gw-v5-bar` labels, native V5 generation credit indicator (suppressed when
+ * spending non-addon Anlas), live scraped theme surface/border colors, progress fill,
+ * debt warnings, and toggle state.
  *
  * @param {object} state - Normalized client policy state.
  */
 function renderDualLedgerHudFromState(state) {
+  const theme = ensureGuildWeaveStyles();
+
+  const v5Root = document.getElementById('gw-v5-bar');
+  const v5Track = document.getElementById('gw-v5-track');
   const v5Label = document.getElementById('gw-v5-label');
   const v5Eta = document.getElementById('gw-v5-eta');
   const v5Fill = document.getElementById('gw-v5-fill');
@@ -667,85 +922,148 @@ function renderDualLedgerHudFromState(state) {
   const bypassCheckbox = document.getElementById('gw-bypass-toggle');
   const bypassText = document.getElementById('gw-bypass-text');
   const modalBypass = document.getElementById('settings-anlas-bypass');
+  const allowanceRoot = document.getElementById('gw-allowance-bar');
+  const allowanceLabel = document.getElementById('gw-allowance-label');
+  const allowanceTrack = document.getElementById('gw-allowance-track');
+  const shieldEl = document.getElementById('gw-button-shield');
+  const shieldTextEl = document.getElementById('gw-shield-text');
+
+  // Continuously keep injected bars synced with live NovelAI theme colors
+  if (v5Root) {
+    v5Root.style.backgroundColor = `var(--theme-bg0, ${theme.bg0})`;
+    v5Root.style.border = `1px solid var(--theme-bg2, ${theme.borderStrong})`;
+  }
+  if (v5Track) {
+    v5Track.style.background = theme.border;
+  }
+  if (allowanceRoot) {
+    allowanceRoot.style.backgroundColor = `var(--theme-bg0, ${theme.bg0})`;
+    allowanceRoot.style.border = `1px solid var(--theme-bg2, ${theme.borderStrong})`;
+  }
+  if (allowanceLabel) {
+    allowanceLabel.style.color = `var(--theme-text, ${theme.text})`;
+  }
+  if (allowanceTrack) {
+    allowanceTrack.style.background = theme.border;
+  }
+  if (shieldEl) {
+    shieldEl.style.background = `var(--theme-bg1, ${theme.bg1})`;
+    shieldEl.style.border = `1px solid var(--theme-accent, ${theme.borderStrong})`;
+  }
+  if (shieldTextEl) {
+    shieldTextEl.style.color = `var(--theme-textHeadings, ${theme.text})`;
+  }
 
   const activeModel = state.activeModel || '';
   const isV5 = isV5ModelFamily(activeModel);
   const isMed = isV5MediumModel(activeModel);
+  const specs = readNativeGenerationSpecsFromDOM(activeModel);
+  const isBaseAnlasBypass = Boolean(state.bypassEnabled) && (
+    specs.area > FIREWALL_MAX_PIXELS ||
+    specs.samples !== FIREWALL_MAX_SAMPLES ||
+    (isV5 && !isMed && specs.steps > FIREWALL_MAX_STEPS)
+  );
+
+  const spendableMasterNcp = computeClientSpendableMasterNcp(state);
 
   if (v5Label && v5Fill) {
+    v5Label.style.color = `var(--theme-text, ${theme.text})`;
     const pctText = typeof state.masterV5Percent === 'number' && Number.isFinite(state.masterV5Percent)
       ? `${state.masterV5Percent.toFixed(1)}%`
       : '--%';
 
     if (state.masterTokenExpired || state.clusterState === 'token_expired') {
       v5Label.textContent = 'Master Token Expired (Awaiting Admin)';
+      v5Label.setAttribute('title', 'The shared NovelAI session token expired and needs to be refreshed by an admin.');
       v5Fill.style.width = '0%';
-      v5Fill.style.backgroundColor = 'var(--theme-error, #e74c3c)';
+      v5Fill.style.backgroundColor = `var(--theme-error, ${theme.error})`;
     } else if (state.subscriptionActive === false && state.lastFetchedAt > 0) {
       v5Label.textContent = 'Master Subscription Inactive';
       v5Fill.style.width = '0%';
-      v5Fill.style.backgroundColor = 'var(--theme-error, #e74c3c)';
+      v5Fill.style.backgroundColor = `var(--theme-error, ${theme.error})`;
     } else if (state.isHardLocked) {
-      v5Label.textContent = `Battery Recharging (${pctText} <= 5.5%)`;
+      v5Label.textContent = `V5 Recharging (${pctText} <= 5.5%)`;
+      v5Label.setAttribute('title', 'Shared V5 capacity must stay above 5.5% to prevent a cluster-wide cooldown. Legacy models and Anlas-paid specs still work.');
       const widthPct = typeof state.masterV5Percent === 'number' ? Math.max(0, Math.min(100, state.masterV5Percent)) : 0;
       v5Fill.style.width = `${widthPct}%`;
-      v5Fill.style.backgroundColor = 'var(--theme-error, #e74c3c)';
+      v5Fill.style.backgroundColor = `var(--theme-error, ${theme.error})`;
     } else if (state.isUnlimitedV5) {
-      v5Label.textContent = `V5 Bank: Exempt (Unlimited) | Tank: ${pctText}`;
+      v5Label.textContent = `V5 Allowance: Unlimited · Pool: ${pctText}`;
       v5Fill.style.width = '100%';
-      v5Fill.style.backgroundColor = resolveClusterStateColor(state.clusterState);
+      v5Fill.style.backgroundColor = resolveClusterStateColor(state.clusterState, theme);
     } else if (typeof state.v5AvailableNcp === 'number') {
+      const effectiveNcp = (spendableMasterNcp !== null && state.lastFetchedAt > 0)
+        ? Math.min(state.v5AvailableNcp, spendableMasterNcp)
+        : state.v5AvailableNcp;
+      const effectiveSurplus = (spendableMasterNcp !== null && state.lastFetchedAt > 0 && typeof state.v5SurplusAvailableNcp === 'number')
+        ? Math.min(state.v5SurplusAvailableNcp, spendableMasterNcp)
+        : (state.v5SurplusAvailableNcp || 0);
+
+      const highLeft = Math.floor(effectiveNcp / V5_HIGH_NCP_COST);
+      const medLeft = Math.floor(effectiveNcp / V5_MEDIUM_NCP_COST);
       const maxNcp = typeof state.v5MaxBankNcp === 'number' && state.v5MaxBankNcp > 0 ? state.v5MaxBankNcp : state.v5AvailableNcp;
-      const surplusSuffix = (state.v5SurplusEligible && typeof state.v5SurplusAvailableNcp === 'number' && state.v5SurplusAvailableNcp > 0)
-        ? ` (+${state.v5SurplusAvailableNcp} Surplus)`
-        : '';
-      const depleted = state.v5AvailableNcp < 10 && (!state.v5SurplusEligible || (state.v5SurplusAvailableNcp || 0) < 10);
+      const surplusHigh = (state.v5SurplusEligible && effectiveSurplus >= V5_HIGH_NCP_COST)
+        ? Math.floor(effectiveSurplus / V5_HIGH_NCP_COST)
+        : 0;
+      const surplusSuffix = surplusHigh > 0 ? ` (+${surplusHigh} Bonus)` : '';
+      const depleted = effectiveNcp < V5_MEDIUM_NCP_COST && (!state.v5SurplusEligible || effectiveSurplus < V5_MEDIUM_NCP_COST);
       v5Label.textContent = depleted
-        ? `V5 Quota Depleted (0/${maxNcp} NCP) | Tank: ${pctText}`
-        : `V5 Bank: ${state.v5AvailableNcp}/${maxNcp} NCP${surplusSuffix} | Tank: ${pctText}`;
-      const barPct = maxNcp > 0 ? Math.min(100, Math.max(0, (state.v5AvailableNcp / maxNcp) * 100)) : 0;
+        ? `V5 Limit Reached · Pool: ${pctText}`
+        : `V5 Free: ${highLeft} High / ${medLeft} Med${surplusSuffix} · Pool: ${pctText}`;
+      v5Label.setAttribute(
+        'title',
+        `Personal Reserve: ${effectiveNcp}/${maxNcp} V5 credits (accumulates daily up to 3 days). Bonus Pool activates above 50% shared pool.`
+      );
+      const barPct = maxNcp > 0 ? Math.min(100, Math.max(0, (effectiveNcp / maxNcp) * 100)) : 0;
       v5Fill.style.width = `${barPct}%`;
-      v5Fill.style.backgroundColor = resolveClusterStateColor(state.clusterState);
+      v5Fill.style.backgroundColor = resolveClusterStateColor(state.clusterState, theme);
     } else {
-      v5Label.textContent = `V5 Bank: --/-- NCP | Tank: ${pctText}`;
+      v5Label.textContent = `V5 Allowance: Syncing · Pool: ${pctText}`;
     }
   }
 
   if (v5Eta) {
+    v5Eta.style.color = `var(--theme-textSecondary, ${theme.textMuted})`;
     const etaStr = formatNextPercentEta(state.nextPercentEtaMs);
-    const stateTag = state.clusterState ? state.clusterState.replace(/_/g, ' ').toUpperCase() : '';
-    v5Eta.textContent = [stateTag, etaStr].filter(Boolean).join(' · ');
+    const stateLabel = formatReadableClusterState(state.clusterState);
+    v5Eta.textContent = [stateLabel, etaStr].filter(Boolean).join(' · ');
   }
 
   if (costBadge) {
-    if (!activeModel) {
+    if (!activeModel || (isV5 && isBaseAnlasBypass)) {
+      costBadge.style.display = 'none';
       costBadge.textContent = '';
     } else if (isMed) {
-      costBadge.textContent = `Cost: ${V5_MEDIUM_NCP_COST} NCP (Med)`;
-      costBadge.style.color = 'var(--theme-accent, #00bc8c)';
+      costBadge.style.display = '';
+      costBadge.textContent = `Uses ${V5_MEDIUM_NCP_COST} V5 pts (Med)`;
+      costBadge.setAttribute('title', `Medium effort uses ${V5_MEDIUM_NCP_COST} credits vs ${V5_HIGH_NCP_COST} on High.`);
+      costBadge.style.color = `var(--theme-text, ${theme.text})`;
     } else if (isV5) {
-      costBadge.textContent = `Cost: ${V5_HIGH_NCP_COST} NCP (High)`;
-      costBadge.style.color = 'var(--theme-accent, #00bc8c)';
+      costBadge.style.display = '';
+      costBadge.textContent = `Uses ${V5_HIGH_NCP_COST} V5 pts (High)`;
+      costBadge.setAttribute('title', `High effort uses ${V5_HIGH_NCP_COST} credits per free-size generation.`);
+      costBadge.style.color = `var(--theme-text, ${theme.text})`;
     } else {
-      costBadge.textContent = 'Legacy (0 NCP)';
-      costBadge.style.color = 'var(--theme-textSecondary, #aaa)';
+      costBadge.style.display = '';
+      costBadge.textContent = 'Legacy (0 V5 pts)';
+      costBadge.style.color = `var(--theme-textSecondary, ${theme.textMuted})`;
     }
   }
 
   if (anlasLabel) {
     if (state.isUnlimitedAnlas) {
-      anlasLabel.textContent = 'Anlas: Unlimited';
-      anlasLabel.style.color = 'var(--theme-accent, #00bc8c)';
+      anlasLabel.textContent = 'Monthly Anlas: Unlimited';
+      anlasLabel.style.color = `var(--theme-text, ${theme.text})`;
     } else if (state.isInDebt) {
-      anlasLabel.textContent = `Anlas Balance: ${state.virtualBalance} (Bypass Locked)`;
-      anlasLabel.style.color = 'var(--theme-error, #e74c3c)';
+      anlasLabel.textContent = `Anlas Overdrawn: ${state.virtualBalance} (Paid Paused)`;
+      anlasLabel.style.color = `var(--theme-error, ${theme.error})`;
     } else if (typeof state.availableAnlas === 'number') {
       const quotaSuffix = typeof state.monthlyQuota === 'number' ? `/${state.monthlyQuota}` : '';
-      anlasLabel.textContent = `Anlas: ${state.availableAnlas}${quotaSuffix} (No Rollover)`;
-      anlasLabel.style.color = 'var(--theme-textSecondary, #ccc)';
+      anlasLabel.textContent = `Monthly Anlas: ${state.availableAnlas}${quotaSuffix}`;
+      anlasLabel.style.color = `var(--theme-textSecondary, ${theme.textMuted})`;
     } else {
-      anlasLabel.textContent = 'Anlas: -- (No Rollover)';
-      anlasLabel.style.color = 'var(--theme-textSecondary, #ccc)';
+      anlasLabel.textContent = 'Monthly Anlas: --';
+      anlasLabel.style.color = `var(--theme-textSecondary, ${theme.textMuted})`;
     }
   }
 
@@ -753,13 +1071,15 @@ function renderDualLedgerHudFromState(state) {
     if (state.isInDebt) {
       bypassCheckbox.checked = false;
       bypassCheckbox.disabled = true;
-      bypassText.textContent = 'Bypass Locked';
-      bypassText.style.color = 'var(--theme-error, #e74c3c)';
+      bypassText.textContent = 'Anlas Paused';
+      bypassText.style.color = `var(--theme-error, ${theme.error})`;
     } else {
       bypassCheckbox.disabled = false;
       bypassCheckbox.checked = Boolean(state.bypassEnabled);
-      bypassText.textContent = 'Anlas Bypass';
-      bypassText.style.color = 'var(--theme-warning, #f39c12)';
+      bypassText.textContent = 'Use Anlas';
+      bypassText.style.color = state.bypassEnabled
+        ? `var(--theme-accent, ${theme.accent})`
+        : `var(--theme-textSecondary, ${theme.textMuted})`;
     }
   }
 
@@ -774,23 +1094,25 @@ function renderDualLedgerHudFromState(state) {
   }
 
   // Sync Generate button capacity lockout state when subscription is inactive or V5 is locked/depleted.
-  // Note: master_token_expired surfaces prominently in the HUD without locking the button via shield
-  // so guests can recover immediately once the admin pushes a fresh token without waiting 10s.
   if (!queueShieldLockActive) {
     if (state.subscriptionActive === false && state.lastFetchedAt > 0) {
       setGenerateLockoutState(true, 'Subscription Inactive');
-    } else if (isV5 && !state.bypassEnabled && !state.masterTokenExpired && state.clusterState !== 'token_expired') {
+    } else if (isV5 && !isBaseAnlasBypass && !state.bypassEnabled && !state.masterTokenExpired && state.clusterState !== 'token_expired') {
       if (state.isHardLocked) {
-        setGenerateLockoutState(true, 'Battery Recharging');
+        setGenerateLockoutState(true, 'V5 Recharging');
       } else if (
         typeof state.v5AvailableNcp === 'number' &&
         !state.isUnlimitedV5 &&
         state.lastFetchedAt > 0
       ) {
         const reqNcp = isMed ? V5_MEDIUM_NCP_COST : V5_HIGH_NCP_COST;
-        const surplusAvail = state.v5SurplusEligible ? (state.v5SurplusAvailableNcp || 0) : 0;
-        if (state.v5AvailableNcp < reqNcp && surplusAvail < reqNcp) {
-          setGenerateLockoutState(true, 'V5 Quota Depleted');
+        const effectiveNcp = (spendableMasterNcp !== null) ? Math.min(state.v5AvailableNcp, spendableMasterNcp) : state.v5AvailableNcp;
+        const effectiveSurplus = (spendableMasterNcp !== null && typeof state.v5SurplusAvailableNcp === 'number')
+          ? Math.min(state.v5SurplusAvailableNcp, spendableMasterNcp)
+          : (state.v5SurplusAvailableNcp || 0);
+        const surplusAvail = state.v5SurplusEligible ? effectiveSurplus : 0;
+        if (effectiveNcp < reqNcp && surplusAvail < reqNcp) {
+          setGenerateLockoutState(true, 'V5 Allowance Reached');
         } else {
           setGenerateLockoutState(false, '');
         }
@@ -866,22 +1188,6 @@ export function updateDualLedgerHud(statusData) {
 }
 
 /**
- * Evaluates whether an `<input>` node represents NovelAI's native generation step control.
- *
- * @param {Element|null} input - Candidate input node.
- * @returns {boolean} True if target is a step control input.
- */
-function isStepControlInput(input) {
-  if (!input || input.tagName !== 'INPUT') return false;
-  if (input.id === 'gw-bypass-toggle' || input.id === 'settings-anlas-bypass') return false;
-  const aria = (input.getAttribute('aria-label') || '').toLowerCase();
-  const name = (input.getAttribute('name') || '').toLowerCase();
-  const id = (input.id || '').toLowerCase();
-  const dataCtrl = (input.getAttribute('data-gw-control') || '').toLowerCase();
-  return dataCtrl === 'steps' || aria.includes('step') || name.includes('step') || id.includes('step');
-}
-
-/**
  * Clamps native step inputs according to NovelAI's active native Model / Effort selection
  * and Anlas Bypass state, clearing stale deadband warnings only when switching off V5 High
  * or moving step inputs outside the 24..28 deadband.
@@ -917,7 +1223,7 @@ export function syncUIControlConstraints(state = getClientPolicyState()) {
       if (Number.isFinite(numVal) && numVal >= 24 && numVal <= 28) {
         deadbandTriggered = true;
         setHudAlert(
-          'Steps 24-28 on V5 Full (High) are prohibited (battery deadband). Use ≤23 for free tier, switch to Medium effort, or enable Anlas bypass with >28 steps.',
+          'V5 High allows up to 23 steps without Anlas (or 29+ steps when using Anlas). Steps 24–28 are blocked to protect shared V5 limits—use ≤23 steps or switch to Medium.',
           'warning'
         );
       }
@@ -930,7 +1236,7 @@ export function syncUIControlConstraints(state = getClientPolicyState()) {
   if (
     !deadbandTriggered &&
     lastHudAlertText &&
-    lastHudAlertText.includes('deadband') &&
+    lastHudAlertText.includes('24–28') &&
     (!isV5High || (foundStepInput && !hasStepInDeadband))
   ) {
     setHudAlert('', 'info');
@@ -1002,6 +1308,8 @@ export function scrapeDisplayedAnlasCost() {
 
 /**
  * Dynamically updates the Rolling Allowance bar telemetry without triggering DOM reconstruction.
+ * Hides `#gw-allowance-bar` (`display: none`) when the user is exempt (`allowance === null || maxAllowance === Infinity`),
+ * preserving DOM sibling relationships (`#gw-allowance-bar.nextElementSibling === .image-gen-generate-button`).
  *
  * @param {number|null} allowance - Current token balance.
  * @param {number} maxAllowance - Upper token boundary.
@@ -1011,17 +1319,22 @@ export function updateAllowanceBar(allowance, maxAllowance, nextRefillMs = 0) {
   injectAllowanceBar();
   injectDualLedgerBar();
 
+  const barRoot = document.getElementById('gw-allowance-bar');
   const labelSpan = document.getElementById('gw-allowance-label');
   const fillDiv = document.getElementById('gw-allowance-fill');
-  if (!labelSpan || !fillDiv) return;
+  if (!barRoot || !labelSpan || !fillDiv) return;
+
+  const theme = ensureGuildWeaveStyles();
 
   if (allowance === null || maxAllowance === Infinity) {
-    labelSpan.textContent = 'Rolling Allowance: Exempt (Unlimited)';
+    barRoot.style.display = 'none';
+    labelSpan.textContent = 'Image Allowance: Unlimited';
     fillDiv.style.width = '100%';
-    fillDiv.style.backgroundColor = 'var(--theme-accent, #00bc8c)';
+    fillDiv.style.backgroundColor = `var(--theme-accent, ${theme.accent})`;
     return;
   }
 
+  barRoot.style.display = 'flex';
   const max = maxAllowance || 100;
   const clampedAllowance = Math.max(0, allowance);
   const percent = Math.min(100, Math.max(0, (clampedAllowance / max) * 100));
@@ -1034,15 +1347,15 @@ export function updateAllowanceBar(allowance, maxAllowance, nextRefillMs = 0) {
     refillSuffix = ' (Full)';
   }
 
-  labelSpan.textContent = `Rolling Allowance: ${clampedAllowance}/${max} Images${refillSuffix}`;
+  labelSpan.textContent = `Image Allowance: ${clampedAllowance}/${max}${refillSuffix}`;
   fillDiv.style.width = `${percent}%`;
 
   if (percent < 20) {
-    fillDiv.style.backgroundColor = 'var(--theme-error, #e74c3c)';
+    fillDiv.style.backgroundColor = `var(--theme-error, ${theme.error})`;
   } else if (percent < 50) {
-    fillDiv.style.backgroundColor = 'var(--theme-warning, #f39c12)';
+    fillDiv.style.backgroundColor = `var(--theme-warning, ${theme.warning})`;
   } else {
-    fillDiv.style.backgroundColor = 'var(--theme-success, #2ecc71)';
+    fillDiv.style.backgroundColor = `var(--theme-accent, ${theme.accent})`;
   }
 }
 
@@ -1058,6 +1371,8 @@ export function injectQueueShield() {
 
   if (document.getElementById('gw-button-shield')) return true;
 
+  const theme = ensureGuildWeaveStyles();
+
   genBtn.style.position = 'relative';
   genBtn.style.overflow = 'hidden';
 
@@ -1071,9 +1386,9 @@ export function injectQueueShield() {
     z-index: 9999 !important;
     box-sizing: border-box !important;
     margin: 0 !important;
-    background: var(--theme-bg1, rgb(24, 26, 46)) !important;
+    background: var(--theme-bg1, ${theme.bg1}) !important;
     border-radius: inherit !important;
-    border: 1px solid var(--theme-accent, #00bc8c) !important;
+    border: 1px solid var(--theme-accent, ${theme.borderStrong}) !important;
     cursor: wait !important;
     display: none;
     pointer-events: none;
@@ -1083,12 +1398,12 @@ export function injectQueueShield() {
   `.replace(/\s+/g, ' ').trim();
 
   const pulseIndicator = document.createElement('div');
-  pulseIndicator.style.cssText = 'width:8px; height:8px; border-radius:50%; background:var(--theme-accent, #00bc8c); margin-right:8px; animation:gwPulse 1s infinite alternate; flex-shrink:0;';
+  pulseIndicator.style.cssText = `width:8px; height:8px; border-radius:50%; background:var(--theme-accent, ${theme.accent}); margin-right:8px; animation:gwPulse 1s infinite alternate; flex-shrink:0;`;
 
   const labelText = document.createElement('span');
   labelText.id = 'gw-shield-text';
-  labelText.style.cssText = 'font-weight:bold; font-size:13px; color:var(--theme-textHeadings, #fff); white-space:nowrap; letter-spacing:0.5px;';
-  labelText.textContent = 'Queue Slot Active...';
+  labelText.style.cssText = `font-weight:bold; font-size:13px; color:var(--theme-textHeadings, ${theme.text}); white-space:nowrap; letter-spacing:0.5px;`;
+  labelText.textContent = 'Joining Queue...';
 
   shield.appendChild(pulseIndicator);
   shield.appendChild(labelText);
@@ -1149,24 +1464,26 @@ export function setQueueShieldState(active, text = '') {
 
 /**
  * Disables or restores the Generate button overlay for V5 capacity/battery exhaustion prompts
- * (`V5 Quota Depleted` or `Battery Recharging`) when no queue turn is actively running.
+ * (`V5 Allowance Reached` or `V5 Recharging`) when no queue turn is actively running.
  *
  * @param {boolean} locked - True if V5 generation is locked out.
  * @param {string} [reasonText=''] - Capacity prompt text.
  */
 export function setGenerateLockoutState(locked, reasonText = '') {
   if (queueShieldLockActive) return;
-  applyButtonShieldVisual(Boolean(locked), reasonText || 'V5 Quota Depleted', 'not-allowed');
+  applyButtonShieldVisual(Boolean(locked), reasonText || 'V5 Allowance Reached', 'not-allowed');
 }
 
 let observerInstance = null;
+let headObserverInstance = null;
 let rafScheduled = false;
 let observedInputRoot = null;
 let inputConstraintHandler = null;
 
 /**
- * Initializes the unified MutationObserver lifecycle engine and reactive step-input listeners.
- * Executes idempotent mounts and tracks native Model/Effort changes via requestAnimationFrame.
+ * Initializes the unified MutationObserver lifecycle engine, head stylesheet observer, and
+ * reactive input listeners. Executes idempotent mounts and tracks native Model / Effort /
+ * Theme / Spec mutations via requestAnimationFrame.
  *
  * @param {object} options - Lifecycle callbacks.
  * @param {Function} [options.onOpenSettings] - Triggered by the nav row badge.
@@ -1183,12 +1500,23 @@ export function initDOMObserver(options = {}) {
     refreshDualLedgerHud();
   };
 
+  const scheduleSync = () => {
+    if (!rafScheduled) {
+      rafScheduled = true;
+      if (typeof requestAnimationFrame === 'function') {
+        requestAnimationFrame(runSync);
+      } else {
+        setTimeout(runSync, 16);
+      }
+    }
+  };
+
   observerInstance = new MutationObserver((mutations) => {
     let relevant = false;
     for (const m of mutations) {
       if (m.target) {
-        if (m.target.id && m.target.id.startsWith('gw-')) continue;
-        if (typeof m.target.closest === 'function' && m.target.closest('[id^="gw-"]')) continue;
+        if (m.target.id && (m.target.id.startsWith('gw-') || m.target.id.startsWith('vps-'))) continue;
+        if (typeof m.target.closest === 'function' && (m.target.closest('[id^="gw-"]') || m.target.closest('[id^="vps-"]'))) continue;
       }
       if (m.type === 'attributes') {
         relevant = true;
@@ -1200,13 +1528,8 @@ export function initDOMObserver(options = {}) {
       }
     }
 
-    if (relevant && !rafScheduled) {
-      rafScheduled = true;
-      if (typeof requestAnimationFrame === 'function') {
-        requestAnimationFrame(runSync);
-      } else {
-        setTimeout(runSync, 16);
-      }
+    if (relevant) {
+      scheduleSync();
     }
   });
 
@@ -1222,8 +1545,8 @@ export function initDOMObserver(options = {}) {
     if (typeof root.addEventListener === 'function') {
       observedInputRoot = root;
       inputConstraintHandler = (ev) => {
-        if (ev && isStepControlInput(ev.target)) {
-          syncUIControlConstraints(getClientPolicyState());
+        if (ev && ev.target && !isInsideGuildWeaveNode(ev.target)) {
+          refreshDualLedgerHud();
         }
       };
       root.addEventListener('input', inputConstraintHandler, true);
@@ -1231,16 +1554,41 @@ export function initDOMObserver(options = {}) {
     }
   }
 
+  // Observe styled-components `<style>` additions/mutations in `<head>` (ignoring #gw-ui-styles self-updates)
+  if (typeof document !== 'undefined' && document.head && document.head !== root) {
+    headObserverInstance = new MutationObserver((mutations) => {
+      for (const m of mutations) {
+        if (m.target && m.target.id === 'gw-ui-styles') continue;
+        const touchesOwnStyle =
+          Array.from(m.addedNodes || []).some(n => n && n.id === 'gw-ui-styles') ||
+          Array.from(m.removedNodes || []).some(n => n && n.id === 'gw-ui-styles');
+        if (!touchesOwnStyle) {
+          scheduleSync();
+          break;
+        }
+      }
+    });
+    headObserverInstance.observe(document.head, {
+      childList: true,
+      subtree: true,
+      characterData: true
+    });
+  }
+
   runSync();
 }
 
 /**
- * Disconnects the active MutationObserver and removes reactive step-input listeners.
+ * Disconnects active MutationObservers and removes reactive step-input listeners.
  */
 export function stopDOMObserver() {
   if (observerInstance) {
     observerInstance.disconnect();
     observerInstance = null;
+  }
+  if (headObserverInstance) {
+    headObserverInstance.disconnect();
+    headObserverInstance = null;
   }
   if (observedInputRoot && inputConstraintHandler && typeof observedInputRoot.removeEventListener === 'function') {
     observedInputRoot.removeEventListener('input', inputConstraintHandler, true);

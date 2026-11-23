@@ -1,7 +1,8 @@
 /**
  * LEVEL 4: QUEUE ROUTER (routes/queueRouter.js)
  * Coordinates single-concurrency Channel A locks, FIFO queue positions, and ACS-1
- * pre-flight V5 compute gating / reservation holds.
+ * pre-flight V5 compute gating / reservation holds, plus Anlas-billed `/ai/upscale`
+ * concurrency admission.
  * Relational Normalization: Enforces concurrency, allowances, billing-cycle Anlas spend gates,
  * master solvency checks, expired-token shielding, and two-bucket V5 NCP reservations on canonical user_id.
  */
@@ -18,6 +19,7 @@ const router = express.Router();
 const V5_HIGH_NCP_COST = 18;
 const V5_MEDIUM_NCP_COST = 10;
 const BASE_PAID_MIN_ANLAS = 2;
+const UPSCALE_MIN_ANLAS = 1;
 
 function getConfig() {
   return loadConfig(process.env);
@@ -117,6 +119,7 @@ router.post('/join', async (req, res) => {
     steps,
     is_base_paid,
     is_v5,
+    is_upscale,
     width,
     height,
     n_samples,
@@ -143,6 +146,16 @@ router.post('/join', async (req, res) => {
 
   if (is_v5 !== undefined && typeof is_v5 !== 'boolean') {
     return res.status(400).json({ statusCode: 400, error: 'INVALID_PARAMETERS', message: 'is_v5 must be a boolean.' });
+  }
+
+  if (is_upscale !== undefined && typeof is_upscale !== 'boolean') {
+    return res.status(400).json({ statusCode: 400, error: 'INVALID_PARAMETERS', message: 'is_upscale must be a boolean.' });
+  }
+
+  const isUpscale = is_upscale === true;
+
+  if (isUpscale && (is_v5 === true || is_base_paid === true)) {
+    return res.status(400).json({ statusCode: 400, error: 'INVALID_PARAMETERS', message: 'is_upscale cannot be combined with is_v5 or is_base_paid.' });
   }
 
   let parsedSteps = null;
@@ -193,23 +206,25 @@ router.post('/join', async (req, res) => {
   const trimmedModel = typeof model === 'string' ? model.trim() : '';
 
   let isV5 = false;
-  if (trimmedModel.length > 0) {
-    const modelIsV5 = auditEngine.isV5ModelFamily(trimmedModel);
-    if (is_v5 !== undefined && is_v5 !== modelIsV5) {
-      return res.status(400).json({
-        statusCode: 400,
-        error: 'INVALID_PARAMETERS',
-        message: `Conflicting model identifier ("${trimmedModel}") and is_v5 (${is_v5}) flag.`
-      });
+  if (!isUpscale) {
+    if (trimmedModel.length > 0) {
+      const modelIsV5 = auditEngine.isV5ModelFamily(trimmedModel);
+      if (is_v5 !== undefined && is_v5 !== modelIsV5) {
+        return res.status(400).json({
+          statusCode: 400,
+          error: 'INVALID_PARAMETERS',
+          message: `Conflicting model identifier ("${trimmedModel}") and is_v5 (${is_v5}) flag.`
+        });
+      }
+      isV5 = modelIsV5;
+    } else {
+      isV5 = is_v5 === true;
     }
-    isV5 = modelIsV5;
-  } else {
-    isV5 = is_v5 === true;
   }
 
-  const isV5Medium = trimmedModel.length > 0 && auditEngine.isV5MediumModel(trimmedModel);
-  const isBasePaid = is_base_paid === true;
-  const requestsAnlasBypass = isBasePaid || (parsedDeclaredAnlas !== null && parsedDeclaredAnlas > 0);
+  const isV5Medium = !isUpscale && trimmedModel.length > 0 && auditEngine.isV5MediumModel(trimmedModel);
+  const isBasePaid = !isUpscale && is_base_paid === true;
+  const requestsAnlasBypass = isUpscale || isBasePaid || (parsedDeclaredAnlas !== null && parsedDeclaredAnlas > 0);
 
   try {
     // Authenticate and enforce approval/ban status prior to evaluating business policy gates
@@ -220,49 +235,64 @@ router.post('/join', async (req, res) => {
     const device = auth.device;
     queueManager.ping(browser_id);
 
-    // Reject impossible base-paid claims when supplied dimensions/samples/steps fall strictly inside free Opus bounds
-    const hasExplicitDimensions = parsedWidth !== null && parsedHeight !== null;
-    const effectivePixels = hasExplicitDimensions ? (parsedWidth * parsedHeight) : null;
-    const effectiveSamples = parsedSamples !== null ? parsedSamples : 1;
-    const isKnownFreeGeometry = hasExplicitDimensions &&
-      effectivePixels <= config.FIREWALL_MAX_PIXELS &&
-      effectiveSamples === config.FIREWALL_MAX_SAMPLES;
+    let upscaleCost = null;
+    if (isUpscale) {
+      if (parsedWidth !== null && parsedHeight !== null) {
+        try {
+          upscaleCost = auditEngine.calculateUpscaleAnlasCost(parsedWidth, parsedHeight);
+        } catch (upscaleErr) {
+          return res.status(400).json({
+            statusCode: 400,
+            error: 'PARAMETRIC_LIMIT_EXCEEDED',
+            message: upscaleErr.message
+          });
+        }
+      }
+    } else {
+      // Reject impossible base-paid claims when supplied dimensions/samples/steps fall strictly inside free Opus bounds
+      const hasExplicitDimensions = parsedWidth !== null && parsedHeight !== null;
+      const effectivePixels = hasExplicitDimensions ? (parsedWidth * parsedHeight) : null;
+      const effectiveSamples = parsedSamples !== null ? parsedSamples : 1;
+      const isKnownFreeGeometry = hasExplicitDimensions &&
+        effectivePixels <= config.FIREWALL_MAX_PIXELS &&
+        effectiveSamples === config.FIREWALL_MAX_SAMPLES;
 
-    if (isBasePaid && isKnownFreeGeometry) {
-      const withinFreeSteps = isV5Medium || parsedSteps === null || parsedSteps <= config.FIREWALL_MAX_STEPS;
-      if (withinFreeSteps) {
+      if (isBasePaid && isKnownFreeGeometry) {
+        const withinFreeSteps = isV5Medium || parsedSteps === null || parsedSteps <= config.FIREWALL_MAX_STEPS;
+        if (withinFreeSteps) {
+          return res.status(400).json({
+            statusCode: 400,
+            error: 'PARAMETRIC_LIMIT_EXCEEDED',
+            message: 'Baseline <=1MP, 1-sample parameters are not eligible for X-Base-Paid exemption.'
+          });
+        }
+      }
+
+      // Model-Aware Parametric & Deadband Gate (V5 Medium bypasses step validation; 24-28 deadband applies strictly to V5 High)
+      if (!isV5Medium && !isBasePaid && parsedSteps !== null) {
+        if (isV5 && parsedSteps >= 24 && parsedSteps <= 28) {
+          return res.status(400).json({
+            statusCode: 400,
+            error: 'PARAMETRIC_LIMIT_EXCEEDED',
+            message: 'V5 High allows up to 23 steps without Anlas (or 29+ steps when using Anlas). Steps 24-28 are blocked to protect shared V5 limits—use <=23 steps or switch to Medium.'
+          });
+        }
+        if (parsedSteps > config.FIREWALL_MAX_STEPS) {
+          return res.status(400).json({
+            statusCode: 400,
+            error: 'PARAMETRIC_LIMIT_EXCEEDED',
+            message: `Steps count of ${parsedSteps} exceeds the maximum limit of ${config.FIREWALL_MAX_STEPS} steps without Anlas enabled.`
+          });
+        }
+      }
+
+      if (!isBasePaid && ((effectivePixels !== null && effectivePixels > config.FIREWALL_MAX_PIXELS) || effectiveSamples !== config.FIREWALL_MAX_SAMPLES)) {
         return res.status(400).json({
           statusCode: 400,
           error: 'PARAMETRIC_LIMIT_EXCEEDED',
-          message: 'Baseline <=1MP, 1-sample parameters are not eligible for X-Base-Paid exemption.'
+          message: 'Parameters exceeding 1MP or 1 sample require Anlas usage enabled.'
         });
       }
-    }
-
-    // Model-Aware Parametric & Deadband Gate (V5 Medium bypasses step validation; 24-28 deadband applies strictly to V5 High)
-    if (!isV5Medium && !isBasePaid && parsedSteps !== null) {
-      if (isV5 && parsedSteps >= 24 && parsedSteps <= 28) {
-        return res.status(400).json({
-          statusCode: 400,
-          error: 'PARAMETRIC_LIMIT_EXCEEDED',
-          message: 'Steps 24-28 on V5 Full (High) are prohibited on the free tier (battery deadband). Use <=23 steps, switch to Medium effort, or enable Anlas bypass.'
-        });
-      }
-      if (parsedSteps > config.FIREWALL_MAX_STEPS) {
-        return res.status(400).json({
-          statusCode: 400,
-          error: 'PARAMETRIC_LIMIT_EXCEEDED',
-          message: `Steps count of ${parsedSteps} exceeds the free-tier maximum limit of ${config.FIREWALL_MAX_STEPS} steps without Anlas bypass.`
-        });
-      }
-    }
-
-    if (!isBasePaid && ((effectivePixels !== null && effectivePixels > config.FIREWALL_MAX_PIXELS) || effectiveSamples !== config.FIREWALL_MAX_SAMPLES)) {
-      return res.status(400).json({
-        statusCode: 400,
-        error: 'PARAMETRIC_LIMIT_EXCEEDED',
-        message: 'Parameters exceeding 1MP or 1 sample require Anlas bypass authorization.'
-      });
     }
 
     // Ensure fresh subscription telemetry for any V5 or Anlas-consuming queue request
@@ -324,7 +354,7 @@ router.post('/join', async (req, res) => {
       });
     }
 
-    // Master Opus Subscription Active Gate (applies to V5, base-paid, and legacy requests once telemetry exists)
+    // Master Opus Subscription Active Gate (applies to V5, base-paid, upscale, and legacy requests once telemetry exists)
     if (req.telemetry && req.telemetry.lastFetched > 0 && req.telemetry.subscriptionActive === false) {
       console.warn(`[GuildWeave Gatekeeper] Queue entry blocked for browser "${browser_id}": Master Opus subscription is inactive.`);
       return res.status(503).json({
@@ -335,7 +365,7 @@ router.post('/join', async (req, res) => {
     }
 
     const tierConfig = config.TIER_CONFIGS[device.priority_tier] || config.TIER_CONFIGS['Normal'];
-    if (tierConfig && tierConfig.maxAllowance !== Infinity) {
+    if (!isUpscale && tierConfig && tierConfig.maxAllowance !== Infinity) {
       // Evaluate allowance against canonical user_id (shared pool across all user devices)
       const allowance = await auditEngine.getOrUpdateAllowance(device.user_id, device.priority_tier, false);
       if (allowance < 1) {
@@ -349,10 +379,10 @@ router.post('/join', async (req, res) => {
     if (requestsAnlasBypass) {
       const effectiveDeclaredAnlas = parsedDeclaredAnlas !== null
         ? parsedDeclaredAnlas
-        : (isBasePaid ? BASE_PAID_MIN_ANLAS : 0);
-      const requiredAnlasFloor = isBasePaid
-        ? Math.max(effectiveDeclaredAnlas, BASE_PAID_MIN_ANLAS)
-        : effectiveDeclaredAnlas;
+        : (isUpscale ? (upscaleCost ?? UPSCALE_MIN_ANLAS) : (isBasePaid ? BASE_PAID_MIN_ANLAS : 0));
+      const requiredAnlasFloor = isUpscale
+        ? Math.max(upscaleCost ?? UPSCALE_MIN_ANLAS, UPSCALE_MIN_ANLAS)
+        : (isBasePaid ? Math.max(effectiveDeclaredAnlas, BASE_PAID_MIN_ANLAS) : effectiveDeclaredAnlas);
 
       if (
         req.telemetry &&
@@ -366,7 +396,7 @@ router.post('/join', async (req, res) => {
         return res.status(503).json({
           statusCode: 503,
           error: 'MASTER_ANLAS_DEPLETED',
-          message: `Master account Anlas balance (${req.telemetry.masterAnlas}) is insufficient for this generation (${requiredAnlasFloor} Anlas required).`
+          message: `Master account Anlas balance (${req.telemetry.masterAnlas}) is insufficient for this request (${requiredAnlasFloor} Anlas required).`
         });
       }
 
@@ -392,6 +422,7 @@ router.post('/join', async (req, res) => {
 
       const spendAuth = await auditEngine.authorizeAnlasSpend(device.user_id, {
         declaredAnlas: effectiveDeclaredAnlas,
+        ...(isUpscale ? { requiredAnlas: requiredAnlasFloor } : {}),
         isBasePaid,
         heldAnlas: netHeldAnlas
       });
@@ -409,7 +440,7 @@ router.post('/join', async (req, res) => {
     let personalBankedBalance = Infinity;
     let reqNcp = 0;
 
-    if (isV5 && !isBasePaid) {
+    if (isV5 && !isBasePaid && !isUpscale) {
       reqNcp = isV5Medium ? V5_MEDIUM_NCP_COST : V5_HIGH_NCP_COST;
 
       const accrual = await auditEngine.evaluateV5Accrual(device.user_id, {
@@ -447,13 +478,13 @@ router.post('/join', async (req, res) => {
     let heldNcp = 0;
     let heldNcpSource = null;
 
-    if (isV5 && !isBasePaid) {
+    if (isV5 && !isBasePaid && !isUpscale) {
       if (req.telemetry.isHardLocked) {
         console.warn(`[GuildWeave Gatekeeper] V5 queue entry blocked by circuit breaker for browser "${browser_id}". Projected V5 Capacity: ${req.telemetry.percent.toFixed(2)}%`);
         return res.status(503).json({
           statusCode: 503,
           error: 'V5_BATTERY_CRITICAL',
-          message: `V5 generation is temporarily locked by the cluster circuit breaker (${req.telemetry.percent.toFixed(2)}% <= ${config.V5_CIRCUIT_BREAKER_PERCENT}%). Try again after battery recharge, or switch to a non-V5 model.`
+          message: `Shared V5 capacity is recharging (${req.telemetry.percent.toFixed(2)}% <= ${config.V5_CIRCUIT_BREAKER_PERCENT}%). Switch to a legacy model or enable monthly Anlas.`
         });
       }
 

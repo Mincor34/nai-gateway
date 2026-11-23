@@ -1,8 +1,9 @@
 /**
  * LEVEL 4: ADMINISTRATIVE ROUTER (routes/adminRouter.js)
  * Isolates all privileged control panel, Discord bot, and management interactions.
- * Exposes dual-ledger Anlas/V5 NCP telemetry, Cluster Surplus state, subscription-period
- * aggregates, and atomic balance adjustment / debt reconciliation controls.
+ * Exposes dual-ledger Anlas/V5 NCP telemetry, Cluster Surplus state, billing-cycle-segregated
+ * period usage & historical archives (`GET /admin/cycles`, `?cycle_epoch=` on `/devices` & `/global-stats`),
+ * and atomic balance adjustment / debt reconciliation controls.
  * Supports canonical user_id, discord_id, and browser_id resolution across governance endpoints
  * (including pruned unlinked user records lacking active rows in devices).
  * Relational Normalization: Operates on canonical users as parents and devices as children.
@@ -31,6 +32,46 @@ function getConfig() {
 function isOptionalNonEmptyString(value) {
   if (value === undefined || value === null) return true;
   return typeof value === 'string' && value.trim().length > 0;
+}
+
+/**
+ * Resolves the requested cycle_epoch query selector:
+ * - `'all'` -> lifetime mode (`mode: 'all'`)
+ * - positive/zero decimal integer -> specific billing cycle (`mode: 'cycle', cycleEpoch`)
+ * - omitted -> active billing cycle from `req.telemetry.activeCycleEpoch` (or `0` fallback)
+ *
+ * @param {*} rawCycleParam - Express req.query.cycle_epoch candidate.
+ * @param {number|null} activeCycleEpoch - Current active cycle epoch from telemetry.
+ * @returns {{ok: boolean, mode?: 'cycle'|'all', cycleEpoch?: number, isActiveCycle?: boolean, error?: string}}
+ */
+function parseCycleFilterParam(rawCycleParam, activeCycleEpoch) {
+  const effectiveActive = (typeof activeCycleEpoch === 'number' && Number.isInteger(activeCycleEpoch) && activeCycleEpoch > 0)
+    ? activeCycleEpoch
+    : 0;
+
+  if (rawCycleParam === undefined || rawCycleParam === null || rawCycleParam === '') {
+    return { ok: true, mode: 'cycle', cycleEpoch: effectiveActive, isActiveCycle: true };
+  }
+  if (typeof rawCycleParam !== 'string') {
+    return { ok: false, error: 'cycle_epoch must be a non-negative integer or "all".' };
+  }
+  const trimmed = rawCycleParam.trim().toLowerCase();
+  if (trimmed === 'all') {
+    return { ok: true, mode: 'all', cycleEpoch: null, isActiveCycle: false };
+  }
+  if (!/^\d+$/.test(trimmed)) {
+    return { ok: false, error: 'cycle_epoch must be a non-negative integer or "all".' };
+  }
+  const parsed = Number(trimmed);
+  if (!Number.isSafeInteger(parsed)) {
+    return { ok: false, error: 'cycle_epoch exceeds safe integer bounds.' };
+  }
+  return {
+    ok: true,
+    mode: 'cycle',
+    cycleEpoch: parsed,
+    isActiveCycle: parsed === effectiveActive
+  };
 }
 
 /**
@@ -90,12 +131,120 @@ const verifyAdmin = (req, res, next) => {
 
 router.use(verifyAdmin);
 
+/**
+ * Lists archived and active subscription billing periods for segregated telemetry inspection.
+ */
+router.get('/cycles', async (req, res) => {
+  try {
+    const activeEpoch = req.telemetry?.activeCycleEpoch ?? null;
+    const rows = await all(
+      `SELECT sp.cycle_epoch, sp.expires_at, sp.started_at,
+              COALESCE(SUM(pu.anlas_consumed), 0) as total_anlas,
+              COALESCE(SUM(pu.v5_high_gens + pu.v5_medium_gens), 0) as total_v5,
+              COALESCE(SUM(pu.legacy_image_gens), 0) as total_legacy_images,
+              COALESCE(SUM(pu.upscale_gens), 0) as total_upscales,
+              COALESCE(SUM(pu.vibe_encodes), 0) as total_vibes,
+              COALESCE(SUM(pu.text_gens), 0) as total_text_gens
+       FROM subscription_periods sp
+       LEFT JOIN period_usage pu ON pu.cycle_epoch = sp.cycle_epoch
+       GROUP BY sp.cycle_epoch
+       ORDER BY sp.cycle_epoch DESC`
+    );
+
+    const seenEpochs = new Set(rows.map(r => r.cycle_epoch));
+    const distinctUsageEpochs = await all('SELECT DISTINCT cycle_epoch FROM period_usage ORDER BY cycle_epoch DESC');
+    for (const row of distinctUsageEpochs) {
+      if (!seenEpochs.has(row.cycle_epoch)) {
+        const agg = await get(
+          `SELECT COALESCE(SUM(anlas_consumed), 0) as total_anlas,
+                  COALESCE(SUM(v5_high_gens + v5_medium_gens), 0) as total_v5,
+                  COALESCE(SUM(legacy_image_gens), 0) as total_legacy_images,
+                  COALESCE(SUM(upscale_gens), 0) as total_upscales,
+                  COALESCE(SUM(vibe_encodes), 0) as total_vibes,
+                  COALESCE(SUM(text_gens), 0) as total_text_gens
+           FROM period_usage WHERE cycle_epoch = ?`,
+          [row.cycle_epoch]
+        );
+        rows.push({
+          cycle_epoch: row.cycle_epoch,
+          expires_at: null,
+          started_at: row.cycle_epoch,
+          total_anlas: agg?.total_anlas || 0,
+          total_v5: agg?.total_v5 || 0,
+          total_legacy_images: agg?.total_legacy_images || 0,
+          total_upscales: agg?.total_upscales || 0,
+          total_vibes: agg?.total_vibes || 0,
+          total_text_gens: agg?.total_text_gens || 0
+        });
+        seenEpochs.add(row.cycle_epoch);
+      }
+    }
+
+    if (activeEpoch && !seenEpochs.has(activeEpoch)) {
+      rows.unshift({
+        cycle_epoch: activeEpoch,
+        expires_at: req.telemetry?.masterExpiresAt ?? null,
+        started_at: activeEpoch,
+        total_anlas: 0,
+        total_v5: 0,
+        total_legacy_images: 0,
+        total_upscales: 0,
+        total_vibes: 0,
+        total_text_gens: 0
+      });
+    }
+
+    rows.sort((a, b) => b.cycle_epoch - a.cycle_epoch);
+
+    res.json({
+      active_cycle_epoch: activeEpoch,
+      cycles: rows.map(r => ({
+        ...r,
+        is_active: activeEpoch !== null && r.cycle_epoch === activeEpoch
+      }))
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 router.get('/devices', async (req, res) => {
   const config = getConfig();
+  const cycleFilter = parseCycleFilterParam(req.query?.cycle_epoch, req.telemetry?.activeCycleEpoch ?? null);
+  if (!cycleFilter.ok) {
+    return res.status(400).json({ error: cycleFilter.error });
+  }
+
   try { 
     const users = await all('SELECT * FROM users');
     const devices = await all('SELECT * FROM devices');
-    
+
+    const periodMap = new Map();
+    if (cycleFilter.mode === 'all') {
+      const periodRows = await all(
+        `SELECT user_id,
+                SUM(anlas_consumed) as anlas_consumed,
+                SUM(v5_high_gens) as v5_high_gens,
+                SUM(v5_medium_gens) as v5_medium_gens,
+                SUM(legacy_image_gens) as legacy_image_gens,
+                SUM(vibe_encodes) as vibe_encodes,
+                SUM(upscale_gens) as upscale_gens,
+                SUM(text_gens) as text_gens
+         FROM period_usage
+         GROUP BY user_id`
+      );
+      for (const r of periodRows) periodMap.set(r.user_id, r);
+    } else {
+      const periodRows = await all(
+        `SELECT user_id, anlas_consumed, v5_high_gens, v5_medium_gens,
+                legacy_image_gens, vibe_encodes, upscale_gens, text_gens
+         FROM period_usage
+         WHERE cycle_epoch = ?`,
+        [cycleFilter.cycleEpoch]
+      );
+      for (const r of periodRows) periodMap.set(r.user_id, r);
+    }
+
     const groups = {};
     for (const u of users) {
       const isLinked = !u.user_id.startsWith('b_');
@@ -124,6 +273,29 @@ router.get('/devices', async (req, res) => {
         ? false
         : (balanceInfo ? balanceInfo.is_in_debt : ((virtualAnlasBalance || 0) < 0));
 
+      const pRow = periodMap.get(u.user_id);
+      const matchesSelectedEpoch = cycleFilter.isActiveCycle && (
+        cycleFilter.cycleEpoch === 0 ||
+        u.subscription_period_start_epoch === cycleFilter.cycleEpoch
+      );
+      const userPeriodAnlas = matchesSelectedEpoch ? (u.subscription_period_anlas || 0) : 0;
+      const userPeriodV5 = matchesSelectedEpoch ? (u.subscription_period_v5 || 0) : 0;
+
+      const pV5High = pRow ? (pRow.v5_high_gens || 0) : 0;
+      const pV5Med = pRow ? (pRow.v5_medium_gens || 0) : 0;
+      const pLegacy = pRow ? (pRow.legacy_image_gens || 0) : 0;
+      const pVibe = pRow ? (pRow.vibe_encodes || 0) : 0;
+      const pUpscale = pRow ? (pRow.upscale_gens || 0) : 0;
+      const pText = pRow ? (pRow.text_gens || 0) : 0;
+
+      const periodAnlas = pRow
+        ? Math.max(pRow.anlas_consumed || 0, userPeriodAnlas)
+        : userPeriodAnlas;
+      const periodV5 = pRow
+        ? Math.max(pV5High + pV5Med, userPeriodV5)
+        : userPeriodV5;
+      const periodRequests = periodV5 + pLegacy + pVibe + pUpscale + pText;
+
       groups[u.user_id] = {
         user_id: u.user_id,
         discord_id: isLinked ? u.user_id : null,
@@ -145,8 +317,15 @@ router.get('/devices', async (req, res) => {
         v5_held_surplus_ncp: heldSurplusNcp,
         v5_daily_consumed: u.v5_daily_consumed || 0,
         v5_last_accrual_epoch: u.v5_last_accrual_epoch ?? null,
-        subscription_period_anlas: u.subscription_period_anlas || 0,
-        subscription_period_v5: u.subscription_period_v5 || 0,
+        subscription_period_anlas: periodAnlas,
+        subscription_period_v5: periodV5,
+        subscription_period_v5_high: pV5High,
+        subscription_period_v5_medium: pV5Med,
+        subscription_period_legacy_images: pLegacy,
+        subscription_period_vibes: pVibe,
+        subscription_period_upscales: pUpscale,
+        subscription_period_text_gens: pText,
+        subscription_period_requests: periodRequests,
         subscription_period_start_epoch: u.subscription_period_start_epoch ?? null,
         total_requests: 0,
         last_active_at: 0,
@@ -760,22 +939,153 @@ router.post('/revoke-discord', async (req, res) => {
 
 router.get('/global-stats', async (req, res) => {
   const config = getConfig();
+  const cycleFilter = parseCycleFilterParam(req.query?.cycle_epoch, req.telemetry?.activeCycleEpoch ?? null);
+  if (!cycleFilter.ok) {
+    return res.status(400).json({ error: cycleFilter.error });
+  }
+
   try {
     const devicesCount = await get('SELECT COUNT(*) as count FROM devices');
     const linkedUsersCount = await get("SELECT COUNT(*) as count FROM users WHERE user_id NOT LIKE 'b_%'");
     const totalAnlas = await get('SELECT SUM(anlas_consumed) as sum FROM users');
     const totalRequests = await get('SELECT SUM(total_requests) as sum FROM devices');
-    
-    const topAnlas = await all("SELECT user_id as discord_id, discord_username, anlas_consumed as anlas FROM users WHERE user_id NOT LIKE 'b_%' ORDER BY anlas DESC LIMIT 5");
-    const topRequests = await all("SELECT d.user_id as discord_id, u.discord_username, SUM(d.total_requests) as reqs FROM devices d JOIN users u ON d.user_id = u.user_id WHERE d.user_id NOT LIKE 'b_%' GROUP BY d.user_id ORDER BY reqs DESC LIMIT 5");
-    
+
+    const allUsers = await all('SELECT user_id, discord_username, anlas_consumed, subscription_period_anlas, subscription_period_v5, subscription_period_start_epoch FROM users');
+    const userNameMap = new Map(allUsers.map(u => [u.user_id, u.discord_username]));
+
+    let periodAggregates = {
+      period_anlas: 0,
+      period_v5: 0,
+      period_v5_high: 0,
+      period_v5_medium: 0,
+      period_legacy_images: 0,
+      period_vibes: 0,
+      period_upscales: 0,
+      period_text_gens: 0
+    };
+    let topAnlas = [];
+    let topRequests = [];
+
+    if (cycleFilter.mode === 'all') {
+      const archiveTotals = await get(
+        `SELECT SUM(anlas_consumed) as anlas,
+                SUM(v5_high_gens) as v5_high,
+                SUM(v5_medium_gens) as v5_med,
+                SUM(legacy_image_gens) as legacy_img,
+                SUM(vibe_encodes) as vibes,
+                SUM(upscale_gens) as upscales,
+                SUM(text_gens) as text_gens
+         FROM period_usage`
+      );
+      periodAggregates = {
+        period_anlas: archiveTotals?.anlas ?? totalAnlas.sum ?? 0,
+        period_v5: (archiveTotals?.v5_high || 0) + (archiveTotals?.v5_med || 0),
+        period_v5_high: archiveTotals?.v5_high || 0,
+        period_v5_medium: archiveTotals?.v5_med || 0,
+        period_legacy_images: archiveTotals?.legacy_img || 0,
+        period_vibes: archiveTotals?.vibes || 0,
+        period_upscales: archiveTotals?.upscales || 0,
+        period_text_gens: archiveTotals?.text_gens || 0
+      };
+      topAnlas = await all("SELECT user_id as discord_id, discord_username, anlas_consumed as anlas FROM users WHERE user_id NOT LIKE 'b_%' ORDER BY anlas DESC LIMIT 5");
+      topRequests = await all("SELECT d.user_id as discord_id, u.discord_username, SUM(d.total_requests) as reqs FROM devices d JOIN users u ON d.user_id = u.user_id WHERE d.user_id NOT LIKE 'b_%' GROUP BY d.user_id ORDER BY reqs DESC LIMIT 5");
+    } else {
+      const periodRows = await all(
+        `SELECT user_id, anlas_consumed, v5_high_gens, v5_medium_gens,
+                legacy_image_gens, vibe_encodes, upscale_gens, text_gens
+         FROM period_usage
+         WHERE cycle_epoch = ?`,
+        [cycleFilter.cycleEpoch]
+      );
+      const periodMap = new Map(periodRows.map(r => [r.user_id, r]));
+
+      // Merge strictly active-epoch SQL rows when period_usage does not yet carry them
+      // (preserves Commit 9 SQL-seeded invariants while excluding inactive stale Cycle 1 balances).
+      const mergedEntries = [];
+      const seen = new Set();
+
+      for (const u of allUsers) {
+        const pRow = periodMap.get(u.user_id);
+        const matchesCycle = cycleFilter.isActiveCycle && (
+          cycleFilter.cycleEpoch === 0 ||
+          u.subscription_period_start_epoch === cycleFilter.cycleEpoch
+        );
+        const uAnlas = matchesCycle ? (u.subscription_period_anlas || 0) : 0;
+        const uV5 = matchesCycle ? (u.subscription_period_v5 || 0) : 0;
+
+        const v5High = pRow ? (pRow.v5_high_gens || 0) : 0;
+        const v5Med = pRow ? (pRow.v5_medium_gens || 0) : 0;
+        const legacyImg = pRow ? (pRow.legacy_image_gens || 0) : 0;
+        const vibes = pRow ? (pRow.vibe_encodes || 0) : 0;
+        const upscales = pRow ? (pRow.upscale_gens || 0) : 0;
+        const textGens = pRow ? (pRow.text_gens || 0) : 0;
+
+        const effAnlas = pRow ? Math.max(pRow.anlas_consumed || 0, uAnlas) : uAnlas;
+        const effV5 = pRow ? Math.max(v5High + v5Med, uV5) : uV5;
+        const effReqs = effV5 + legacyImg + vibes + upscales + textGens;
+
+        periodAggregates.period_anlas += effAnlas;
+        periodAggregates.period_v5 += effV5;
+        periodAggregates.period_v5_high += v5High;
+        periodAggregates.period_v5_medium += v5Med;
+        periodAggregates.period_legacy_images += legacyImg;
+        periodAggregates.period_vibes += vibes;
+        periodAggregates.period_upscales += upscales;
+        periodAggregates.period_text_gens += textGens;
+
+        seen.add(u.user_id);
+        if (!u.user_id.startsWith('b_') && (effAnlas > 0 || effReqs > 0)) {
+          mergedEntries.push({
+            discord_id: u.user_id,
+            discord_username: u.discord_username,
+            anlas: effAnlas,
+            reqs: effReqs
+          });
+        }
+      }
+
+      for (const [uid, pRow] of periodMap.entries()) {
+        if (seen.has(uid)) continue;
+        const v5Count = (pRow.v5_high_gens || 0) + (pRow.v5_medium_gens || 0);
+        const reqCount = v5Count + (pRow.legacy_image_gens || 0) + (pRow.vibe_encodes || 0) + (pRow.upscale_gens || 0) + (pRow.text_gens || 0);
+
+        periodAggregates.period_anlas += (pRow.anlas_consumed || 0);
+        periodAggregates.period_v5 += v5Count;
+        periodAggregates.period_v5_high += (pRow.v5_high_gens || 0);
+        periodAggregates.period_v5_medium += (pRow.v5_medium_gens || 0);
+        periodAggregates.period_legacy_images += (pRow.legacy_image_gens || 0);
+        periodAggregates.period_vibes += (pRow.vibe_encodes || 0);
+        periodAggregates.period_upscales += (pRow.upscale_gens || 0);
+        periodAggregates.period_text_gens += (pRow.text_gens || 0);
+
+        if (!uid.startsWith('b_')) {
+          mergedEntries.push({
+            discord_id: uid,
+            discord_username: userNameMap.get(uid) || (uid === 'admin' ? 'Administrator' : uid),
+            anlas: pRow.anlas_consumed || 0,
+            reqs: reqCount
+          });
+        }
+      }
+
+      topAnlas = mergedEntries
+        .filter(e => e.anlas > 0)
+        .sort((a, b) => b.anlas - a.anlas)
+        .slice(0, 5)
+        .map(({ discord_id, discord_username, anlas }) => ({ discord_id, discord_username, anlas }));
+
+      topRequests = mergedEntries
+        .filter(e => e.reqs > 0)
+        .sort((a, b) => b.reqs - a.reqs)
+        .slice(0, 5)
+        .map(({ discord_id, discord_username, reqs }) => ({ discord_id, discord_username, reqs }));
+    }
+
     const bannedCount = await get('SELECT COUNT(*) as count FROM users WHERE banned = 1');
     const bannedList = await all('SELECT user_id as discord_id, ban_reason as reason FROM users WHERE banned = 1');
 
     const ledgerAggregates = await get(
       `SELECT
-         SUM(subscription_period_anlas) as period_anlas,
-         SUM(subscription_period_v5) as period_v5,
          SUM(CASE WHEN virtual_anlas_balance > 0 THEN virtual_anlas_balance ELSE 0 END) as positive_virtual_anlas,
          SUM(CASE WHEN virtual_anlas_balance < 0 THEN virtual_anlas_balance ELSE 0 END) as total_anlas_debt,
          SUM(v5_banked_balance) as total_v5_banked,
@@ -809,6 +1119,7 @@ router.get('/global-stats', async (req, res) => {
     const isColdOrExpired = telemetrySnap.lastFetched === 0;
 
     res.json({
+      selected_cycle_epoch: cycleFilter.mode === 'all' ? 'all' : cycleFilter.cycleEpoch,
       total_devices: devicesCount.count,
       linked_users: linkedUsersCount.count,
       total_anlas_consumed: totalAnlas.sum || 0,
@@ -817,8 +1128,14 @@ router.get('/global-stats', async (req, res) => {
       top_request_makers: topRequests,
       banned_count: bannedCount.count,
       banned_list: bannedList,
-      total_subscription_period_anlas: ledgerAggregates?.period_anlas || 0,
-      total_subscription_period_v5: ledgerAggregates?.period_v5 || 0,
+      total_subscription_period_anlas: periodAggregates.period_anlas,
+      total_subscription_period_v5: periodAggregates.period_v5,
+      total_subscription_period_v5_high: periodAggregates.period_v5_high,
+      total_subscription_period_v5_medium: periodAggregates.period_v5_medium,
+      total_subscription_period_legacy_images: periodAggregates.period_legacy_images,
+      total_subscription_period_vibes: periodAggregates.period_vibes,
+      total_subscription_period_upscales: periodAggregates.period_upscales,
+      total_subscription_period_text_gens: periodAggregates.period_text_gens,
       total_virtual_anlas_balance: ledgerAggregates?.positive_virtual_anlas || 0,
       total_anlas_debt: ledgerAggregates?.total_anlas_debt || 0,
       total_v5_banked_balance: ledgerAggregates?.total_v5_banked || 0,

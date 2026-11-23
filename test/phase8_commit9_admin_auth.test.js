@@ -2,12 +2,13 @@
  * PHASE 8 COMMIT 9 VERIFICATION HARNESS (test/phase8_commit9_admin_auth.test.js)
  *
  * Exhaustively tests:
- * 1. Happy Path: `/auth/status` Dual-Ledger Metadata, Countdown Timers & Cluster State:
+ * 1. Happy Path: `/auth/status` Dual-Ledger Metadata, Countdown Timers, Cluster State & Physical Tank Cap:
  *    - Serializes virtual Anlas balance, available balance (deducting cross-channel holds),
  *      monthly quota, debt state, zero_rollover, subscription-period usage, V5 banked NCP,
- *      available NCP, surplus pool availability, cluster_state (`surplus_active`, `reserve_mode`,
- *      `throttled`, `frozen`, `token_expired`, `telemetry_offline`), time_until_next_percent,
- *      next_percent_eta_ms, and billing-cycle fields.
+ *      available NCP (capped against physical `spendable_master_ncp` above 5.5%), surplus pool
+ *      availability, cluster_state (`surplus_active`, `reserve_mode`, `throttled`, `frozen`,
+ *      `token_expired`, `telemetry_offline`), time_until_next_percent, next_percent_eta_ms,
+ *      and billing-cycle fields.
  *    - Forwards `req.telemetry.nominalDailyCompute` into lazy `evaluateV5Accrual()` on `/auth/status`.
  *    - Preserves all legacy `/auth/status` response fields (`approved`, `tier`, `anlas_consumed`,
  *      `precise_limit`, `session`, `linked_devices`, `master_v5_percent`, `debug_*`), Admin Infinity
@@ -218,7 +219,7 @@ test('Phase 8 Commit 9: Administrative Telemetry, Governance & Dual-Ledger Statu
   // ---------------------------------------------------------------------------
   // 1. HAPPY PATH: `/auth/status` DUAL-LEDGER TELEMETRY & `nominalDailyCompute`
   // ---------------------------------------------------------------------------
-  await t.test('Happy Path: /auth/status serializes dual-ledger metadata, holds, countdown timers, cluster states & nominalDailyCompute', async () => {
+  await t.test('Happy Path: /auth/status serializes dual-ledger metadata, holds, countdown timers, cluster states & physical tank cap', async () => {
     queueManager.reset();
     const syncNow = Date.now();
     serverModule.applyUsageTelemetry({
@@ -297,6 +298,17 @@ test('Phase 8 Commit 9: Administrative Telemetry, Governance & Dual-Ledger Statu
     assert.strictEqual(d.telemetry.master_token_expired, false);
     assert.strictEqual(d.subscription_period.anlas_consumed, 45);
     assert.strictEqual(d.subscription_period.v5_consumed, 5);
+
+    // Physical tank solvency cap: when master tank drops to 8.0% (~777 NCP spendable above 5.5%),
+    // available_ncp must cap at spendableMasterNcp (~777) while keeping banked_ncp (1635) intact!
+    serverModule.applyUsageTelemetry({
+      tier: 3, active: true, expiresAt: DEFAULT_SUB_EXPIRES, isGracePeriod: false,
+      usage: { percent: 8.0, timeUntilNextPercent: 7200, isNegative: false }
+    }, undefined, Date.now());
+    const lowTankRes = await queryGateway('/auth/status?browser_id=dev_alice_1', 'GET', { 'Authorization': 'Bearer sec_alice_1' });
+    assert.strictEqual(lowTankRes.data.v5.banked_ncp, 1635, 'Low master tank must NOT erase SQLite banked_ncp');
+    assert.ok(lowTankRes.data.v5.available_ncp <= 780 && lowTankRes.data.v5.available_ncp >= 770, 'available_ncp must cap to physical master headroom (~777 NCP at 8.0%)');
+    assert.ok(lowTankRes.data.v5.spendable_master_ncp <= 780);
 
     // Metered tier serialization (zero quota, zero V5 weight, surplus_eligible: false, session allowance present)
     const meteredRes = await queryGateway('/auth/status?browser_id=dev_metered9', 'GET', {

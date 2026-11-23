@@ -10,7 +10,7 @@
  * - ACS-1 dynamic timeUntilNextPercent normalization, weighted V5 dispatch projection,
  *   adaptive polling escalation (10m -> 2m -> 60s floor), and 5.5% circuit breaker
  * - Authoritative master subscription billing-cycle tracking (active, tier, expiresAt,
- *   isGracePeriod, trainingStepsLeft) with SQLite config persistence and fail-closed guards
+ *   isGracePeriod, trainingStepsLeft) with SQLite config + `subscription_periods` persistence
  * - Explicit master_token_expired clearing of stale cached capacity on upstream 401
  * - Bucket 2 surplus pool hydration, clamped [0, 100] telemetry injection, and unified
  *   retry-safe SQLite persistence across 24h sweeps and PoNR deductions
@@ -25,7 +25,7 @@ const crypto = require('crypto');
 const { loadConfig } = require('./config');
 const database = require('./database');
 const queueManager = require('./queueManager');
-const { isV5ModelFamily, isV5MediumModel } = require('./auditEngine');
+const { isV5ModelFamily, isV5MediumModel, recordSubscriptionPeriod } = require('./auditEngine');
 
 // Route Controllers (Level 4)
 const proxyRouter = require('./routes/proxyRouter');
@@ -345,8 +345,9 @@ function hydrateSubscriptionState(lastPaidExpiresAtSec, cycleEpochMs) {
 }
 
 /**
- * Atomically persists master billing-cycle state (`master_last_paid_expires_at` and
- * `master_anlas_cycle_epoch`) to SQLite `config` with serialized retry resilience.
+ * Atomically persists master billing-cycle state (`master_last_paid_expires_at`,
+ * `master_anlas_cycle_epoch`, and `subscription_periods` archive row) to SQLite
+ * with serialized retry resilience.
  *
  * @param {number} lastPaidExpiresAtSec - Unix seconds of last paid non-grace expiration.
  * @param {number} cycleEpochMs - Millisecond epoch of active billing cycle.
@@ -369,6 +370,13 @@ function persistSubscriptionCycleState(lastPaidExpiresAtSec, cycleEpochMs) {
           "INSERT OR REPLACE INTO config (key, value) VALUES ('master_last_paid_expires_at', ?), ('master_anlas_cycle_epoch', ?)",
           [String(lastPaidExpiresAtSec), String(cycleEpochMs)]
         );
+        if (cycleEpochMs > 0) {
+          await recordSubscriptionPeriod(
+            cycleEpochMs,
+            lastPaidExpiresAtSec > 0 ? lastPaidExpiresAtSec : null,
+            cycleEpochMs
+          );
+        }
         if (pendingCyclePersist && pendingCyclePersist.seq === mySeq) {
           pendingCyclePersist = null;
         }
@@ -997,6 +1005,13 @@ database.initDatabase(bootConfig.DATABASE_PATH)
       const expiresRow = await database.get("SELECT value FROM config WHERE key = 'master_last_paid_expires_at'");
       const cycleRow = await database.get("SELECT value FROM config WHERE key = 'master_anlas_cycle_epoch'");
       hydrateSubscriptionState(expiresRow ? expiresRow.value : '0', cycleRow ? cycleRow.value : '0');
+      if (master_anlas_cycle_epoch > 0) {
+        await recordSubscriptionPeriod(
+          master_anlas_cycle_epoch,
+          master_last_paid_expires_at > 0 ? master_last_paid_expires_at : null,
+          master_anlas_cycle_epoch
+        );
+      }
     } catch (cycleHydrateErr) {
       console.warn("[GuildWeave Boot] Billing cycle hydration failed. Falling back to 0:", cycleHydrateErr.message);
       hydrateSubscriptionState('0', '0');

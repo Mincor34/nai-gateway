@@ -4,7 +4,7 @@
  *
  * This module is the authoritative persistence engine for GuildWeave.
  * It manages persistent device registrations, approval states, blacklists,
- * financial ledgers, and system configuration variables.
+ * financial ledgers, subscription-period telemetry archives, and system configuration variables.
  *
  * DESIGN PRINCIPLES:
  * 1. Zero top-level connection side-effects or ambient environment coupling.
@@ -15,6 +15,8 @@
  * 6. Relational Normalization (Option 1): Maintains canonical users table for authoritative principal state
  *    while preserving legacy column contracts and synchronizing via SQLite triggers for complete zero-regression safety.
  * 7. Negative Ledger Invariant: Preserves integer precision on negative balance states (overdrafts) without float casting.
+ * 8. Period-Segregated Telemetry Archive: Persists historical and active cycle usage in `subscription_periods`
+ *    and `period_usage` so inactive users never pollute subsequent cycle aggregates.
  */
 
 'use strict';
@@ -187,6 +189,27 @@ const initDatabase = async (targetPath) => {
             PRIMARY KEY (browser_id, session_date)
           )`);
 
+          // Subscription Periods Archive: Preserves distinct billing cycles for period-segregated telemetry
+          await execRun(newDb, `CREATE TABLE IF NOT EXISTS subscription_periods (
+            cycle_epoch INTEGER PRIMARY KEY,
+            expires_at INTEGER,
+            started_at INTEGER NOT NULL
+          )`);
+
+          // Period Usage Table: Segregates all generation and Anlas usage strictly by billing cycle and user_id
+          await execRun(newDb, `CREATE TABLE IF NOT EXISTS period_usage (
+            cycle_epoch INTEGER NOT NULL,
+            user_id TEXT NOT NULL,
+            anlas_consumed INTEGER NOT NULL DEFAULT 0,
+            v5_high_gens INTEGER NOT NULL DEFAULT 0,
+            v5_medium_gens INTEGER NOT NULL DEFAULT 0,
+            legacy_image_gens INTEGER NOT NULL DEFAULT 0,
+            vibe_encodes INTEGER NOT NULL DEFAULT 0,
+            upscale_gens INTEGER NOT NULL DEFAULT 0,
+            text_gens INTEGER NOT NULL DEFAULT 0,
+            PRIMARY KEY (cycle_epoch, user_id)
+          )`);
+
           // Backward-Compatibility Migrations & Trigger Setup inside BEGIN IMMEDIATE
           await execRun(newDb, "BEGIN IMMEDIATE;");
           try {
@@ -267,7 +290,28 @@ const initDatabase = async (targetPath) => {
               UPDATE devices SET user_id = COALESCE(user_id, discord_id, browser_id) WHERE user_id IS NULL
             `);
 
-            // 6. Reset triggers to modern schema definitions
+            // 6. Backfill period_usage from pre-existing active-cycle users rows if period_usage is currently empty
+            const existingPeriodRows = await execAll(newDb, "SELECT 1 FROM period_usage LIMIT 1");
+            if (existingPeriodRows.length === 0) {
+              const cycleRows = await execAll(newDb, "SELECT value FROM config WHERE key = 'master_anlas_cycle_epoch'");
+              const activeEpochRaw = (cycleRows && cycleRows[0]) ? Number(cycleRows[0].value) : 0;
+              const fallbackEpoch = (Number.isSafeInteger(activeEpochRaw) && activeEpochRaw > 0) ? activeEpochRaw : 0;
+
+              await execRun(newDb, `
+                INSERT OR IGNORE INTO period_usage (
+                  cycle_epoch, user_id, anlas_consumed, v5_high_gens
+                )
+                SELECT
+                  COALESCE(NULLIF(subscription_period_start_epoch, 0), ?),
+                  user_id,
+                  COALESCE(subscription_period_anlas, 0),
+                  COALESCE(subscription_period_v5, 0)
+                FROM users
+                WHERE COALESCE(subscription_period_anlas, 0) > 0 OR COALESCE(subscription_period_v5, 0) > 0
+              `, [fallbackEpoch]);
+            }
+
+            // 7. Reset triggers to modern schema definitions
             await execRun(newDb, "DROP TRIGGER IF EXISTS trg_sync_devices_insert;");
             await execRun(newDb, "DROP TRIGGER IF EXISTS trg_sync_devices_update_allowance;");
             await execRun(newDb, "DROP TRIGGER IF EXISTS trg_sync_users_update_allowance;");
@@ -277,7 +321,7 @@ const initDatabase = async (targetPath) => {
             await execRun(newDb, "DROP TRIGGER IF EXISTS trg_sync_banned_discords_insert;");
             await execRun(newDb, "DROP TRIGGER IF EXISTS trg_sync_banned_discords_delete;");
 
-            // 7. Bidirectional Synchronization Triggers
+            // 8. Bidirectional Synchronization Triggers
             await execRun(newDb, `
               CREATE TRIGGER IF NOT EXISTS trg_sync_devices_insert
               AFTER INSERT ON devices

@@ -6,13 +6,15 @@
  * - Blind to HTTP transport (Express), socket streams, and queue RAM states.
  * - Handles parameter parsing, security auditing, Anlas tracking, authoritative principal authentication,
  *   synchronous security ban commits, and ACS-1 dual-ledger balance derivation, debt lockouts,
- *   temporal accruals, and serialized administrative balance/debt mutations.
+ *   temporal accruals, serialized administrative balance/debt mutations, binary image dimension
+ *   inspection for /ai/upscale, and cycle-segregated period usage recording.
  * - Relational Normalization: Evaluates quotas, allowances, Anlas deductions, and bans strictly
  *   against the canonical user_id (Security Principal), eliminating multi-device quota inflation.
  * - ACS-1 Domain Engine: Authoritative NovelAI Anlas formula (Module 643656 parity), bounded
  *   zero-copy binary multipart parser, isolated Channel B vibe payload validator,
- *   segregated Character Reference (director_reference_images*) vs. Vibe Transfer
- *   (reference_image_multiple) accounting, and integer-only NCP/Anlas ledger mutations.
+ *   Channel A upscale binary-header verifier & bucket pricer, segregated Character Reference
+ *   (director_reference_images*) vs. Vibe Transfer (reference_image_multiple) accounting,
+ *   and integer-only NCP/Anlas ledger mutations.
  */
 
 'use strict';
@@ -30,6 +32,18 @@ const ANLAS_MAX_PER_IMAGE_CAP = 140;
 const ANLAS_MIN_PER_IMAGE_FLOOR = 2;
 const MAX_NOVELAI_PIXELS = 3145728;
 const MAX_NOVELAI_STEPS = 50;
+
+// NovelAI Upscale Pixel Buckets (Module 643656 export "M" / Q table)
+const UPSCALE_COST_BUCKETS = Object.freeze([
+  [1048576, 1],
+  [1747627, 2],
+  [2446678, 3],
+  [3145728, 4]
+]);
+
+// Bounded Base64 prefix decode limits for JSON upscale payloads (~64KB fast path, ~2MB JPEG EXIF path)
+const BASE64_FAST_SCAN_CHARS = 87384;
+const BASE64_JPEG_SCAN_CHARS = 2796200;
 
 // ACS-1 Ledger Temporal & Compute Constants
 const DAY_MS = 86400000;
@@ -595,6 +609,157 @@ function calculateAnlasCost(params, options = {}) {
 }
 
 /**
+ * Computes the authoritative Anlas cost for `/ai/upscale` using NovelAI Module 643656's
+ * pixel-area bucket table (`Q = [[1048576, 1], [1747627, 2], [2446678, 3], [3145728, 4]]`).
+ * No Opus discount applies to upscaling.
+ *
+ * @param {number} width - Intrinsic image width in pixels.
+ * @param {number} height - Intrinsic image height in pixels.
+ * @returns {number} Integer Anlas cost (`1..4`).
+ * @throws {Error} If dimensions are invalid or exceed 3MP (`3,145,728 px`).
+ */
+function calculateUpscaleAnlasCost(width, height) {
+  if (
+    typeof width !== 'number' || !Number.isInteger(width) || width <= 0 ||
+    typeof height !== 'number' || !Number.isInteger(height) || height <= 0
+  ) {
+    throw new Error('Upscale image dimensions must be positive integers.');
+  }
+  const area = width * height;
+  if (!Number.isSafeInteger(area) || area <= 0 || area > MAX_NOVELAI_PIXELS) {
+    throw new Error(`Upscale image resolution area of ${area}px (${width}x${height}) exceeds maximum NovelAI cap of ${MAX_NOVELAI_PIXELS}px.`);
+  }
+  for (const [maxArea, cost] of UPSCALE_COST_BUCKETS) {
+    if (area <= maxArea) {
+      return cost;
+    }
+  }
+  throw new Error(`Upscale image resolution area of ${area}px exceeds maximum NovelAI cap of ${MAX_NOVELAI_PIXELS}px.`);
+}
+
+/**
+ * Extracts intrinsic pixel dimensions directly from raw PNG, JPEG, WebP, GIF, or BMP binary headers.
+ * Bounded to a strict single-pass scan without allocating decoded bitmaps.
+ *
+ * @param {Buffer} buffer - Binary image buffer or header slice.
+ * @returns {{ width: number, height: number, format: string }|null} Intrinsic dimensions or null if unrecognized.
+ */
+function extractImageDimensionsFromBuffer(buffer) {
+  if (!buffer || !Buffer.isBuffer(buffer) || buffer.length < 10) {
+    return null;
+  }
+
+  // 1. PNG (89 50 4E 47 0D 0A 1A 0A + IHDR)
+  if (
+    buffer.length >= 24 &&
+    buffer[0] === 0x89 && buffer[1] === 0x50 && buffer[2] === 0x4E && buffer[3] === 0x47 &&
+    buffer[4] === 0x0D && buffer[5] === 0x0A && buffer[6] === 0x1A && buffer[7] === 0x0A &&
+    buffer[12] === 0x49 && buffer[13] === 0x48 && buffer[14] === 0x44 && buffer[15] === 0x52
+  ) {
+    const width = buffer.readUInt32BE(16);
+    const height = buffer.readUInt32BE(20);
+    return (width > 0 && height > 0) ? { width, height, format: 'png' } : null;
+  }
+
+  // 2. WebP (RIFF....WEBP + VP8 / VP8L / VP8X)
+  if (
+    buffer.length >= 30 &&
+    buffer.subarray(0, 4).toString('ascii') === 'RIFF' &&
+    buffer.subarray(8, 12).toString('ascii') === 'WEBP'
+  ) {
+    const chunkTag = buffer.subarray(12, 16).toString('ascii');
+    if (chunkTag === 'VP8 ') {
+      if ((buffer[20] & 1) === 0 && buffer[23] === 0x9D && buffer[24] === 0x01 && buffer[25] === 0x2A) {
+        const width = buffer.readUInt16LE(26) & 0x3FFF;
+        const height = buffer.readUInt16LE(28) & 0x3FFF;
+        return (width > 0 && height > 0) ? { width, height, format: 'webp' } : null;
+      }
+      return null;
+    }
+    if (chunkTag === 'VP8L') {
+      if (buffer[20] === 0x2F) {
+        const bits = buffer.readUInt32LE(21);
+        const width = (bits & 0x3FFF) + 1;
+        const height = ((bits >> 14) & 0x3FFF) + 1;
+        return (width > 0 && height > 0) ? { width, height, format: 'webp' } : null;
+      }
+      return null;
+    }
+    if (chunkTag === 'VP8X') {
+      const width = 1 + buffer.readUIntLE(24, 3);
+      const height = 1 + buffer.readUIntLE(27, 3);
+      return (width > 0 && height > 0) ? { width, height, format: 'webp' } : null;
+    }
+    return null;
+  }
+
+  // 3. JPEG (FF D8 ... SOF0..SOF15)
+  if (buffer.length >= 4 && buffer[0] === 0xFF && buffer[1] === 0xD8) {
+    let pos = 2;
+    while (pos + 1 < buffer.length) {
+      if (buffer[pos] !== 0xFF) {
+        pos++;
+        continue;
+      }
+      while (pos + 1 < buffer.length && buffer[pos + 1] === 0xFF) {
+        pos++;
+      }
+      if (pos + 1 >= buffer.length) break;
+      const marker = buffer[pos + 1];
+      pos += 2;
+      if (marker === 0x00 || marker === 0x01 || (marker >= 0xD0 && marker <= 0xD8)) {
+        continue;
+      }
+      if (marker === 0xD9 || marker === 0xDA) {
+        break;
+      }
+      if (pos + 2 > buffer.length) break;
+      const segLen = buffer.readUInt16BE(pos);
+      if (segLen < 2 || pos + segLen > buffer.length) break;
+      const isSof = (marker >= 0xC0 && marker <= 0xC3) ||
+                    (marker >= 0xC5 && marker <= 0xC7) ||
+                    (marker >= 0xC9 && marker <= 0xCB) ||
+                    (marker >= 0xCD && marker <= 0xCF);
+      if (isSof && segLen >= 7 && pos + 7 <= buffer.length) {
+        const height = buffer.readUInt16BE(pos + 3);
+        const width = buffer.readUInt16BE(pos + 5);
+        return (width > 0 && height > 0) ? { width, height, format: 'jpeg' } : null;
+      }
+      pos += segLen;
+    }
+    return null;
+  }
+
+  // 4. GIF (GIF87a / GIF89a)
+  if (
+    buffer.length >= 10 &&
+    (buffer.subarray(0, 6).toString('ascii') === 'GIF87a' ||
+     buffer.subarray(0, 6).toString('ascii') === 'GIF89a')
+  ) {
+    const width = buffer.readUInt16LE(6);
+    const height = buffer.readUInt16LE(8);
+    return (width > 0 && height > 0) ? { width, height, format: 'gif' } : null;
+  }
+
+  // 5. BMP (BM + BITMAPCOREHEADER / BITMAPINFOHEADER)
+  if (buffer.length >= 22 && buffer[0] === 0x42 && buffer[1] === 0x4D) {
+    const dibSize = buffer.readUInt32LE(14);
+    if (dibSize === 12) {
+      const width = buffer.readUInt16LE(18);
+      const height = buffer.readUInt16LE(20);
+      return (width > 0 && height > 0) ? { width, height, format: 'bmp' } : null;
+    }
+    if (buffer.length >= 26) {
+      const width = buffer.readInt32LE(18);
+      const height = Math.abs(buffer.readInt32LE(22));
+      return (width > 0 && height > 0) ? { width, height, format: 'bmp' } : null;
+    }
+  }
+
+  return null;
+}
+
+/**
  * Pure read-only balance evaluator (Command Query Separation).
  * Computes dynamic available Anlas balance by deducting caller-supplied active cross-channel
  * reservation holds (heldAnlas = sum of Channel A + Channel B holds from Level 3) against the
@@ -822,10 +987,11 @@ async function evaluateAnlasReset(userId, optionsOrNow = Date.now()) {
 /**
  * Lazily accrues daily V5 Normalized Compute Points (NCP) for Bucket 1 (Personal Rollover Bank).
  * Evaluates proportional cluster weights strictly across distinct, unbanned, approved canonical
- * users (1 weight per user_id regardless of linked device count), caps balances at
- * tierConfig.v5MaxBankDays, resets v5_daily_consumed on day rollovers, and preserves strict
- * integer balances in SQLite. Always reports accurate active daily_share_ncp, max_bank_ncp,
- * and total_cluster_weight even when the 24-hour accrual boundary has not yet elapsed.
+ * users (1 weight per user_id regardless of linked device count), includes the cluster Admin
+ * operator weight whenever no approved Admin-tier principal exists in SQLite (preventing a
+ * single non-Admin guest from monopolizing 100% of daily master compute), clamps any bloated
+ * balance down to tierConfig.v5MaxBankDays immediately even within a 24h window, resets
+ * v5_daily_consumed on day rollovers, and preserves strict integer balances in SQLite.
  * Leaves unapproved or banned principals unmutated, and avoids stamping v5_last_accrual_epoch
  * on zero-weight principals with zero balance so tier upgrades take effect without a 24h wait.
  * Serialized per canonical user_id against TOCTOU races.
@@ -894,13 +1060,27 @@ async function evaluateV5Accrual(userId, options = {}) {
 
     let totalWeight = 0;
     let isTargetApproved = false;
+    let hasApprovedAdmin = false;
     for (const row of approvedUsers) {
       const rowTier = config.TIER_CONFIGS[row.priority_tier] || config.TIER_CONFIGS['Normal'];
       const w = Number.isInteger(rowTier.v5Weight) && rowTier.v5Weight > 0 ? rowTier.v5Weight : 0;
       totalWeight += w;
+      if (row.priority_tier === 'Admin') {
+        hasApprovedAdmin = true;
+      }
       if (row.user_id === user.user_id) {
         isTargetApproved = true;
       }
+    }
+
+    // Account for the cluster Admin operator (ADMIN_SECRET_KEY) when no approved Admin-tier
+    // record exists in SQLite so a single non-Admin guest cannot absorb 100% of daily capacity.
+    if (approvedUsers.length > 0 && !hasApprovedAdmin) {
+      const adminTier = config.TIER_CONFIGS['Admin'];
+      const adminWeight = (adminTier && Number.isInteger(adminTier.v5Weight) && adminTier.v5Weight > 0)
+        ? adminTier.v5Weight
+        : 0;
+      totalWeight += adminWeight;
     }
 
     // Preserve existing bank and epoch untouched when principal is banned or has zero approved devices
@@ -931,8 +1111,18 @@ async function evaluateV5Accrual(userId, options = {}) {
       ? Infinity
       : dailyShareNcp * Math.max(0, Math.trunc(maxBankDays));
 
+    // Clamp stale over-allocated balances immediately (e.g., tier downgrade or cluster weight increase)
+    let effectiveBanked = currentBanked;
+    if (maxBankNcp !== Infinity && currentBanked > maxBankNcp) {
+      effectiveBanked = maxBankNcp;
+      await run(
+        'UPDATE users SET v5_banked_balance = ? WHERE user_id = ?',
+        [effectiveBanked, user.user_id]
+      );
+    }
+
     // Avoid locking zero-weight principals (e.g. Metered) into a 24h cooldown unless downgrading existing state
-    if (userWeight === 0 && maxBankNcp === 0 && currentBanked === 0 && currentDailyConsumed === 0) {
+    if (userWeight === 0 && maxBankNcp === 0 && effectiveBanked === 0 && currentDailyConsumed === 0) {
       return {
         user_id: user.user_id,
         v5_banked_balance: 0,
@@ -949,7 +1139,7 @@ async function evaluateV5Accrual(userId, options = {}) {
     if (!isInitialAccrual && (safeNow - lastAccrual < DAY_MS)) {
       return {
         user_id: user.user_id,
-        v5_banked_balance: currentBanked,
+        v5_banked_balance: effectiveBanked,
         v5_daily_consumed: currentDailyConsumed,
         accrual_applied: false,
         daily_share_ncp: dailyShareNcp,
@@ -963,7 +1153,7 @@ async function evaluateV5Accrual(userId, options = {}) {
     const nextAccrualEpoch = isInitialAccrual ? safeNow : (lastAccrual + (wholeDays * DAY_MS));
 
     const accruedNcp = dailyShareNcp * wholeDays;
-    const uncappedBalance = currentBanked + accruedNcp;
+    const uncappedBalance = effectiveBanked + accruedNcp;
     const newBanked = maxBankNcp === Infinity
       ? Math.min(Number.MAX_SAFE_INTEGER, uncappedBalance)
       : Math.min(maxBankNcp, uncappedBalance);
@@ -1279,6 +1469,89 @@ async function recordSurplusV5Usage(userId) {
       [userId]
     );
   });
+}
+
+/**
+ * Registers or updates a billing cycle archive record in `subscription_periods`.
+ *
+ * @param {number} cycleEpoch - Authoritative billing cycle epoch ms (> 0).
+ * @param {number|null} [expiresAt=null] - Upstream Unix expiration timestamp in seconds.
+ * @param {number} [startedAt=Date.now()] - Archive stamp timestamp in ms.
+ * @returns {Promise<void>}
+ */
+async function recordSubscriptionPeriod(cycleEpoch, expiresAt = null, startedAt = Date.now()) {
+  const safeEpoch = assertNonNegativeSafeInt(cycleEpoch, 'cycleEpoch');
+  if (safeEpoch === 0) return;
+  const safeStarted = assertValidTimestamp(startedAt, 'startedAt');
+  const safeExpires = (expiresAt !== null && expiresAt !== undefined)
+    ? assertNonNegativeSafeInt(expiresAt, 'expiresAt')
+    : null;
+
+  await run(
+    `INSERT INTO subscription_periods (cycle_epoch, expires_at, started_at)
+     VALUES (?, ?, ?)
+     ON CONFLICT(cycle_epoch) DO UPDATE SET
+       expires_at = COALESCE(excluded.expires_at, subscription_periods.expires_at)`,
+    [safeEpoch, safeExpires, safeStarted]
+  );
+}
+
+/**
+ * Atomically records PoNR generation and Anlas usage inside `period_usage` keyed by
+ * `(cycle_epoch, user_id)`. Preserves historical cycles without overwriting and segregates
+ * inactive accounts cleanly from subsequent cycles. Records synthetic `'admin'` usage
+ * alongside linked and unlinked principals.
+ *
+ * @param {number|null} cycleEpoch - Active cycle epoch ms (falls back to 0 when unseeded).
+ * @param {string} userId - Canonical Security Principal identifier.
+ * @param {object} [increments={}] - Non-negative integer deltas for each telemetry counter.
+ * @returns {Promise<void>}
+ */
+async function recordPeriodUsage(cycleEpoch, userId, increments = {}) {
+  assertNonEmptyString(userId, 'userId');
+  if (increments === null || typeof increments !== 'object' || Array.isArray(increments)) {
+    throw new Error('[Audit Error] increments must be a plain object.');
+  }
+
+  const safeEpoch = (cycleEpoch !== null && cycleEpoch !== undefined)
+    ? assertNonNegativeSafeInt(cycleEpoch, 'cycleEpoch')
+    : 0;
+
+  const anlasConsumed = assertNonNegativeSafeInt(increments.anlasConsumed ?? 0, 'anlasConsumed');
+  const v5HighGens = assertNonNegativeSafeInt(increments.v5HighGens ?? 0, 'v5HighGens');
+  const v5MediumGens = assertNonNegativeSafeInt(increments.v5MediumGens ?? 0, 'v5MediumGens');
+  const legacyImageGens = assertNonNegativeSafeInt(increments.legacyImageGens ?? 0, 'legacyImageGens');
+  const vibeEncodes = assertNonNegativeSafeInt(increments.vibeEncodes ?? 0, 'vibeEncodes');
+  const upscaleGens = assertNonNegativeSafeInt(increments.upscaleGens ?? 0, 'upscaleGens');
+  const textGens = assertNonNegativeSafeInt(increments.textGens ?? 0, 'textGens');
+
+  if (
+    anlasConsumed === 0 &&
+    v5HighGens === 0 &&
+    v5MediumGens === 0 &&
+    legacyImageGens === 0 &&
+    vibeEncodes === 0 &&
+    upscaleGens === 0 &&
+    textGens === 0
+  ) {
+    return;
+  }
+
+  await run(
+    `INSERT INTO period_usage (
+       cycle_epoch, user_id, anlas_consumed, v5_high_gens, v5_medium_gens,
+       legacy_image_gens, vibe_encodes, upscale_gens, text_gens
+     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+     ON CONFLICT(cycle_epoch, user_id) DO UPDATE SET
+       anlas_consumed = period_usage.anlas_consumed + excluded.anlas_consumed,
+       v5_high_gens = period_usage.v5_high_gens + excluded.v5_high_gens,
+       v5_medium_gens = period_usage.v5_medium_gens + excluded.v5_medium_gens,
+       legacy_image_gens = period_usage.legacy_image_gens + excluded.legacy_image_gens,
+       vibe_encodes = period_usage.vibe_encodes + excluded.vibe_encodes,
+       upscale_gens = period_usage.upscale_gens + excluded.upscale_gens,
+       text_gens = period_usage.text_gens + excluded.text_gens`,
+    [safeEpoch, userId, anlasConsumed, v5HighGens, v5MediumGens, legacyImageGens, vibeEncodes, upscaleGens, textGens]
+  );
 }
 
 /**
@@ -1736,6 +2009,217 @@ function extractDescriptorFromBuffer(buffer, contentType = null) {
       } catch (_) {
         return null;
       }
+    }
+  }
+
+  return null;
+}
+
+/**
+ * Decodes a Base64 (or data URI) image prefix safely, expanding the scan budget up to ~2MB
+ * for JPEGs carrying large EXIF/ICC/XMP metadata headers before SOF0..SOF15.
+ *
+ * @param {string} rawImageStr - Raw Base64 string or data URI.
+ * @returns {{ width: number, height: number, format: string }|null}
+ */
+function extractDimensionsFromBase64Image(rawImageStr) {
+  if (typeof rawImageStr !== 'string') return null;
+  const trimmed = rawImageStr.trim();
+  const commaIdx = trimmed.startsWith('data:image/') ? trimmed.indexOf(',') : -1;
+  const cleanB64 = (commaIdx !== -1 ? trimmed.slice(commaIdx + 1) : trimmed).replace(/\s+/g, '');
+  if (cleanB64.length === 0) return null;
+
+  const fastLen = Math.min(cleanB64.length, BASE64_FAST_SCAN_CHARS);
+  const alignedFast = fastLen - (fastLen % 4);
+  if (alignedFast > 0) {
+    const dims = extractImageDimensionsFromBuffer(Buffer.from(cleanB64.slice(0, alignedFast), 'base64'));
+    if (dims) return dims;
+  }
+
+  if (cleanB64.startsWith('/9j/') && cleanB64.length > BASE64_FAST_SCAN_CHARS) {
+    const jpegLen = Math.min(cleanB64.length, BASE64_JPEG_SCAN_CHARS);
+    const alignedJpeg = jpegLen - (jpegLen % 4);
+    if (alignedJpeg > alignedFast) {
+      return extractImageDimensionsFromBuffer(Buffer.from(cleanB64.slice(0, alignedJpeg), 'base64'));
+    }
+  }
+
+  return null;
+}
+
+/**
+ * Extracts authoritative intrinsic image dimensions and optional JSON metadata
+ * from an `/ai/upscale` payload (supporting both NovelAI's live `multipart/form-data`
+ * wire format `{ image: <binary>, request: <json> }` and direct JSON base64 payloads).
+ * Zero-copy inspects binary image slices directly without truncating JPEGs carrying >64KB EXIF.
+ *
+ * @param {Buffer} buffer - Raw accumulated request buffer.
+ * @param {string|null} [contentType=null] - Inbound HTTP Content-Type header string.
+ * @returns {{ width: number, height: number, format: string, jsonWidth: number|null, jsonHeight: number|null, model: string|null, scale: number|null }|null}
+ */
+function extractUpscaleParametersFromRawBody(buffer, contentType = null) {
+  if (!buffer || !Buffer.isBuffer(buffer) || buffer.length === 0) return null;
+
+  const boundary = extractMultipartBoundary(buffer, contentType);
+
+  if (boundary) {
+    const delimiter = Buffer.from(`--${boundary}`);
+    let partSearchOffset = 0;
+    let imageDims = null;
+    let requestJson = null;
+
+    while (partSearchOffset < buffer.length) {
+      const boundaryIdx = buffer.indexOf(delimiter, partSearchOffset);
+      if (boundaryIdx === -1) break;
+
+      if (boundaryIdx > 0 && buffer[boundaryIdx - 1] !== 0x0A) {
+        partSearchOffset = boundaryIdx + 1;
+        continue;
+      }
+
+      let cursor = boundaryIdx + delimiter.length;
+      let isClosing = false;
+      if (cursor + 1 < buffer.length && buffer[cursor] === 0x2D && buffer[cursor + 1] === 0x2D) {
+        isClosing = true;
+        cursor += 2;
+      }
+
+      while (cursor < buffer.length && (buffer[cursor] === 0x20 || buffer[cursor] === 0x09)) {
+        cursor++;
+      }
+
+      if (cursor < buffer.length && buffer[cursor] === 0x0D) cursor++;
+      if (cursor < buffer.length && buffer[cursor] === 0x0A) cursor++;
+
+      if (isClosing) break;
+
+      const partHeaderStart = cursor;
+      const maxHeaderScan = Math.min(buffer.length, partHeaderStart + 4096);
+      const headerWindow = buffer.subarray(partHeaderStart, maxHeaderScan);
+
+      let headerEnd = -1;
+      let headerDelimLen = 0;
+
+      const crlfEnd = headerWindow.indexOf(NEEDLE_CRLF_CRLF);
+      const lfEnd = headerWindow.indexOf(NEEDLE_LF_LF);
+
+      if (crlfEnd !== -1 && lfEnd !== -1) {
+        if (crlfEnd <= lfEnd) {
+          headerEnd = partHeaderStart + crlfEnd;
+          headerDelimLen = 4;
+        } else {
+          headerEnd = partHeaderStart + lfEnd;
+          headerDelimLen = 2;
+        }
+      } else if (crlfEnd !== -1) {
+        headerEnd = partHeaderStart + crlfEnd;
+        headerDelimLen = 4;
+      } else if (lfEnd !== -1) {
+        headerEnd = partHeaderStart + lfEnd;
+        headerDelimLen = 2;
+      }
+
+      if (headerEnd === -1) {
+        partSearchOffset = boundaryIdx + delimiter.length;
+        continue;
+      }
+
+      const partHeaderText = buffer.subarray(partHeaderStart, headerEnd).toString('utf8');
+      const bodyStart = headerEnd + headerDelimLen;
+
+      if (!imageDims && (PART_NAME_IMAGE_REGEX.test(partHeaderText) || PART_CONTENT_TYPE_IMAGE_REGEX.test(partHeaderText))) {
+        let searchBoundaryFrom = bodyStart;
+        while (searchBoundaryFrom < buffer.length) {
+          const nextBoundaryIdx = buffer.indexOf(delimiter, searchBoundaryFrom);
+          if (nextBoundaryIdx === -1) break;
+
+          if (nextBoundaryIdx > 0 && buffer[nextBoundaryIdx - 1] !== 0x0A) {
+            searchBoundaryFrom = nextBoundaryIdx + 1;
+            continue;
+          }
+
+          let bodyEnd = nextBoundaryIdx;
+          if (bodyEnd > bodyStart && buffer[bodyEnd - 1] === 0x0A) {
+            bodyEnd--;
+            if (bodyEnd > bodyStart && buffer[bodyEnd - 1] === 0x0D) {
+              bodyEnd--;
+            }
+          }
+
+          if (bodyEnd > bodyStart) {
+            // Zero-copy subarray scan preserves full JPEG EXIF/ICC headers without truncation
+            imageDims = extractImageDimensionsFromBuffer(buffer.subarray(bodyStart, bodyEnd));
+            partSearchOffset = nextBoundaryIdx;
+          }
+          break;
+        }
+      } else if (!requestJson && PART_NAME_REQUEST_REGEX.test(partHeaderText)) {
+        let searchBoundaryFrom = bodyStart;
+        while (searchBoundaryFrom < buffer.length) {
+          const nextBoundaryIdx = buffer.indexOf(delimiter, searchBoundaryFrom);
+          if (nextBoundaryIdx === -1) break;
+
+          if (nextBoundaryIdx > 0 && buffer[nextBoundaryIdx - 1] !== 0x0A) {
+            searchBoundaryFrom = nextBoundaryIdx + 1;
+            continue;
+          }
+
+          let jsonEnd = nextBoundaryIdx;
+          if (jsonEnd > bodyStart && buffer[jsonEnd - 1] === 0x0A) {
+            jsonEnd--;
+            if (jsonEnd > bodyStart && buffer[jsonEnd - 1] === 0x0D) {
+              jsonEnd--;
+            }
+          }
+
+          const sliceLen = jsonEnd - bodyStart;
+          if (sliceLen > 0 && sliceLen <= MAX_JSON_PART_BYTES) {
+            try {
+              const parsed = JSON.parse(buffer.subarray(bodyStart, jsonEnd).toString('utf8').trim());
+              if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+                requestJson = parsed;
+                partSearchOffset = nextBoundaryIdx;
+                break;
+              }
+            } catch (_) {}
+          }
+          searchBoundaryFrom = nextBoundaryIdx + delimiter.length;
+        }
+      }
+
+      if (partSearchOffset <= boundaryIdx) {
+        partSearchOffset = boundaryIdx + delimiter.length;
+      }
+    }
+
+    if (imageDims) {
+      return {
+        width: imageDims.width,
+        height: imageDims.height,
+        format: imageDims.format,
+        jsonWidth: parseOptionalInt(requestJson?.width),
+        jsonHeight: parseOptionalInt(requestJson?.height),
+        model: typeof requestJson?.model === 'string' ? requestJson.model.trim() : null,
+        scale: parseOptionalInt(requestJson?.scale)
+      };
+    }
+    return null;
+  }
+
+  // Direct JSON payload fallback ({ image: "<base64|dataUri>", width?, height?, scale? })
+  const descriptor = extractDescriptorFromBuffer(buffer, contentType);
+  if (descriptor && descriptor.json && typeof descriptor.json.image === 'string') {
+    const dims = extractDimensionsFromBase64Image(descriptor.json.image);
+    if (dims) {
+      return {
+        width: dims.width,
+        height: dims.height,
+        format: dims.format,
+        jsonWidth: parseOptionalInt(descriptor.json.width),
+        jsonHeight: parseOptionalInt(descriptor.json.height),
+        model: typeof descriptor.json.model === 'string' ? descriptor.json.model.trim() : null,
+        scale: parseOptionalInt(descriptor.json.scale)
+      };
     }
   }
 
@@ -2284,6 +2768,7 @@ module.exports = {
   isV5MediumModel,
   calculateAnlasCost,
   calculateAnlasCostDetails,
+  calculateUpscaleAnlasCost,
   calculateAvailableBalance,
   evaluateAnlasReset,
   evaluateV5Accrual,
@@ -2291,8 +2776,12 @@ module.exports = {
   commitAnlasDebit,
   commitV5Debit,
   recordSurplusV5Usage,
+  recordSubscriptionPeriod,
+  recordPeriodUsage,
   adjustUserBalances,
   reconcileUserDebt,
+  extractImageDimensionsFromBuffer,
+  extractUpscaleParametersFromRawBody,
   extractParametersFromRawBody,
   validateVibeEncodePayload,
   sanitizeObjectForLogging,
@@ -2303,6 +2792,7 @@ module.exports = {
   MAX_JSON_PART_BYTES,
   MAX_NOVELAI_PIXELS,
   MAX_NOVELAI_STEPS,
+  UPSCALE_COST_BUCKETS,
   TELEMETRY_PROMPT_KEYS,
   DAY_MS,
   THIRTY_DAYS_MS

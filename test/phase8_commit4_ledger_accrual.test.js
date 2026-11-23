@@ -6,7 +6,9 @@
  *    - Verifies auditEngine.js imports strictly Level 0 (./database) and Level 1 (./config),
  *      with zero upward dependency on queueManager.js.
  * 2. Happy Path: V5 Lazy Accrual Engine (`evaluateV5Accrual`):
- *    - Accrues daily NCP shares based on proportional tier weights up to v5MaxBankDays (3-day ceiling).
+ *    - Accrues daily NCP shares based on proportional tier weights (including implicit cluster
+ *      Admin operator weight when no approved Admin row exists) up to v5MaxBankDays (3-day ceiling).
+ *    - Clamps bloated pre-existing balances down to maxBankNcp immediately even within <24h.
  *    - Sub-day (<24h) evaluations do not double-accrue or reset v5_daily_consumed, while still returning
  *      accurate daily_share_ncp, max_bank_ncp, and total_cluster_weight for downstream HUD telemetry.
  *    - Preserves sub-day remainder drift across multi-day evaluations.
@@ -25,7 +27,7 @@
  *    - User with 3 approved devices counts once in W_all (zero weight inflation).
  *    - Banned and unapproved users contribute 0 weight to W_all and accrue 0 NCP.
  *    - Metered principals do not stamp v5_last_accrual_epoch, allowing immediate accrual on upgrade,
- *      while downgrading to Metered caps prior banked NCP to 0.
+ *      while downgrading to Metered clamps prior banked NCP to 0 immediately.
  *    - Temporary revocation or ban preserves existing banked V5 NCP and leaves v5_last_accrual_epoch untouched.
  *    - Unapproved onboarding polling does not poison v5_last_accrual_epoch prior to approval.
  *    - Division-by-zero protection when total cluster weight is 0.
@@ -139,26 +141,34 @@ test('Phase 8 Commit 4: Financial Ledger, Dynamic Balance Derivation & Temporal 
   // ---------------------------------------------------------------------------
   // 2. HAPPY PATH: V5 LAZY ACCRUAL & 3-DAY BANKING CEILING
   // ---------------------------------------------------------------------------
-  await t.test('Happy Path: evaluateV5Accrual credits integer NCP shares up to 3-day cap and clamps nominalDailyCompute', async () => {
-    // Seed Normal (weight 2) and Low (weight 1) approved users => totalWeight = 3
+  await t.test('Happy Path: evaluateV5Accrual includes implicit Admin weight, clamps stale bloat, and clamps nominalDailyCompute', async () => {
+    // Seed Normal (weight 2) and Low (weight 1) approved users + implicit Admin (weight 4) => totalWeight = 7
     // Nominal Daily NCP = floor(190.0 * 18) = 3420 NCP
-    // Normal daily share = floor(3420 * (2 / 3)) = 2280 NCP; 3-day cap = 6840 NCP
-    // Low daily share = floor(3420 * (1 / 3)) = 1140 NCP; 3-day cap = 3420 NCP
+    // Normal daily share = floor(3420 * (2 / 7)) = 977 NCP; 3-day cap = 2931 NCP
+    // Low daily share = floor(3420 * (1 / 7)) = 488 NCP; 3-day cap = 1464 NCP
     await run("INSERT INTO users (user_id, priority_tier, banned) VALUES ('u_norm_1', 'Normal', 0)");
     await run("INSERT INTO devices (browser_id, user_id, device_secret, approved) VALUES ('b_norm_1', 'u_norm_1', 's1', 1)");
 
-    await run("INSERT INTO users (user_id, priority_tier, banned) VALUES ('u_low_1', 'Low', 0)");
+    await run("INSERT INTO users (user_id, priority_tier, banned, v5_banked_balance, v5_last_accrual_epoch) VALUES ('u_low_1', 'Low', 0, 11088, ?)", [1760000000000]);
     await run("INSERT INTO devices (browser_id, user_id, device_secret, approved) VALUES ('b_low_1', 'u_low_1', 's2', 1)");
 
     const t0 = 1760000000000;
 
-    // Initial accrual -> 1 day share (2280 NCP)
+    // Bloated u_low_1 (11088 NCP) must clamp down immediately to 1464 NCP even within < 24h!
+    const clampedLow = await evaluateV5Accrual('u_low_1', { now: t0 + 3600000 });
+    assert.strictEqual(clampedLow.accrual_applied, false);
+    assert.strictEqual(clampedLow.total_cluster_weight, 7);
+    assert.strictEqual(clampedLow.daily_share_ncp, 488);
+    assert.strictEqual(clampedLow.max_bank_ncp, 1464);
+    assert.strictEqual(clampedLow.v5_banked_balance, 1464, 'Stale over-allocated balance must clamp down immediately');
+
+    // Initial accrual -> 1 day share (977 NCP)
     const initNorm = await evaluateV5Accrual('u_norm_1', { now: t0 });
     assert.strictEqual(initNorm.accrual_applied, true);
-    assert.strictEqual(initNorm.total_cluster_weight, 3);
-    assert.strictEqual(initNorm.daily_share_ncp, 2280);
-    assert.strictEqual(initNorm.max_bank_ncp, 6840);
-    assert.strictEqual(initNorm.v5_banked_balance, 2280);
+    assert.strictEqual(initNorm.total_cluster_weight, 7);
+    assert.strictEqual(initNorm.daily_share_ncp, 977);
+    assert.strictEqual(initNorm.max_bank_ncp, 2931);
+    assert.strictEqual(initNorm.v5_banked_balance, 977);
     assert.strictEqual(Number.isInteger(initNorm.v5_banked_balance), true);
 
     // Sub-day check (12h later): must NOT accrue and must preserve v5_daily_consumed,
@@ -166,39 +176,35 @@ test('Phase 8 Commit 4: Financial Ledger, Dynamic Balance Derivation & Temporal 
     await run("UPDATE users SET v5_daily_consumed = 4 WHERE user_id = 'u_norm_1'");
     const subDay = await evaluateV5Accrual('u_norm_1', { now: t0 + (DAY_MS / 2) });
     assert.strictEqual(subDay.accrual_applied, false);
-    assert.strictEqual(subDay.v5_banked_balance, 2280);
+    assert.strictEqual(subDay.v5_banked_balance, 977);
     assert.strictEqual(subDay.v5_daily_consumed, 4);
-    assert.strictEqual(subDay.total_cluster_weight, 3, 'Sub-day read must return real cluster weight');
-    assert.strictEqual(subDay.daily_share_ncp, 2280, 'Sub-day read must return real daily share');
-    assert.strictEqual(subDay.max_bank_ncp, 6840, 'Sub-day read must return real max bank cap');
+    assert.strictEqual(subDay.total_cluster_weight, 7, 'Sub-day read must return real cluster weight');
+    assert.strictEqual(subDay.daily_share_ncp, 977, 'Sub-day read must return real daily share');
+    assert.strictEqual(subDay.max_bank_ncp, 2931, 'Sub-day read must return real max bank cap');
 
-    // 1.5 days after t0 -> accrues 1 day (total 4560), resets daily_consumed, preserves 0.5 day remainder
+    // 1.5 days after t0 -> accrues 1 day (total 1954), resets daily_consumed, preserves 0.5 day remainder
     const day15 = await evaluateV5Accrual('u_norm_1', { now: t0 + Math.floor(1.5 * DAY_MS) });
     assert.strictEqual(day15.accrual_applied, true);
-    assert.strictEqual(day15.v5_banked_balance, 4560);
+    assert.strictEqual(day15.v5_banked_balance, 1954);
     assert.strictEqual(day15.v5_daily_consumed, 0);
     assert.strictEqual(day15.v5_last_accrual_epoch, t0 + DAY_MS, 'Must preserve sub-day remainder');
 
-    // Jump 10 days ahead -> capped strictly at 3-day ceiling (6840 NCP)
+    // Jump 10 days ahead -> capped strictly at 3-day ceiling (2931 NCP)
     const day10 = await evaluateV5Accrual('u_norm_1', { now: t0 + (10 * DAY_MS) });
     assert.strictEqual(day10.accrual_applied, true);
-    assert.strictEqual(day10.v5_banked_balance, 6840, 'Balance must cap at 3-day ceiling');
-
-    // Low user check
-    const initLow = await evaluateV5Accrual('u_low_1', { now: t0 });
-    assert.strictEqual(initLow.v5_banked_balance, 1140);
+    assert.strictEqual(day10.v5_banked_balance, 2931, 'Balance must cap at 3-day ceiling');
 
     // nominalDailyCompute lower/upper clamping ([100.0, 300.0]) and fail-closed rejection
     await run("INSERT INTO users (user_id, priority_tier, banned) VALUES ('u_clamp_low', 'Low', 0)");
     await run("INSERT INTO devices (browser_id, user_id, device_secret, approved) VALUES ('b_clamp_low', 'u_clamp_low', 'scl', 1)");
-    // totalWeight = 2 + 1 + 1 = 4; Low weight = 1
-    // nominalDailyCompute = 50 -> clamps to 100.0 -> 1800 NCP * (1/4) = 450 NCP
+    // totalWeight = 4 (Admin) + 2 + 1 + 1 = 8; Low weight = 1
+    // nominalDailyCompute = 50 -> clamps to 100.0 -> 1800 NCP * (1/8) = 225 NCP
     const clampedMin = await evaluateV5Accrual('u_clamp_low', { now: t0, nominalDailyCompute: 50 });
-    assert.strictEqual(clampedMin.daily_share_ncp, 450, 'nominalDailyCompute < 100 must clamp to 100.0');
+    assert.strictEqual(clampedMin.daily_share_ncp, 225, 'nominalDailyCompute < 100 must clamp to 100.0');
 
-    // nominalDailyCompute = 999 -> clamps to 300.0 -> 5400 NCP * (1/4) = 1350 NCP
+    // nominalDailyCompute = 999 -> clamps to 300.0 -> 5400 NCP * (1/8) = 675 NCP
     const clampedMax = await evaluateV5Accrual('u_clamp_low', { now: t0 + DAY_MS, nominalDailyCompute: 999 });
-    assert.strictEqual(clampedMax.daily_share_ncp, 1350, 'nominalDailyCompute > 300 must clamp to 300.0');
+    assert.strictEqual(clampedMax.daily_share_ncp, 675, 'nominalDailyCompute > 300 must clamp to 300.0');
 
     for (const badCompute of [0, -10, NaN, Infinity, '190', false, []]) {
       await assert.rejects(
@@ -226,7 +232,7 @@ test('Phase 8 Commit 4: Financial Ledger, Dynamic Balance Derivation & Temporal 
     await run("INSERT INTO users (user_id, priority_tier, banned) VALUES ('u_norm_b', 'Normal', 0)");
     await run("INSERT INTO devices (browser_id, user_id, device_secret, approved) VALUES ('d_nb1', 'u_norm_b', 'snb1', 1)");
 
-    // User C (Normal, weight 2) -> totalWeight = 7 (3420 * 3 / 7 = 1465.714...)
+    // User C (Normal, weight 2) + implicit Admin (weight 4) -> totalWeight = 11
     await run("INSERT INTO users (user_id, priority_tier, banned) VALUES ('u_norm_c', 'Normal', 0)");
     await run("INSERT INTO devices (browser_id, user_id, device_secret, approved) VALUES ('d_nc1', 'u_norm_c', 'snc1', 1)");
 
@@ -245,10 +251,10 @@ test('Phase 8 Commit 4: Financial Ledger, Dynamic Balance Derivation & Temporal 
     const now = 1761000000000;
     const resMulti = await evaluateV5Accrual('u_multi', { now });
 
-    assert.strictEqual(resMulti.total_cluster_weight, 7, 'Multi-device user must count once; banned/unapproved excluded');
-    // floor(3420 * 3 / 7) = floor(1465.714285...) = 1465
-    assert.strictEqual(resMulti.daily_share_ncp, 1465);
-    assert.strictEqual(resMulti.max_bank_ncp, 1465 * 3);
+    assert.strictEqual(resMulti.total_cluster_weight, 11, 'Multi-device user must count once; implicit Admin counted; banned/unapproved excluded');
+    // floor(3420 * 3 / 11) = floor(932.7272...) = 932
+    assert.strictEqual(resMulti.daily_share_ncp, 932);
+    assert.strictEqual(resMulti.max_bank_ncp, 932 * 3);
     assert.strictEqual(Number.isInteger(resMulti.v5_banked_balance), true, 'SQLite balance must be strict integer');
 
     // Banned user must not accrue AND must not have pre-existing bank wiped
@@ -289,10 +295,10 @@ test('Phase 8 Commit 4: Financial Ledger, Dynamic Balance Derivation & Temporal 
     assert.strictEqual(resUpgraded.accrual_applied, true, 'Upgraded Metered user must accrue immediately without 24h wait');
     assert.ok(resUpgraded.v5_banked_balance > 0);
 
-    // Downgrading back to Metered must cap existing banked NCP to 0 after 24h
+    // Downgrading back to Metered must cap existing banked NCP to 0 immediately
     await run("UPDATE users SET priority_tier = 'Metered' WHERE user_id = 'u_metered'");
-    const resDowngraded = await evaluateV5Accrual('u_metered', { now: now + 10000 + DAY_MS });
-    assert.strictEqual(resDowngraded.v5_banked_balance, 0, 'Downgrading to Metered must cap banked balance to 0');
+    const resDowngraded = await evaluateV5Accrual('u_metered', { now: now + 20000 });
+    assert.strictEqual(resDowngraded.v5_banked_balance, 0, 'Downgrading to Metered must clamp banked balance to 0 immediately');
 
     // Division-by-zero protection when zero approved active users exist
     await run('UPDATE devices SET approved = 0');
@@ -544,7 +550,7 @@ test('Phase 8 Commit 4: Financial Ledger, Dynamic Balance Derivation & Temporal 
     );
     await run("INSERT INTO devices (browser_id, user_id, device_secret, approved) VALUES ('d_race', 'u_race', 'srace', 1)");
 
-    // Fire 10 simultaneous V5 accruals exactly 1 day later (sole user => 3420 NCP daily share)
+    // Fire 10 simultaneous V5 accruals exactly 1 day later (Normal=2 + implicit Admin=4 = 6 => floor(3420 * 2 / 6) = 1140 NCP)
     const accrualPromises = Array.from({ length: 10 }, () => evaluateV5Accrual('u_race', { now: t0 + DAY_MS }));
     const accrualResults = await Promise.all(accrualPromises);
 
@@ -552,7 +558,7 @@ test('Phase 8 Commit 4: Financial Ledger, Dynamic Balance Derivation & Temporal 
     assert.strictEqual(appliedCount, 1, 'Exactly ONE concurrent V5 accrual must execute');
 
     const userRow = await get("SELECT v5_banked_balance FROM users WHERE user_id = 'u_race'");
-    assert.strictEqual(userRow.v5_banked_balance, 3420, 'Concurrent accrual race must not multiply balance');
+    assert.strictEqual(userRow.v5_banked_balance, 1140, 'Concurrent accrual race must not multiply balance');
 
     // Fire 10 simultaneous Anlas resets after 30 days
     const resetPromises = Array.from({ length: 10 }, () => evaluateAnlasReset('u_race', t0 + THIRTY_DAYS_MS));
