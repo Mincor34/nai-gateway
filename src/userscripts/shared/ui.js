@@ -8,7 +8,7 @@
  *    to remain visible above React modal dialogues.
  * 3. Autonomous Animation Styling: Injects isolated keyframe animations (@keyframes gwPulse)
  *    dynamically to eliminate external CSS dependencies.
- * 4. Re-exports DOM Engine and live Theme Scraper primitives for unified module ingestion.
+ * 4. Re-exports DOM Engine, Clipboard helpers, and live Theme Scraper primitives for unified module ingestion.
  */
 
 'use strict';
@@ -36,6 +36,8 @@ import {
 
 import {
   escapeHtml,
+  copyTextToClipboard,
+  attachCopyChipHandlers,
   scrapeNovelAITheme,
   ensureGuildWeaveStyles
 } from './theme.js';
@@ -60,6 +62,8 @@ export {
   initDOMObserver,
   stopDOMObserver,
   escapeHtml,
+  copyTextToClipboard,
+  attachCopyChipHandlers,
   scrapeNovelAITheme,
   ensureGuildWeaveStyles
 };

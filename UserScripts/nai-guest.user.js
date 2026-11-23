@@ -682,6 +682,9 @@
     bg0: "#13152c",
     bg1: "#1a1d3a",
     bg2: "#23274c",
+    cardBorder: "rgba(255, 255, 255, 0.14)",
+    inputBg: "#13152c",
+    inputBorder: "rgba(255, 255, 255, 0.24)",
     border: "rgba(255, 255, 255, 0.14)",
     borderStrong: "rgba(255, 255, 255, 0.24)",
     text: "#f5f3c2",
@@ -698,6 +701,76 @@
   function escapeHtml(value) {
     if (value === null || value === void 0) return "";
     return String(value).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;").replace(/'/g, "&#39;");
+  }
+  async function copyTextToClipboard(text) {
+    if (typeof text !== "string" || text.length === 0) return false;
+    try {
+      if (typeof navigator !== "undefined" && navigator.clipboard && typeof navigator.clipboard.writeText === "function") {
+        await navigator.clipboard.writeText(text);
+        return true;
+      }
+    } catch (_) {
+    }
+    try {
+      if (typeof document !== "undefined" && typeof document.createElement === "function" && typeof document.execCommand === "function") {
+        const ta = document.createElement("textarea");
+        ta.value = text;
+        ta.setAttribute("readonly", "");
+        ta.style.cssText = "position:fixed; top:0; left:0; width:1px; height:1px; opacity:0; pointer-events:none;";
+        const host = document.body || document.documentElement;
+        if (host && typeof host.appendChild === "function") {
+          host.appendChild(ta);
+          if (typeof ta.focus === "function") ta.focus({ preventScroll: true });
+          if (typeof ta.select === "function") ta.select();
+          if (typeof ta.setSelectionRange === "function") ta.setSelectionRange(0, text.length);
+          const ok = Boolean(document.execCommand("copy"));
+          ta.remove();
+          if (ok) return true;
+        }
+      }
+    } catch (_) {
+    }
+    return false;
+  }
+  function attachCopyChipHandlers(rootEl) {
+    if (!rootEl || typeof rootEl.querySelectorAll !== "function") return;
+    const chips = rootEl.querySelectorAll(".gw-copy-chip[data-copy-id]");
+    for (const chip of chips) {
+      const fullId = chip.getAttribute("data-copy-id") || "";
+      if (!fullId) continue;
+      const originalLabel = chip.textContent || "";
+      let resetTimer = null;
+      let copySeq = 0;
+      const handleCopy = async (e) => {
+        if (e && typeof e.preventDefault === "function") e.preventDefault();
+        if (e && typeof e.stopPropagation === "function") e.stopPropagation();
+        const seq = ++copySeq;
+        if (resetTimer) {
+          clearTimeout(resetTimer);
+          resetTimer = null;
+        }
+        const copied = await copyTextToClipboard(fullId);
+        if (seq !== copySeq) return;
+        chip.textContent = copied ? "Copied!" : "Copy failed";
+        if (typeof setTimeout === "function") {
+          if (resetTimer) {
+            clearTimeout(resetTimer);
+            resetTimer = null;
+          }
+          resetTimer = setTimeout(() => {
+            if (seq !== copySeq) return;
+            resetTimer = null;
+            chip.textContent = originalLabel;
+          }, 1500);
+        }
+      };
+      chip.onclick = handleCopy;
+      chip.onkeydown = (e) => {
+        if (e && (e.key === "Enter" || e.key === " ")) {
+          handleCopy(e);
+        }
+      };
+    }
   }
   function parseCssColor(colorStr) {
     if (typeof colorStr !== "string") return null;
@@ -743,6 +816,27 @@
   function isSolidSurface(parsed) {
     return Boolean(parsed && parsed.a >= 0.75);
   }
+  function isHiddenStyle(st) {
+    if (!st) return true;
+    return st.display === "none" || st.visibility === "hidden" || st.opacity === "0";
+  }
+  function isElementVisible(node, safeGetStyle) {
+    if (!node) return false;
+    const ownStyle = safeGetStyle(node);
+    if (isHiddenStyle(ownStyle)) return false;
+    let cur = node.parentElement;
+    let hops = 0;
+    while (cur && hops < 16) {
+      const st = safeGetStyle(cur);
+      if (st && (st.display === "none" || st.opacity === "0")) {
+        return false;
+      }
+      if (cur === document.body || cur === document.documentElement) break;
+      cur = cur.parentElement;
+      hops++;
+    }
+    return true;
+  }
   function relativeLuminance(rgb) {
     return (0.2126 * rgb.r + 0.7152 * rgb.g + 0.0722 * rgb.b) / 255;
   }
@@ -752,6 +846,19 @@
   function withAlpha(rgb, alpha) {
     return `rgba(${rgb.r}, ${rgb.g}, ${rgb.b}, ${alpha})`;
   }
+  function compositeOver(fg, bg) {
+    if (!fg) return null;
+    if (fg.a >= 0.99 || !bg) {
+      return { r: fg.r, g: fg.g, b: fg.b, a: 1 };
+    }
+    const a = Math.max(0, Math.min(1, fg.a));
+    return {
+      r: clampByte(bg.r * (1 - a) + fg.r * a),
+      g: clampByte(bg.g * (1 - a) + fg.g * a),
+      b: clampByte(bg.b * (1 - a) + fg.b * a),
+      a: 1
+    };
+  }
   function isInsideGuildWeave(node) {
     if (!node) return false;
     if (node.id && (node.id.startsWith("gw-") || node.id.startsWith("vps-"))) return true;
@@ -760,11 +867,21 @@
     }
     return false;
   }
-  function collectAncestors(el, maxHops = 6, { excludeRoot = false } = {}) {
+  function nodeContainsAny(container, targets) {
+    if (!container || typeof container.contains !== "function") return false;
+    for (const target of targets) {
+      if (target && target !== container && container.contains(target)) {
+        return true;
+      }
+    }
+    return false;
+  }
+  function collectAncestors(el, maxHops = 6, { excludeRoot = false, stopAt = null } = {}) {
     const out = [];
     let cur = el ? el.parentElement : null;
     let steps = 0;
     while (cur && steps < maxHops) {
+      if (stopAt && cur === stopAt) break;
       if (cur === document.body || cur === document.documentElement) {
         if (!excludeRoot) out.push(cur);
         break;
@@ -775,26 +892,116 @@
     }
     return out;
   }
-  function extractSolidBackground(st) {
-    if (!st) return null;
+  function extractSurfaceColor(st, backdropParsed = null, { allowTranslucent = false } = {}) {
+    if (isHiddenStyle(st)) return null;
     const bgCol = st.backgroundColor;
     const parsedBg = parseCssColor(bgCol);
-    if (isSolidSurface(parsedBg)) {
-      return { color: bgCol, parsed: parsedBg };
-    }
     const bgImg = st.backgroundImage;
     if (typeof bgImg === "string" && bgImg !== "none" && bgImg.includes("gradient")) {
       const stopMatches = bgImg.match(/rgba?\([^)]+\)|#[0-9a-fA-F]{3,8}/g);
       if (stopMatches) {
+        let firstTranslucentStop = null;
         for (const stop of stopMatches) {
           const parsedStop = parseCssColor(stop);
           if (isSolidSurface(parsedStop)) {
             return { color: `rgb(${parsedStop.r}, ${parsedStop.g}, ${parsedStop.b})`, parsed: parsedStop };
           }
+          if (!firstTranslucentStop && parsedStop && parsedStop.a >= 0.03) {
+            firstTranslucentStop = parsedStop;
+          }
+        }
+        if (firstTranslucentStop) {
+          const base = isSolidSurface(parsedBg) ? parsedBg : allowTranslucent ? backdropParsed : null;
+          if (base) {
+            const comp = compositeOver(firstTranslucentStop, base);
+            return { color: `rgb(${comp.r}, ${comp.g}, ${comp.b})`, parsed: comp };
+          }
         }
       }
     }
+    if (isSolidSurface(parsedBg)) {
+      return { color: bgCol, parsed: parsedBg };
+    }
+    if (allowTranslucent && parsedBg && parsedBg.a >= 0.03 && backdropParsed) {
+      const comp = compositeOver(parsedBg, backdropParsed);
+      return { color: `rgb(${comp.r}, ${comp.g}, ${comp.b})`, parsed: comp };
+    }
     return null;
+  }
+  function extractBoxShadowBorderRing(boxShadow) {
+    if (typeof boxShadow !== "string" || boxShadow === "none" || !boxShadow.trim()) {
+      return null;
+    }
+    const layers = [];
+    let current = "";
+    let parenDepth = 0;
+    for (let i = 0; i < boxShadow.length; i++) {
+      const ch = boxShadow[i];
+      if (ch === "(") parenDepth++;
+      else if (ch === ")") parenDepth = Math.max(0, parenDepth - 1);
+      if (ch === "," && parenDepth === 0) {
+        if (current.trim()) layers.push(current.trim());
+        current = "";
+      } else {
+        current += ch;
+      }
+    }
+    if (current.trim()) layers.push(current.trim());
+    for (const layer of layers) {
+      const colorMatch = layer.match(/rgba?\([^)]+\)|#[0-9a-fA-F]{3,8}/);
+      if (!colorMatch) continue;
+      const colorStr = colorMatch[0];
+      const parsed = parseCssColor(colorStr);
+      if (!isOpaque(parsed)) continue;
+      const remainder = layer.replace(colorStr, "").replace(/\binset\b/gi, "").trim();
+      const lengths = remainder.match(/-?\d+(?:\.\d+)?(?:px|rem|em)?/gi);
+      if (!lengths || lengths.length < 4) continue;
+      const x = parseFloat(lengths[0]);
+      const y = parseFloat(lengths[1]);
+      const blur = parseFloat(lengths[2]);
+      const spread = parseFloat(lengths[3]);
+      if (x === 0 && y === 0 && blur === 0 && spread > 0) {
+        return { color: colorStr, parsed };
+      }
+    }
+    return null;
+  }
+  function extractElementBorderColor(st) {
+    if (isHiddenStyle(st)) return null;
+    const sides = [
+      { w: st.borderTopWidth, s: st.borderTopStyle, c: st.borderTopColor },
+      { w: st.borderRightWidth, s: st.borderRightStyle, c: st.borderRightColor },
+      { w: st.borderBottomWidth, s: st.borderBottomStyle, c: st.borderBottomColor },
+      { w: st.borderLeftWidth, s: st.borderLeftStyle, c: st.borderLeftColor }
+    ];
+    for (const side of sides) {
+      const bw = parseFloat(side.w || "1");
+      const styleOk = !side.s || side.s !== "none";
+      if ((Number.isNaN(bw) || bw > 0) && styleOk) {
+        const parsed = parseCssColor(side.c);
+        if (isOpaque(parsed)) {
+          return { color: side.c, parsed };
+        }
+      }
+    }
+    if (st.borderColor) {
+      const bw = parseFloat(st.borderTopWidth || "1");
+      const styleOk = !st.borderTopStyle || st.borderTopStyle !== "none";
+      if ((Number.isNaN(bw) || bw > 0) && styleOk) {
+        const parsed = parseCssColor(st.borderColor);
+        if (isOpaque(parsed)) {
+          return { color: st.borderColor, parsed };
+        }
+      }
+    }
+    const ow = parseFloat(st.outlineWidth || "0");
+    if ((!st.outlineStyle || st.outlineStyle !== "none") && (Number.isNaN(ow) || ow > 0)) {
+      const parsedOut = parseCssColor(st.outlineColor);
+      if (isOpaque(parsedOut)) {
+        return { color: st.outlineColor, parsed: parsedOut };
+      }
+    }
+    return extractBoxShadowBorderRing(st.boxShadow);
   }
   function scrapeNovelAITheme() {
     const palette = { ...DEFAULT_PALETTE };
@@ -817,7 +1024,12 @@
       const modelRow = typeof document.querySelector === "function" ? document.querySelector(".image-gen-model-mode-row") : null;
       const genBtn = typeof document.querySelector === "function" ? document.querySelector(".image-gen-generate-button") : null;
       const menuBtn = typeof document.querySelector === "function" ? document.querySelector('button[aria-label="menu"]') : null;
-      const promptNode = typeof document.querySelector === "function" ? document.querySelector("textarea") || document.querySelector('[contenteditable="true"]') : null;
+      const charPromptsEl = typeof document.querySelector === "function" ? document.querySelector(".image-gen-character-prompts") : null;
+      const charPromptsHeader = typeof document.querySelector === "function" ? document.querySelector(".image-gen-character-prompts-header") : null;
+      const promptMainEl = typeof document.querySelector === "function" ? document.querySelector(".image-gen-prompt-main") : null;
+      const promptBoxEl = (promptMainEl && typeof promptMainEl.querySelector === "function" ? promptMainEl.querySelector('[data-prompt-input="true"]') || promptMainEl.querySelector(".prompt-input-box-prompt") : null) || (typeof document.querySelector === "function" ? document.querySelector('[data-prompt-input="true"]') || document.querySelector(".prompt-input-box-prompt") : null);
+      const boxEditorNode = promptBoxEl && typeof promptBoxEl.querySelector === "function" ? promptBoxEl.querySelector('[contenteditable="true"], textarea') : null;
+      const promptNode = boxEditorNode || (promptMainEl && typeof promptMainEl.querySelector === "function" ? promptMainEl.querySelector('[contenteditable="true"], textarea') : null) || (typeof document.querySelector === "function" ? document.querySelector("textarea") || document.querySelector('[contenteditable="true"]') : null);
       const nextRoot = typeof document.getElementById === "function" ? document.getElementById("__next") : null;
       const topDownWrappers = [];
       const pushChain = (startNode, depth = 4) => {
@@ -843,10 +1055,10 @@
       const seenBg0 = /* @__PURE__ */ new Set();
       let bg0Parsed = null;
       for (const node of bg0Candidates) {
-        if (!node || seenBg0.has(node) || node === genBtn || node === promptNode || isInsideGuildWeave(node)) continue;
+        if (!node || seenBg0.has(node) || node === genBtn || node === promptNode || node === promptBoxEl || isInsideGuildWeave(node) || !isElementVisible(node, safeGetStyle)) continue;
         seenBg0.add(node);
         const st = safeGetStyle(node);
-        const extracted = extractSolidBackground(st);
+        const extracted = extractSurfaceColor(st, null, { allowTranslucent: false });
         if (extracted) {
           palette.bg0 = extracted.color;
           bg0Parsed = extracted.parsed;
@@ -859,6 +1071,7 @@
         palette.bg1 = shiftColor(bg0Parsed, isDark ? 8 : -8);
         palette.bg2 = shiftColor(bg0Parsed, isDark ? 16 : -16);
         palette.controlAccent = palette.bg2;
+        palette.inputBg = palette.bg0;
       }
       const textCandidates = [
         nextRoot,
@@ -873,9 +1086,8 @@
       ];
       let textParsed = null;
       for (const node of textCandidates) {
-        if (!node || isInsideGuildWeave(node)) continue;
+        if (!node || isInsideGuildWeave(node) || !isElementVisible(node, safeGetStyle)) continue;
         const st = safeGetStyle(node);
-        if (!st) continue;
         if (st.fontFamily && st.fontFamily.trim() && palette.font === DEFAULT_PALETTE.font) {
           palette.font = st.fontFamily.trim();
         }
@@ -893,41 +1105,116 @@
         palette.textMuted = withAlpha(textParsed, 0.68);
         palette.border = withAlpha(textParsed, 0.14);
         palette.borderStrong = withAlpha(textParsed, 0.24);
+        palette.cardBorder = palette.border;
+        palette.inputBorder = palette.borderStrong;
         palette.accent = palette.text;
         palette.accentText = palette.bg0;
         palette.controlAccentText = palette.text;
       }
-      const dialogNode = typeof document.querySelector === "function" ? document.querySelector('[role="dialog"]') : null;
-      const footerChildren = footerEl && footerEl.children ? Array.from(footerEl.children) : [];
-      const surfaceNodes = [
-        dialogNode,
-        promptNode,
-        ...collectAncestors(promptNode, 4, { excludeRoot: true }),
-        navRow,
-        footerEl,
-        modelRow,
-        ...collectAncestors(modelRow, 3, { excludeRoot: true }),
-        ...footerChildren
-      ];
+      const charPromptChildren = charPromptsEl && charPromptsEl.children ? Array.from(charPromptsEl.children) : [];
+      const charPromptSiblings = charPromptsEl && charPromptsEl.parentElement && charPromptsEl.parentElement.children ? Array.from(charPromptsEl.parentElement.children).filter(
+        (c) => c !== charPromptsEl && c !== promptMainEl && c !== promptBoxEl && c !== footerEl && c !== navRow && c !== modelRow && !isInsideGuildWeave(c) && !nodeContainsAny(c, [promptMainEl, footerEl, navRow, modelRow])
+      ).slice(0, 6) : [];
+      const explicitCardNodes = [
+        charPromptsEl,
+        charPromptsHeader,
+        ...charPromptChildren,
+        ...charPromptSiblings
+      ].filter(Boolean);
       let bg1Parsed = null;
-      for (const node of surfaceNodes) {
-        if (!node || node === genBtn || isInsideGuildWeave(node)) continue;
+      let foundExplicitCardBg = false;
+      for (const node of explicitCardNodes) {
+        if (!node || node === genBtn || isInsideGuildWeave(node) || !isElementVisible(node, safeGetStyle)) continue;
         const st = safeGetStyle(node);
-        const extracted = extractSolidBackground(st);
-        if (!extracted || extracted.color === palette.bg0) continue;
+        const extracted = extractSurfaceColor(st, bg0Parsed, { allowTranslucent: true });
+        if (!extracted) continue;
         const lum = relativeLuminance(extracted.parsed);
-        if (isDark ? lum < 0.35 : lum > 0.65) {
+        if (isDark ? lum < 0.45 : lum > 0.55) {
           palette.bg1 = extracted.color;
           bg1Parsed = extracted.parsed;
           palette.bg2 = shiftColor(extracted.parsed, isDark ? 10 : -10);
+          foundExplicitCardBg = true;
           break;
+        }
+      }
+      if (!foundExplicitCardBg) {
+        const dialogNode = typeof document.querySelector === "function" ? document.querySelector('[role="dialog"]') : null;
+        const fallbackCardNodes = [
+          dialogNode,
+          promptNode,
+          ...collectAncestors(promptNode, 3, { excludeRoot: true })
+        ].filter(Boolean);
+        for (const node of fallbackCardNodes) {
+          if (!node || node === genBtn || isInsideGuildWeave(node) || !isElementVisible(node, safeGetStyle)) continue;
+          const st = safeGetStyle(node);
+          const extracted = extractSurfaceColor(st, null, { allowTranslucent: false });
+          if (!extracted || extracted.color === palette.bg0) continue;
+          const lum = relativeLuminance(extracted.parsed);
+          if (isDark ? lum < 0.35 : lum > 0.65) {
+            palette.bg1 = extracted.color;
+            bg1Parsed = extracted.parsed;
+            palette.bg2 = shiftColor(extracted.parsed, isDark ? 10 : -10);
+            break;
+          }
         }
       }
       if (!bg0Parsed && bg1Parsed) {
         const bg1IsDark = relativeLuminance(bg1Parsed) < 0.5;
         palette.bg0 = shiftColor(bg1Parsed, bg1IsDark ? 10 : -10);
+        palette.inputBg = palette.bg0;
+      }
+      const promptEditorChain = [];
+      if (promptBoxEl) {
+        promptEditorChain.push(promptBoxEl);
+        if (boxEditorNode) {
+          const between = [];
+          let cur = boxEditorNode.parentElement;
+          let hops = 0;
+          while (cur && cur !== promptBoxEl && hops < 8) {
+            between.push(cur);
+            cur = cur.parentElement;
+            hops++;
+          }
+          for (let i = between.length - 1; i >= 0; i--) {
+            promptEditorChain.push(between[i]);
+          }
+          promptEditorChain.push(boxEditorNode);
+        }
+      } else if (promptNode) {
+        promptEditorChain.push(promptNode);
+        const stopNode = promptMainEl ? promptMainEl.parentElement : null;
+        const maxPromptHops = promptMainEl ? 4 : 1;
+        for (const anc of collectAncestors(promptNode, maxPromptHops, { excludeRoot: true, stopAt: stopNode })) {
+          if (anc !== nextRoot && !promptEditorChain.includes(anc) && !nodeContainsAny(anc, [charPromptsEl, footerEl, navRow])) {
+            promptEditorChain.push(anc);
+          }
+        }
+      }
+      const inputBackdrop = bg0Parsed || bg1Parsed;
+      for (const node of promptEditorChain) {
+        if (!node || node === genBtn || isInsideGuildWeave(node) || !isElementVisible(node, safeGetStyle)) continue;
+        const st = safeGetStyle(node);
+        const extracted = extractSurfaceColor(st, inputBackdrop, { allowTranslucent: true });
+        if (!extracted) continue;
+        const lum = relativeLuminance(extracted.parsed);
+        if (isDark ? lum < 0.45 : lum > 0.55) {
+          palette.inputBg = extracted.color;
+          break;
+        }
+      }
+      let foundInputBorder = false;
+      for (const node of promptEditorChain) {
+        if (!node || node === genBtn || isInsideGuildWeave(node) || !isElementVisible(node, safeGetStyle)) continue;
+        const st = safeGetStyle(node);
+        const borderInfo = extractElementBorderColor(st);
+        if (borderInfo && borderInfo.color !== palette.inputBg && borderInfo.color !== palette.bg0) {
+          palette.inputBorder = borderInfo.color;
+          foundInputBorder = true;
+          break;
+        }
       }
       let foundExplicitBorder = false;
+      let foundCardBorder = false;
       let foundExplicitControlAccent = false;
       const modelButtons = modelRow && typeof modelRow.querySelectorAll === "function" ? Array.from(modelRow.querySelectorAll("button")) : [];
       if (modelButtons.length >= 2) {
@@ -989,28 +1276,40 @@
           }
         }
       }
-      const borderPool = [
-        menuBtn,
-        ...navRow && typeof navRow.querySelectorAll === "function" ? Array.from(navRow.querySelectorAll("button, div")).slice(0, 12) : [],
-        ...modelButtons,
-        ...modelRow && typeof modelRow.querySelectorAll === "function" ? Array.from(modelRow.querySelectorAll("div, button")).slice(0, 12) : [],
-        promptNode,
-        ...collectAncestors(promptNode, 3, { excludeRoot: true }),
-        ...typeof document.querySelectorAll === "function" ? Array.from(document.querySelectorAll("input, button")).slice(0, 20) : []
-      ].filter(Boolean);
-      for (const ctrl of borderPool) {
-        if (ctrl === genBtn || isInsideGuildWeave(ctrl)) continue;
-        const st = safeGetStyle(ctrl);
-        if (!st) continue;
-        const bw = parseFloat(st.borderTopWidth || "1");
-        const borderStyleOk = !st.borderTopStyle || st.borderTopStyle !== "none";
-        const borderRaw = st.borderTopColor || st.borderColor;
-        const borderParsed = parseCssColor(borderRaw);
-        if ((Number.isNaN(bw) || bw > 0) && borderStyleOk && isOpaque(borderParsed) && borderRaw !== palette.bg0 && borderRaw !== palette.bg1) {
-          palette.borderStrong = borderRaw;
-          palette.border = withAlpha(borderParsed, 0.58);
+      for (const cardNode of explicitCardNodes) {
+        if (!cardNode || cardNode === genBtn || isInsideGuildWeave(cardNode) || !isElementVisible(cardNode, safeGetStyle)) continue;
+        const st = safeGetStyle(cardNode);
+        const borderInfo = extractElementBorderColor(st);
+        if (borderInfo && borderInfo.color !== palette.bg0 && borderInfo.color !== palette.bg1) {
+          palette.cardBorder = borderInfo.color;
+          palette.borderStrong = borderInfo.color;
+          palette.border = borderInfo.parsed.a < 0.95 ? borderInfo.color : withAlpha(borderInfo.parsed, 0.72);
+          foundCardBorder = true;
           foundExplicitBorder = true;
           break;
+        }
+      }
+      if (!foundExplicitBorder) {
+        const borderPool = [
+          menuBtn,
+          ...navRow && typeof navRow.querySelectorAll === "function" ? Array.from(navRow.querySelectorAll("button, div")).slice(0, 12) : [],
+          ...modelButtons,
+          ...modelRow && typeof modelRow.querySelectorAll === "function" ? Array.from(modelRow.querySelectorAll("div, button")).slice(0, 12) : [],
+          promptNode,
+          ...collectAncestors(promptNode, 3, { excludeRoot: true }),
+          ...typeof document.querySelectorAll === "function" ? Array.from(document.querySelectorAll("input, button")).slice(0, 20) : []
+        ].filter(Boolean);
+        for (const ctrl of borderPool) {
+          if (ctrl === genBtn || isInsideGuildWeave(ctrl) || !isElementVisible(ctrl, safeGetStyle)) continue;
+          const st = safeGetStyle(ctrl);
+          const borderInfo = extractElementBorderColor(st);
+          if (borderInfo && borderInfo.color !== palette.bg0 && borderInfo.color !== palette.bg1) {
+            palette.borderStrong = borderInfo.color;
+            palette.border = borderInfo.parsed.a < 0.95 ? borderInfo.color : withAlpha(borderInfo.parsed, 0.58);
+            if (!foundCardBorder) palette.cardBorder = borderInfo.color;
+            foundExplicitBorder = true;
+            break;
+          }
         }
       }
       const controlBgPool = [
@@ -1020,9 +1319,8 @@
         ...typeof document.querySelectorAll === "function" ? Array.from(document.querySelectorAll("input, button")).slice(0, 20) : []
       ].filter(Boolean);
       for (const ctrl of controlBgPool) {
-        if (ctrl === genBtn || isInsideGuildWeave(ctrl)) continue;
+        if (ctrl === genBtn || isInsideGuildWeave(ctrl) || !isElementVisible(ctrl, safeGetStyle)) continue;
         const st = safeGetStyle(ctrl);
-        if (!st) continue;
         const bgParsed = parseCssColor(st.backgroundColor);
         if (isOpaque(bgParsed) && st.backgroundColor !== palette.bg0 && st.backgroundColor !== palette.bg1) {
           const lum = relativeLuminance(bgParsed);
@@ -1064,6 +1362,10 @@
         const parsedBg2 = parseCssColor(palette.bg2);
         palette.borderStrong = shiftColor(parsedBg2, isDark ? 20 : -20);
         palette.border = withAlpha(parsedBg2, 0.65);
+        palette.cardBorder = palette.borderStrong;
+      }
+      if (!foundInputBorder) {
+        palette.inputBorder = palette.borderStrong;
       }
     } catch (_) {
     }
@@ -1094,6 +1396,9 @@
       --gw-bg0: var(--theme-bg0, ${theme.bg0});
       --gw-bg1: var(--theme-bg1, ${theme.bg1});
       --gw-bg2: ${theme.bg2};
+      --gw-card-border: ${theme.cardBorder || theme.borderStrong};
+      --gw-input-bg: ${theme.inputBg || theme.bg0};
+      --gw-input-border: ${theme.inputBorder || theme.borderStrong};
       --gw-border: var(--theme-bg2, ${theme.border});
       --gw-border-strong: ${theme.borderStrong};
       --gw-text: var(--theme-text, ${theme.text});
@@ -1169,7 +1474,7 @@
       padding: 4px;
       border-radius: 8px;
       background: var(--gw-bg1);
-      border: 1px solid ${theme.border};
+      border: 1px solid var(--gw-card-border);
       margin-bottom: 14px;
     }
     .gw-tab-btn {
@@ -1191,7 +1496,7 @@
     }
     .gw-card {
       background: var(--gw-bg1);
-      border: 1px solid ${theme.border};
+      border: 1px solid var(--gw-card-border);
       border-radius: 8px;
       padding: 12px 14px;
       margin-bottom: 12px;
@@ -1264,8 +1569,8 @@
       padding: 0 !important;
       box-shadow: none !important;
       border-radius: 999px;
-      background: var(--gw-bg0);
-      border: 1px solid ${theme.borderStrong};
+      background: var(--gw-input-bg);
+      border: 1px solid var(--gw-input-border);
       position: relative;
       cursor: pointer;
       transition: background 0.18s ease, border-color 0.18s ease;
@@ -1312,8 +1617,8 @@
       align-items: center;
     }
     .gw-input, .gw-select {
-      background: var(--gw-bg0);
-      border: 1px solid ${theme.borderStrong};
+      background: var(--gw-input-bg);
+      border: 1px solid var(--gw-input-border);
       color: var(--gw-text);
       padding: 7px 10px;
       font-size: 12px;
@@ -1376,11 +1681,20 @@
       display: inline-block;
       font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
       font-size: 10px;
-      padding: 1px 5px;
+      padding: 2px 6px;
       border-radius: 4px;
-      background: var(--gw-bg0);
-      border: 1px solid ${theme.border};
+      background: var(--gw-input-bg);
+      border: 1px solid var(--gw-input-border);
       color: var(--gw-text);
+    }
+    .gw-copy-chip {
+      cursor: pointer;
+      user-select: none;
+      transition: border-color 0.15s ease, opacity 0.15s ease;
+    }
+    .gw-copy-chip:hover, .gw-copy-chip:focus-visible {
+      border-color: var(--gw-accent);
+      outline: none;
     }
     .gw-details-note {
       font-size: 11px;
@@ -3308,7 +3622,7 @@
     const safeHost = escapeHtml(GM_getValue("vps_host", ""));
     const safeNick = escapeHtml(GM_getValue("device_nickname", ""));
     container.innerHTML = `
-        <div class="setup-wizard-card gw-card" style="background:var(--theme-bg1, ${theme.bg1}); padding:28px; border-radius:12px; border:1px solid var(--theme-bg2, ${theme.borderStrong}); box-shadow:0 12px 36px rgba(0,0,0,0.6); max-width:90vw; width:430px; color:var(--theme-text, ${theme.text});">
+        <div class="setup-wizard-card gw-card" style="background:var(--gw-bg1, ${theme.bg1}); padding:28px; border-radius:12px; border:1px solid var(--gw-card-border, ${theme.cardBorder || theme.borderStrong}); box-shadow:0 12px 36px rgba(0,0,0,0.6); max-width:90vw; width:430px; color:var(--theme-text, ${theme.text});">
             <h3 style="margin:0 0 18px 0; color:var(--theme-accent, ${theme.accent}); text-align:center; font-size:18px; font-weight:700;">GuildWeave Setup</h3>
             
             <div id="step-1-container" style="margin-bottom:18px;">
@@ -3423,14 +3737,16 @@
       }
     }
     function showStep3() {
+      const safeFullBid = escapeHtml(browserId);
       step3Content.innerHTML = `
             <p style="margin: 0 0 8px 0; font-weight: 600; color: var(--theme-text, ${theme.text});">Link this browser via Discord:</p>
             <p style="margin: 0 0 10px 0;">Run this command in your Discord server to finish linking:</p>
-            <div class="gw-code-chip" style="display:block; padding:10px; text-align:center; word-break:break-all; color:var(--theme-warning, ${theme.warning}); margin-bottom:10px;">
-                /link browser_id:${escapeHtml(browserId)}
+            <div role="button" tabindex="0" class="gw-code-chip gw-copy-chip" data-copy-id="/link browser_id:${safeFullBid}" title="Click to copy command" style="display:block; padding:10px; text-align:center; word-break:break-all; color:var(--theme-warning, ${theme.warning}); margin-bottom:10px;">
+                /link browser_id:${safeFullBid}
             </div>
             <p style="margin:0; font-size:11px; text-align:center; animation: gwPulse 1.5s infinite alternate;">Waiting for approval...</p>
         `;
+      attachCopyChipHandlers(step3Content);
       const checkAuth = async () => {
         try {
           const res = await backgroundRequest({
@@ -3578,7 +3894,7 @@
 
                 <div style="padding-top:10px; border-top:1px solid ${theme.border};">
                     <span class="gw-stat-label" style="display:block; margin-bottom:5px;">Linked Browsers (Up to 3)</span>
-                    <div id="guest-linked-devices" class="gw-details-note" style="margin-top:0;">
+                    <div id="guest-linked-devices" class="gw-details-note" style="margin-top:0; display:flex; flex-direction:column; gap:4px;">
                         No linked browsers found.
                     </div>
                     <div class="gw-details-note">Remove old browsers in Discord using <span class="gw-code-chip">/mygateway unlink</span>.</div>
@@ -3589,7 +3905,7 @@
                 <label class="gw-toggle-row" for="settings-debug">
                     <div class="gw-toggle-copy">
                         <span class="gw-toggle-title">Share Generation Logs for Troubleshooting</span>
-                        <span class="gw-toggle-desc">When authorized by an admin, shares your prompt and generation parameters in server logs to diagnose issues. Personal account tokens stay strictly on your device.</span>
+                        <span class="gw-toggle-desc">When authorized by an admin, shares your prompt and generation parameters in server logs to diagnose issues. <b>This includes input images (e.g., image2image, Precise References).</b> Personal account tokens stay strictly on your device. <b>When turned off (default), your prompts remain fully private.</b></span>
                     </div>
                     <input type="checkbox" id="settings-debug" class="gw-switch" ${debugActive ? "checked" : ""}>
                 </label>
@@ -3710,7 +4026,12 @@
             }
             const devicesEl = container.querySelector("#guest-linked-devices");
             if (devicesEl && data.linked_devices && data.linked_devices.length > 0) {
-              devicesEl.innerHTML = data.linked_devices.map((d) => `<div><span class="gw-code-chip">${escapeHtml((d.id || "").substring(0, 10))}...</span> ${escapeHtml(d.label)}</div>`).join("");
+              devicesEl.innerHTML = data.linked_devices.map((d) => {
+                const fullId = escapeHtml(d.id || "");
+                const shortId = escapeHtml((d.id || "").substring(0, 10));
+                return `<div><span role="button" tabindex="0" class="gw-code-chip gw-copy-chip" data-copy-id="${fullId}" title="Click to copy full browser ID (${fullId})">${shortId}...</span> ${escapeHtml(d.label)}</div>`;
+              }).join("");
+              attachCopyChipHandlers(devicesEl);
             }
             const debugStatus = container.querySelector("#debug-intent-status");
             if (debugStatus) {

@@ -25,12 +25,21 @@
  *    - Polls `/auth/status` with full Commit 9 + cycle-segregated payload and verifies `#gw-v5-bar`
  *      mounts above `#gw-allowance-bar` while preserving `allowanceBar.nextElementSibling === genBtn`.
  *    - Verifies `scrapeNovelAITheme()` skips stale navy `document.body` CSS (`rgb(19, 21, 44)`),
- *      ignores low-alpha translucent overlays (`rgba(255,255,255,0.08)`), extracts `#__next`/ancestor
- *      backgrounds & `linear-gradient(...)` `backgroundImage` stops, card container `borderTopColor`,
- *      and active effort fills, keeps dark-button bright-text themes legible, refreshes `#gw-nav-badge`
- *      classes & computed colors when `button[aria-label="menu"]` transitions post-hydration, reacts to
- *      `document.head` `<style>` swaps while ignoring `#gw-ui-styles`, locks `.gw-switch` dimensions,
- *      and hides `#gw-allowance-bar` for unlimited tiers.
+ *      ignores hidden `[role="dialog"]` (`display: none`) and ancestor-hidden subtrees, ignores stale
+ *      fallback `backgroundColor` buried under `linear-gradient(...)`, ignores low-alpha translucent
+ *      overlays (`rgba(255,255,255,0.08)`), rejects blurred drop shadows while accepting spread-only
+ *      `0 0 0 <N>px` rings, extracts `#__next`/ancestor backgrounds, `.image-gen-character-prompts`
+ *      card background + outline (`--gw-bg1`, `--gw-card-border`), `[data-prompt-input="true"]` /
+ *      `.prompt-input-box-prompt` background (`--gw-input-bg`, ignoring `.sc-b7a086c6-0` inner button
+ *      row regardless of child order), card container `borderTopColor`, and active effort fills,
+ *      keeps dark-button bright-text themes legible, refreshes `#gw-nav-badge` classes & computed colors
+ *      when `button[aria-label="menu"]` transitions post-hydration, reacts to `document.head` `<style>`
+ *      swaps while ignoring `#gw-ui-styles`, locks `.gw-switch` dimensions, and hides `#gw-allowance-bar`
+ *      for unlimited tiers.
+ *    - Verifies linked browser ID chips (`#guest-linked-devices`, Admin Governance, and Operator Settings)
+ *      copy the full `browser_id` to clipboard on click, `Space`, and `Enter` key, cancel stale timers
+ *      across rapid double clicks, display `'Copied!'` / `'Copy failed'` accurately, and fall back to
+ *      `document.execCommand('copy')` with `focus()` and `setSelectionRange()` when `navigator.clipboard` rejects.
  *    - Verifies `/user/data` injects live `availableAnlas` into `trainingStepsLeft` after `/auth/status` arrives.
  *    - Verifies `#gw-effort-select` is absent (relies strictly on NovelAI's native `.image-gen-model-mode-row`).
  *    - Verifies `#gw-v5-cost` hides when configured for non-addon Anlas bypass (`1536x2048`, `2` samples,
@@ -184,6 +193,11 @@ function createBrowserSandbox(initialStorage = {}, scriptSource = null) {
   const promptQueue = [];
   const confirmQueue = [];
   const alertLog = [];
+  const copiedTexts = [];
+  const execCommands = [];
+  let clipboardError = null;
+  let execCommandReturn = true;
+  let clipboardReadVal = '';
   const voidTags = new Set(['input', 'img', 'br', 'hr', 'meta', 'link']);
 
   const resolvedVersion = extractMetadataVersion(scriptSource);
@@ -252,16 +266,19 @@ function createBrowserSandbox(initialStorage = {}, scriptSource = null) {
     }
     if (baseSelector.startsWith('.')) {
       const cls = baseSelector.slice(1);
-      const classes = (el.getAttribute('class') || '').split(/\s+/);
-      return classes.includes(cls);
+      if (!cls.includes('.')) {
+        const classes = (el.getAttribute('class') || '').split(/\s+/);
+        return classes.includes(cls);
+      }
     }
     if (baseSelector.includes('.')) {
-      const parts = baseSelector.split('.');
-      const tag = parts[0];
-      const cls = parts[1];
+      const dotParts = baseSelector.split('.').filter(Boolean);
+      const hasTagPrefix = !baseSelector.startsWith('.');
+      const tag = hasTagPrefix ? dotParts[0] : '';
+      const requiredClasses = hasTagPrefix ? dotParts.slice(1) : dotParts;
       if (tag && el.tagName.toLowerCase() !== tag.toLowerCase()) return false;
       const classes = (el.getAttribute('class') || '').split(/\s+/);
-      return classes.includes(cls);
+      return requiredClasses.every(c => classes.includes(c));
     }
     return el.tagName.toLowerCase() === baseSelector.toLowerCase();
   }
@@ -382,6 +399,8 @@ function createBrowserSandbox(initialStorage = {}, scriptSource = null) {
     let _children = [];
     let _nodes = [];
     let _value = '';
+    let _focusCalled = false;
+    let _selectionRange = null;
     const attributes = new Map();
     const listeners = new Map();
 
@@ -418,6 +437,7 @@ function createBrowserSandbox(initialStorage = {}, scriptSource = null) {
       checked: false,
       onclick: null,
       onchange: null,
+      onkeydown: null,
       parentElement: null,
       _nodes,
 
@@ -490,6 +510,16 @@ function createBrowserSandbox(initialStorage = {}, scriptSource = null) {
         return idx !== -1 && idx < el.parentElement.children.length - 1 ? el.parentElement.children[idx + 1] : null;
       },
 
+      contains(other) {
+        if (!other) return false;
+        let cur = other;
+        while (cur) {
+          if (cur === el) return true;
+          cur = cur.parentElement;
+        }
+        return false;
+      },
+
       closest(sel) {
         let cur = el;
         while (cur) {
@@ -499,6 +529,22 @@ function createBrowserSandbox(initialStorage = {}, scriptSource = null) {
           cur = cur.parentElement;
         }
         return null;
+      },
+
+      focus() {
+        _focusCalled = true;
+      },
+
+      select() {
+        clipboardReadVal = el.value || '';
+      },
+
+      setSelectionRange(start, end) {
+        _selectionRange = [start, end];
+      },
+
+      get _clipboardMeta() {
+        return { focusCalled: _focusCalled, selectionRange: _selectionRange };
       },
 
       appendChild(child) {
@@ -599,11 +645,16 @@ function createBrowserSandbox(initialStorage = {}, scriptSource = null) {
     return el;
   }
 
+  let lastCreatedTextarea = null;
   const documentMock = {
     body: createMockElement('body'),
     head: createMockElement('head'),
     documentElement: createMockElement('html'),
-    createElement: (tag) => createMockElement(tag),
+    createElement: (tag) => {
+      const node = createMockElement(tag);
+      if (String(tag).toLowerCase() === 'textarea') lastCreatedTextarea = node;
+      return node;
+    },
     createElementNS: (_, tag) => createMockElement(tag),
     getElementById: (id) => elements.get(id) || null,
     querySelector(sel) {
@@ -614,6 +665,19 @@ function createBrowserSandbox(initialStorage = {}, scriptSource = null) {
       const results = [];
       findSelector(documentMock.documentElement, sel, false, results);
       return results;
+    },
+    execCommand(cmd) {
+      execCommands.push({
+        cmd,
+        value: clipboardReadVal,
+        focusCalled: lastCreatedTextarea ? lastCreatedTextarea._clipboardMeta.focusCalled : false,
+        selectionRange: lastCreatedTextarea ? lastCreatedTextarea._clipboardMeta.selectionRange : null
+      });
+      if (cmd === 'copy' && execCommandReturn && clipboardReadVal) {
+        copiedTexts.push(clipboardReadVal);
+        return true;
+      }
+      return false;
     }
   };
   documentMock.documentElement.appendChild(documentMock.head);
@@ -641,9 +705,25 @@ function createBrowserSandbox(initialStorage = {}, scriptSource = null) {
       color: (el && el.style && el.style.color) ? el.style.color : '',
       fontFamily: (el && el.style && el.style.fontFamily) ? el.style.fontFamily : '',
       borderTopColor: (el && el.style && (el.style.borderTopColor || el.style.borderColor)) ? (el.style.borderTopColor || el.style.borderColor) : '',
+      borderRightColor: (el && el.style && (el.style.borderRightColor || el.style.borderColor)) ? (el.style.borderRightColor || el.style.borderColor) : '',
+      borderBottomColor: (el && el.style && (el.style.borderBottomColor || el.style.borderColor)) ? (el.style.borderBottomColor || el.style.borderColor) : '',
+      borderLeftColor: (el && el.style && (el.style.borderLeftColor || el.style.borderColor)) ? (el.style.borderLeftColor || el.style.borderColor) : '',
       borderColor: (el && el.style && (el.style.borderColor || el.style.borderTopColor)) ? (el.style.borderColor || el.style.borderTopColor) : '',
       borderTopWidth: (el && el.style && el.style.borderTopWidth) ? el.style.borderTopWidth : '',
-      borderTopStyle: (el && el.style && el.style.borderTopStyle) ? el.style.borderTopStyle : ''
+      borderRightWidth: (el && el.style && el.style.borderRightWidth) ? el.style.borderRightWidth : '',
+      borderBottomWidth: (el && el.style && el.style.borderBottomWidth) ? el.style.borderBottomWidth : '',
+      borderLeftWidth: (el && el.style && el.style.borderLeftWidth) ? el.style.borderLeftWidth : '',
+      borderTopStyle: (el && el.style && el.style.borderTopStyle) ? el.style.borderTopStyle : '',
+      borderRightStyle: (el && el.style && el.style.borderRightStyle) ? el.style.borderRightStyle : '',
+      borderBottomStyle: (el && el.style && el.style.borderBottomStyle) ? el.style.borderBottomStyle : '',
+      borderLeftStyle: (el && el.style && el.style.borderLeftStyle) ? el.style.borderLeftStyle : '',
+      outlineWidth: (el && el.style && el.style.outlineWidth) ? el.style.outlineWidth : '',
+      outlineStyle: (el && el.style && el.style.outlineStyle) ? el.style.outlineStyle : '',
+      outlineColor: (el && el.style && el.style.outlineColor) ? el.style.outlineColor : '',
+      boxShadow: (el && el.style && el.style.boxShadow) ? el.style.boxShadow : 'none',
+      display: (el && el.style && el.style.display) ? el.style.display : '',
+      visibility: (el && el.style && el.style.visibility) ? el.style.visibility : '',
+      opacity: (el && el.style && el.style.opacity) ? el.style.opacity : ''
     })
   };
 
@@ -652,6 +732,15 @@ function createBrowserSandbox(initialStorage = {}, scriptSource = null) {
     getRandomValues: (arr) => nodeCrypto.getRandomValues(arr)
   };
   windowMock.crypto = cryptoMock;
+
+  const navigatorMock = {
+    clipboard: {
+      writeText: async (text) => {
+        if (clipboardError) throw clipboardError;
+        copiedTexts.push(String(text));
+      }
+    }
+  };
 
   class MockMutationObserver {
     constructor(cb) { this.cb = cb; }
@@ -666,6 +755,7 @@ function createBrowserSandbox(initialStorage = {}, scriptSource = null) {
     window: windowMock,
     unsafeWindow: unsafeWindowMock,
     document: documentMock,
+    navigator: navigatorMock,
     sessionStorage: windowMock.sessionStorage,
     location: windowMock.location,
     requestAnimationFrame: windowMock.requestAnimationFrame,
@@ -714,6 +804,10 @@ function createBrowserSandbox(initialStorage = {}, scriptSource = null) {
     promptQueue,
     confirmQueue,
     alertLog,
+    copiedTexts,
+    execCommands,
+    setClipboardError: (err) => { clipboardError = err; },
+    setExecCommandReturn: (val) => { execCommandReturn = Boolean(val); },
     setPageFetch: (fn) => { originalPageFetch = fn; },
     triggerIntervalAtMs: (ms) => {
       for (const entry of intervals) {
@@ -1371,9 +1465,9 @@ test('Phase 8 Commit 10: Client UserScript Runtime, Dynamic Design Engine & Prod
       browser_id: 'b_brown_theme'
     }, guestCode);
 
-    // 1. Stale navy CSS on body (rgb(19, 21, 44)) + translucent white hover tint overlay +
-    //    real warm-brown theme painted via linear-gradient on layout wrapper + card container border +
-    //    delayed teal->brown transition on button[aria-label="menu"].
+    // Stale navy CSS on body (rgb(19, 21, 44)) + translucent white hover tint overlay +
+    // real warm-brown theme painted via linear-gradient on layout wrapper + card container border +
+    // delayed teal->brown transition on button[aria-label="menu"].
     context.document.body.style.backgroundColor = 'rgb(19, 21, 44)';
     context.document.body.style.color = 'rgb(245, 243, 194)';
     context.document.body.innerHTML = `
@@ -1407,15 +1501,12 @@ test('Phase 8 Commit 10: Client UserScript Runtime, Dynamic Design Engine & Prod
     const navBadge = context.document.getElementById('gw-nav-badge');
     assert.ok(styleSheet && v5Bar && navBadge);
 
-    // Must ignore stale body rgb(19, 21, 44) AND ignore rgba(255,255,255,0.08)/rgba(0,0,0,0.15) tints,
-    // scraping warm-brown gradient stop rgb(50, 27, 15) and card border rgb(91, 56, 36)!
     assert.match(styleSheet.textContent, /--theme-bg0:\s*rgb\(50,\s*27,\s*15\)/, 'Must inherit inner warm-brown gradient instead of stale navy body');
     assert.match(styleSheet.textContent, /--theme-bg2:\s*rgb\(91,\s*56,\s*36\)/, 'Must inherit card/pill borderTopColor instead of translucent white fallback');
     assert.match(v5Bar.style.backgroundColor, /rgb\(50,\s*27,\s*15\)/);
     assert.match(v5Bar.style.border, /rgb\(91,\s*56,\s*36\)/);
     assert.strictEqual(navBadge.className, 'nav-btn-teal');
 
-    // Simulate NovelAI async /user/clientsettings hydrating the warm-brown theme onto menu-btn + layout wrapper
     const menuBtn = context.document.getElementById('menu-btn');
     menuBtn.className = 'nav-btn-brown';
     menuBtn.style.backgroundColor = 'rgb(75, 43, 26)';
@@ -1424,7 +1515,6 @@ test('Phase 8 Commit 10: Client UserScript Runtime, Dynamic Design Engine & Prod
     context.document.getElementById('theme-canvas').style.backgroundImage = 'none';
     context.document.getElementById('theme-canvas').style.backgroundColor = 'rgb(56, 30, 17)';
 
-    // Verify head <style> swap triggers immediate theme + nav-badge refresh!
     const headStyle = context.document.createElement('style');
     context.document.head.appendChild(headStyle);
     triggerHeadStyleMutation(headStyle);
@@ -1434,6 +1524,273 @@ test('Phase 8 Commit 10: Client UserScript Runtime, Dynamic Design Engine & Prod
     assert.strictEqual(navBadge.style.backgroundColor, 'rgb(75, 43, 26)', 'Delayed theme hydration must sync #gw-nav-badge backgroundColor');
     assert.strictEqual(navBadge.style.color, 'rgb(245, 243, 194)', 'Delayed theme hydration must sync #gw-nav-badge color');
     assert.match(styleSheet.textContent, /--theme-bg0:\s*rgb\(56,\s*30,\s*17\)/, 'Head style mutation must refresh live scraped theme');
+  });
+
+  // ---------------------------------------------------------------------------
+  // 3b-ii. HELL PATH: CHARACTER PROMPTS CARD + PROMPT INPUT BOX + CLICK-TO-COPY CHIPS
+  // ---------------------------------------------------------------------------
+  await t.test('Theme & Clipboard: Cards match Character Prompts bg + outline, inputs/chips match Prompt box bg, and browser chips copy full ID', async () => {
+    const fullBid1 = 'b_1c92fbcf00112233445566778899aabb';
+    const fullBid2 = 'b_1073eb7c998877665544332211ffeedd';
+
+    const { context, networkCalls, copiedTexts, execCommands, setClipboardError, setExecCommandReturn, triggerObserverSync } = createBrowserSandbox({
+      approved: true,
+      vps_host: 'https://vps.example.duckdns.org',
+      device_secret: 'sec_novelai_dom',
+      browser_id: fullBid1
+    }, guestCode);
+
+    // Replicates NovelAI's real DOM:
+    // - Hidden [role="dialog"] carrying navy fallback rgb(19, 21, 44) (must be ignored!)
+    // - Outer sidebar wrapper carrying stale navy backgroundColor: rgb(19, 21, 44) UNDER a warm-brown gradient
+    // - .image-gen-character-prompts + .image-gen-character-prompts-header painting card bg + outline
+    // - .image-gen-prompt-main > .prompt-input-box-prompt[data-prompt-input="true"] painting recessed prompt box bg,
+    //   with inner .sc-b7a086c6-0 toolbar carrying bright button color that must NOT leak into --gw-input-bg!
+    context.document.body.style.backgroundColor = 'rgb(19, 21, 44)';
+    context.document.body.innerHTML = `
+      <div role="dialog" style="display: none; background-color: rgb(19, 21, 44);">Hidden Dialog</div>
+      <div id="__next">
+        <div id="sidebar-wrapper" style="background-color: rgb(19, 21, 44); background-image: linear-gradient(180deg, rgb(50, 27, 15) 0%, rgb(44, 23, 12) 100%); color: rgb(245, 243, 194);">
+          <div class="image-gen-nav-row">
+            <div style="display:flex;">
+              <button aria-label="menu" style="background-color: rgb(75, 43, 26); color: rgb(245, 243, 194);"></button>
+            </div>
+          </div>
+          <div class="image-gen-model-mode-row">
+            <div><span>Model</span><div class="css-icpgrc"><div class="css-singleValue">V5 Full</div><input aria-label="Select the Model" value="" /></div></div>
+            <div><span>Effort</span><div><button style="background-color: rgb(95, 58, 36);">Medium</button><button style="background-color: rgba(0, 0, 0, 0);">High</button></div></div>
+          </div>
+          <div class="image-gen-prompt-main">
+            <div class="prompt-input-box-prompt" data-prompt-input="true" style="background-color: rgb(37, 7, 3); border-top-color: rgb(105, 44, 24); border-top-width: 1px;">
+              <div class="relative">
+                <div class="sc-58cb76b2-43 hHIolY">
+                  <div contenteditable="true" translate="no" class="ProseMirror"><p>minccino</p></div>
+                </div>
+              </div>
+              <div class="sc-b7a086c6-0 dZAKno" style="background-color: rgb(120, 80, 60);">
+                <button style="background-color: rgb(200, 160, 120);">Transparent BG</button>
+              </div>
+            </div>
+          </div>
+          <div class="sc-5eac4fda-0 eRsbjO image-gen-character-prompts" style="background-color: rgba(255, 255, 255, 0.08); border-top-color: rgb(102, 62, 38); border-top-width: 1px; border-top-style: solid;">
+            <div class="sc-5eac4fda-1 fQipBf image-gen-character-prompts-header">
+              <div>Character Prompts</div>
+            </div>
+          </div>
+          <div class="image-gen-footer">
+            <button class="image-gen-generate-button" style="background-color: rgb(245, 203, 92); color: rgb(26, 15, 10);">
+              <span>Generate 1 Image</span>
+            </button>
+          </div>
+        </div>
+      </div>
+    `;
+
+    vm.runInContext(guestCode, context);
+    triggerObserverSync();
+
+    const styleSheet = context.document.getElementById('gw-ui-styles');
+    assert.ok(styleSheet);
+
+    // 1. Sidebar wrapper gradient rgb(50, 27, 15) must win over stale navy fallback rgb(19, 21, 44)
+    assert.match(styleSheet.textContent, /--theme-bg0:\s*rgb\(50,\s*27,\s*15\)/);
+    // 2. Character Prompts rgba(255,255,255,0.08) composited over rgb(50,27,15) -> rgb(66, 45, 34), never navy!
+    assert.match(styleSheet.textContent, /--theme-bg1:\s*rgb\(66,\s*45,\s*34\)/, 'Card bg must inherit composited Character Prompts surface');
+    assert.doesNotMatch(styleSheet.textContent, /--theme-bg1:\s*rgb\(19,\s*21,\s*44\)/, 'Hidden dialog / stale fallback navy must never leak into --theme-bg1');
+    // 3. Card outline matches Character Prompts border-top-color rgb(102, 62, 38)
+    assert.match(styleSheet.textContent, /--gw-card-border:\s*rgb\(102,\s*62,\s*38\)/);
+    assert.match(styleSheet.textContent, /\.gw-card\s*\{[^}]*border:\s*1px solid var\(--gw-card-border\)/);
+    // 4. Text fields & inline code chips inherit Prompt input box rgb(37, 7, 3) + border rgb(105, 44, 24) (never toolbar rgb(120,80,60))
+    assert.match(styleSheet.textContent, /--gw-input-bg:\s*rgb\(37,\s*7,\s*3\)/);
+    assert.match(styleSheet.textContent, /--gw-input-border:\s*rgb\(105,\s*44,\s*24\)/);
+    assert.match(styleSheet.textContent, /\.gw-input,\s*\.gw-select\s*\{[^}]*background:\s*var\(--gw-input-bg\)/);
+    assert.match(styleSheet.textContent, /\.gw-code-chip\s*\{[^}]*background:\s*var\(--gw-input-bg\)/);
+
+    // 5. Linked browser ID chunks in Guest modal copy the FULL browser_id on click & Enter, and fall back to execCommand
+    context.document.getElementById('gw-nav-badge').onclick({ preventDefault: () => {}, stopPropagation: () => {} });
+    await new Promise(r => setTimeout(r, 20));
+    const statusCall = networkCalls.find(c => c.url.includes('/auth/status'));
+    assert.ok(statusCall);
+    statusCall.onload({
+      status: 200,
+      responseText: JSON.stringify({
+        approved: true,
+        tier: 'Low',
+        linked_devices: [
+          { id: fullBid1, label: 'Test' },
+          { id: fullBid2, label: 'GuestTest1' }
+        ],
+        anlas: { virtual_balance: 112, available_balance: 112, monthly_quota: 250, is_unlimited: false, is_in_debt: false },
+        v5: { banked_ncp: 180, available_ncp: 180, max_bank_ncp: 540, surplus_available_ncp: 0, surplus_eligible: true, is_unlimited: false },
+        telemetry: { master_v5_percent: 25.0, cluster_state: 'reserve_mode', is_hard_locked: false, subscription_active: true, last_fetched_at: Date.now() }
+      })
+    });
+    await new Promise(r => setTimeout(r, 20));
+
+    const chips = context.document.querySelectorAll('#guest-linked-devices .gw-copy-chip');
+    assert.strictEqual(chips.length, 2, 'Guest linked browser chips must render as copyable .gw-copy-chip elements');
+    assert.strictEqual(chips[0].textContent, 'b_1c92fbcf...');
+    assert.strictEqual(chips[0].getAttribute('data-copy-id'), fullBid1);
+
+    // Click copies full ID and restores original truncated label
+    chips[0].onclick({ preventDefault: () => {}, stopPropagation: () => {} });
+    await new Promise(r => setTimeout(r, 10));
+    assert.strictEqual(copiedTexts[0], fullBid1, 'Clicking truncated chip must copy FULL browser_id');
+    assert.strictEqual(chips[0].textContent, 'b_1c92fbcf...', 'Original chip label must remain intact after reset timer');
+
+    // Keyboard Enter triggers copy on second chip
+    chips[1].onkeydown({ key: 'Enter', preventDefault: () => {}, stopPropagation: () => {} });
+    await new Promise(r => setTimeout(r, 10));
+    assert.strictEqual(copiedTexts[1], fullBid2, 'Pressing Enter on truncated chip must copy FULL browser_id');
+
+    // Verify navigator.clipboard failure falls back cleanly to document.execCommand('copy') with focus() & setSelectionRange()
+    setClipboardError(new Error('Clipboard API blocked'));
+    chips[0].onclick({ preventDefault: () => {}, stopPropagation: () => {} });
+    await new Promise(r => setTimeout(r, 10));
+    assert.strictEqual(execCommands.length, 1);
+    assert.strictEqual(execCommands[0].cmd, 'copy');
+    assert.strictEqual(execCommands[0].focusCalled, true);
+    assert.deepStrictEqual(execCommands[0].selectionRange, [0, fullBid1.length]);
+    assert.strictEqual(copiedTexts[2], fullBid1, 'Fallback execCommand must copy full browser_id when Clipboard API rejects');
+
+    // 6. Scoped async timer checks: 'Copy failed', Spacebar copy, and overlapping rapid double-click cancellation
+    const origSandboxSetTimeout = context.setTimeout;
+    const origSandboxClearTimeout = context.clearTimeout;
+    const origClipboardWrite = context.navigator.clipboard.writeText;
+    const activeResetTimers = new Map();
+    let asyncTimerSeq = 100;
+
+    context.setTimeout = (fn, delay = 0) => {
+      if (delay >= 1500) {
+        const id = asyncTimerSeq++;
+        activeResetTimers.set(id, fn);
+        return id;
+      }
+      return origSandboxSetTimeout(fn, delay);
+    };
+    context.clearTimeout = (id) => {
+      if (activeResetTimers.has(id)) {
+        activeResetTimers.delete(id);
+        return;
+      }
+      return origSandboxClearTimeout(id);
+    };
+
+    try {
+      setExecCommandReturn(false);
+      chips[0].onclick({ preventDefault: () => {}, stopPropagation: () => {} });
+      await new Promise(r => setTimeout(r, 10));
+      assert.strictEqual(chips[0].textContent, 'Copy failed', 'Total clipboard failure must display Copy failed');
+      assert.strictEqual(activeResetTimers.size, 1);
+      for (const [id, fn] of Array.from(activeResetTimers.entries())) {
+        activeResetTimers.delete(id);
+        fn();
+      }
+      assert.strictEqual(chips[0].textContent, 'b_1c92fbcf...');
+
+      setExecCommandReturn(true);
+      setClipboardError(null);
+      let resolveFirstWrite;
+      let asyncCalls = 0;
+      context.navigator.clipboard.writeText = (text) => {
+        asyncCalls += 1;
+        copiedTexts.push(String(text));
+        if (asyncCalls === 1) {
+          return new Promise(resolve => { resolveFirstWrite = resolve; });
+        }
+        return Promise.resolve();
+      };
+
+      chips[0].onclick({ preventDefault: () => {}, stopPropagation: () => {} });
+      chips[0].onclick({ preventDefault: () => {}, stopPropagation: () => {} });
+      await new Promise(r => setTimeout(r, 10));
+      assert.strictEqual(chips[0].textContent, 'Copied!', 'Overlapping rapid double-click must hold Copied! label');
+      assert.strictEqual(activeResetTimers.size, 1, 'Overlapping rapid double-click must arm exactly one reset timer');
+
+      resolveFirstWrite();
+      await new Promise(r => setTimeout(r, 10));
+      assert.strictEqual(chips[0].textContent, 'Copied!', 'Superseded first click resolving late must not clobber Copied!');
+      assert.strictEqual(activeResetTimers.size, 1);
+
+      for (const [id, fn] of Array.from(activeResetTimers.entries())) {
+        activeResetTimers.delete(id);
+        fn();
+      }
+      assert.strictEqual(chips[0].textContent, 'b_1c92fbcf...');
+
+      let spacePrevented = false;
+      chips[1].onkeydown({
+        key: ' ',
+        preventDefault: () => { spacePrevented = true; },
+        stopPropagation: () => {}
+      });
+      await new Promise(r => setTimeout(r, 10));
+      assert.strictEqual(spacePrevented, true);
+      assert.strictEqual(chips[1].textContent, 'Copied!');
+      for (const [id, fn] of Array.from(activeResetTimers.entries())) {
+        activeResetTimers.delete(id);
+        fn();
+      }
+      assert.strictEqual(chips[1].textContent, 'b_1073eb7c...');
+    } finally {
+      context.setTimeout = origSandboxSetTimeout;
+      context.clearTimeout = origSandboxClearTimeout;
+      context.navigator.clipboard.writeText = origClipboardWrite;
+    }
+
+    // 7. Toolbar-first prompt box, ancestor-hidden wrappers, blurred drop shadow vs 0 0 0 1px ring & inputBorder sync
+    const hellSandbox = createBrowserSandbox({
+      approved: true,
+      vps_host: 'https://vps.example.duckdns.org',
+      device_secret: 'sec_theme_hell',
+      browser_id: 'b_theme_hell'
+    }, guestCode);
+    hellSandbox.context.document.body.style.backgroundColor = 'rgb(19, 21, 44)';
+    hellSandbox.context.document.body.innerHTML = `
+      <div style="display: none;">
+        <div role="dialog" style="background-color: rgb(19, 21, 44);">Hidden Portal Dialog</div>
+      </div>
+      <textarea style="background-color: rgb(220, 40, 40);">stray</textarea>
+      <div id="__next">
+        <div style="background-image: linear-gradient(180deg, rgb(50, 27, 15) 0%, rgb(44, 23, 12) 100%); color: rgb(245, 243, 194);">
+          <div class="image-gen-nav-row"><button aria-label="menu" style="background-color: rgb(75, 43, 26);"></button></div>
+          <div class="image-gen-prompt-main">
+            <div class="prompt-input-box-prompt" data-prompt-input="true" style="background-color: rgba(0, 0, 0, 0); box-shadow: rgba(0, 0, 0, 0.55) 0px 4px 12px 0px;">
+              <div class="sc-b7a086c6-0" style="background-color: rgb(210, 170, 120);"><button>Tags</button></div>
+              <div class="relative" style="background-color: rgb(37, 7, 3);">
+                <div contenteditable="true" class="ProseMirror"><p>prompt</p></div>
+              </div>
+            </div>
+          </div>
+          <div id="cards-col">
+            <div class="image-gen-character-prompts" style="background-color: rgb(66, 45, 34); box-shadow: rgba(0, 0, 0, 0.45) 0px 4px 12px 0px, rgb(102, 62, 38) 0px 0px 0px 1px;">
+              <div class="image-gen-character-prompts-header">Characters</div>
+            </div>
+          </div>
+          <div class="image-gen-footer">
+            <button class="image-gen-generate-button" style="background-color: rgb(245, 203, 92); color: rgb(26, 15, 10);"><span>Generate 1 Image</span></button>
+          </div>
+        </div>
+      </div>
+    `;
+    vm.runInContext(guestCode, hellSandbox.context);
+    hellSandbox.triggerObserverSync();
+    await new Promise(r => setTimeout(r, 20));
+    const hellCss = hellSandbox.context.document.getElementById('gw-ui-styles').textContent;
+    assert.match(hellCss, /--theme-bg1:\s*rgb\(66,\s*45,\s*34\)/);
+    assert.doesNotMatch(hellCss, /--theme-bg1:\s*rgb\(19,\s*21,\s*44\)/);
+    assert.match(hellCss, /--gw-input-bg:\s*rgb\(37,\s*7,\s*3\)/, 'Toolbar-first .sc-b7a086c6-0 and stray textarea must not hijack --gw-input-bg');
+    assert.doesNotMatch(hellCss, /rgba\(0,\s*0,\s*0,\s*0\.45\)/, 'Blurred drop shadow must never hijack border tokens');
+    assert.doesNotMatch(hellCss, /rgba\(0,\s*0,\s*0,\s*0\.55\)/, 'Prompt drop shadow must never hijack --gw-input-border');
+    assert.match(hellCss, /--gw-card-border:\s*rgb\(102,\s*62,\s*38\)/);
+    assert.match(hellCss, /--gw-input-border:\s*rgb\(102,\s*62,\s*38\)/, 'Borderless prompt box must inherit resolved borderStrong');
+
+    hellSandbox.context.document.getElementById('cards-col').style.opacity = '0';
+    hellSandbox.triggerObserverSync();
+    await new Promise(r => setTimeout(r, 20));
+    const hiddenCardCss = hellSandbox.context.document.getElementById('gw-ui-styles').textContent;
+    assert.doesNotMatch(hiddenCardCss, /--theme-bg1:\s*rgb\(66,\s*45,\s*34\)/, 'opacity: 0 ancestor must exclude hidden character prompts card');
+    assert.doesNotMatch(hiddenCardCss, /--theme-bg1:\s*rgb\(19,\s*21,\s*44\)/, 'display: none ancestor around [role="dialog"] must never leak navy bg1');
   });
 
   // ---------------------------------------------------------------------------
@@ -2168,10 +2525,13 @@ test('Phase 8 Commit 10: Client UserScript Runtime, Dynamic Design Engine & Prod
   });
 
   // ---------------------------------------------------------------------------
-  // 7. ADMIN DUAL-LEDGER GOVERNANCE, XSS ESCAPING, CYCLE FILTER, UNLINKED `user_id` & OPERATOR SETTINGS
+  // 7. ADMIN DUAL-LEDGER GOVERNANCE, XSS ESCAPING, CYCLE FILTER, COPY CHIPS, UNLINKED `user_id` & OPERATOR SETTINGS
   // ---------------------------------------------------------------------------
-  await t.test('Admin Governance: Escapes XSS payloads, populates cycle selector, handles sort/token-push refresh, omits Rolling Allowance & validates strict deltas', async () => {
-    const { context, networkCalls, promptQueue, alertLog, triggerIntervalAtMs, triggerObserverSync } = createBrowserSandbox({
+  await t.test('Admin Governance: Escapes XSS payloads, populates cycle selector, copies full browser IDs, handles sort/token-push refresh, omits Rolling Allowance & validates strict deltas', async () => {
+    const fullDebtorBid = 'b_debtor_dev_00112233445566778899aa';
+    const fullAdminLinkedBid = 'b_admin_link_99887766554433221100ff';
+
+    const { context, networkCalls, promptQueue, alertLog, copiedTexts, triggerIntervalAtMs, triggerObserverSync } = createBrowserSandbox({
       approved: true,
       vps_host: 'https://vps.example.duckdns.org',
       admin_token: 'adm_sec_10',
@@ -2231,7 +2591,7 @@ test('Phase 8 Commit 10: Client UserScript Runtime, Dynamic Design Engine & Prod
         last_active_at: Date.now(),
         is_online: true,
         devices: [{
-          browser_id: 'b_debtor_dev',
+          browser_id: fullDebtorBid,
           label: '<svg onload=alert(2)>Laptop',
           approved: 1,
           banned: 0,
@@ -2363,7 +2723,7 @@ test('Phase 8 Commit 10: Client UserScript Runtime, Dynamic Design Engine & Prod
     await new Promise(r => setTimeout(r, 20));
     assert.ok(networkCalls.some(c => c.url.includes('/admin/global-stats?cycle_epoch=1759400000000')));
 
-    // Pushing fresh token via Save Token button triggers immediate HUD poll + modal refresh
+    // Pushing fresh token via Save Token button triggers immediate HUD + modal refresh
     networkCalls.length = 0;
     context.document.getElementById('vps-master-token-input').value = 'fresh_master_jwt';
     context.document.getElementById('vps-btn-push-token').onclick();
@@ -2387,6 +2747,14 @@ test('Phase 8 Commit 10: Client UserScript Runtime, Dynamic Design Engine & Prod
 
     assert.strictEqual(clientListEl.querySelectorAll('svg').length, 0, 'XSS <svg> node must never mount in DOM');
     assert.doesNotMatch(context.document.getElementById('vps-client-list').innerHTML, /<svg\s/i, 'XSS <svg> device label must be escaped');
+
+    // Governance linked browser chip copies full browser_id on click
+    const govChip = context.document.querySelector('#vps-client-list .gw-copy-chip');
+    assert.ok(govChip);
+    govChip.onclick({ preventDefault: () => {}, stopPropagation: () => {} });
+    await new Promise(r => setTimeout(r, 10));
+    assert.strictEqual(copiedTexts[0], fullDebtorBid, 'Governance browser chip must copy full browser_id');
+    assert.strictEqual(govChip.textContent, 'b_debtor...');
 
     const headers2 = context.document.querySelectorAll('.client-card-header');
     headers2[1].onclick({ currentTarget: headers2[1] });
@@ -2453,7 +2821,7 @@ test('Phase 8 Commit 10: Client UserScript Runtime, Dynamic Design Engine & Prod
     assert.ok(recCall);
     assert.deepStrictEqual(JSON.parse(recCall.data), { discord_id: 'discord_debtor' });
 
-    // Operator Settings tab: omits Rolling Allowance completely and displays cycle-segregated usage without backticks
+    // Operator Settings tab: omits Rolling Allowance completely, copies linked browser IDs, and displays cycle-segregated usage without backticks
     networkCalls.length = 0;
     context.document.getElementById('admin-tab-settings').onclick();
     await new Promise(r => setTimeout(r, 20));
@@ -2466,6 +2834,7 @@ test('Phase 8 Commit 10: Client UserScript Runtime, Dynamic Design Engine & Prod
         tier: 'Admin',
         anlas_consumed: 240,
         precise_limit: 'Unlimited',
+        linked_devices: [{ id: fullAdminLinkedBid, label: 'Workstation' }],
         anlas: { is_unlimited: true, is_in_debt: false },
         v5: { is_unlimited: true, surplus_available_ncp: 320, surplus_eligible: true },
         telemetry: { master_v5_percent: 72.0, cluster_state: 'surplus_active', subscription_active: true, last_fetched_at: Date.now() },
@@ -2478,5 +2847,12 @@ test('Phase 8 Commit 10: Client UserScript Runtime, Dynamic Design Engine & Prod
     assert.doesNotMatch(adminPanelHtml, /`/, 'Admin Operator Settings must contain zero literal Markdown backticks');
     assert.strictEqual(context.document.getElementById('operator-period-usage').textContent, '65 Anlas · 12 images · 4 text');
     assert.strictEqual(context.document.getElementById('operator-anlas-consumed').textContent, '240 Anlas');
+
+    const opChip = context.document.querySelector('#operator-linked-devices .gw-copy-chip');
+    assert.ok(opChip);
+    opChip.onclick({ preventDefault: () => {}, stopPropagation: () => {} });
+    await new Promise(r => setTimeout(r, 10));
+    assert.strictEqual(copiedTexts[1], fullAdminLinkedBid, 'Operator linked browser chip must copy full browser_id');
+    assert.strictEqual(opChip.textContent, 'b_admin_li...');
   });
 });

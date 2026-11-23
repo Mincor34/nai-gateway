@@ -6,8 +6,9 @@
  * Intercepts outbound generation/upscale requests, executes secure token swaps, exposes
  * billing-cycle-segregated telemetry (`GET /admin/cycles`, `?cycle_epoch=` filtering),
  * Anlas/V5 balances, expired/offline token states, immediate post-push telemetry refresh,
- * balance adjustments (`POST /admin/adjust-balance`), debt forgiveness (`POST /admin/reconcile-debt`),
- * escapes all untrusted identifiers against stored XSS, and coordinates bilateral debug gates.
+ * clickable linked-browser ID copy chips, balance adjustments (`POST /admin/adjust-balance`),
+ * debt forgiveness (`POST /admin/reconcile-debt`), escapes all untrusted identifiers against
+ * stored XSS, and coordinates bilateral debug gates.
  */
 
 'use strict';
@@ -23,7 +24,8 @@ import {
   setClientPolicyState,
   initDOMObserver,
   ensureGuildWeaveStyles,
-  escapeHtml
+  escapeHtml,
+  attachCopyChipHandlers
 } from '../shared/ui.js';
 import { V5_HIGH_NCP_COST, V5_MEDIUM_NCP_COST } from '../shared/pricing.js';
 import { initInterceptor } from '../shared/interceptor.js';
@@ -100,7 +102,7 @@ function renderSetupWizard(container) {
     const safeNick = escapeHtml(GM_getValue("device_nickname", ""));
 
     container.innerHTML = `
-        <div class="setup-wizard-card gw-card" style="background:var(--theme-bg1, ${theme.bg1}); padding:28px; border-radius:12px; border:1px solid var(--theme-bg2, ${theme.borderStrong}); box-shadow:0 12px 36px rgba(0,0,0,0.6); max-width:90vw; width:430px; color:var(--theme-text, ${theme.text});">
+        <div class="setup-wizard-card gw-card" style="background:var(--gw-bg1, ${theme.bg1}); padding:28px; border-radius:12px; border:1px solid var(--gw-card-border, ${theme.cardBorder || theme.borderStrong}); box-shadow:0 12px 36px rgba(0,0,0,0.6); max-width:90vw; width:430px; color:var(--theme-text, ${theme.text});">
             <h3 style="margin:0 0 18px 0; color:var(--theme-accent, ${theme.accent}); text-align:center; font-size:18px; font-weight:700;">GuildWeave Admin Setup</h3>
             
             <div id="step-1-container" style="margin-bottom:18px;">
@@ -626,7 +628,7 @@ if (!approved || !VPS_HOST || !deviceSecret) {
                     const isExpanded = expandedKeys.has(selectorId);
 
                     const el = document.createElement("div");
-                    el.style.cssText = `background:var(--theme-bg1, ${theme.bg1}); border-radius:8px; border:1px solid ${group.banned === 1 ? `var(--theme-error, ${theme.error})` : `var(--theme-bg2, ${theme.border})`}; overflow:hidden; display:flex; flex-direction:column; transition:border-color 0.2s;`;
+                    el.style.cssText = `background:var(--gw-bg1, ${theme.bg1}); border-radius:8px; border:1px solid ${group.banned === 1 ? `var(--theme-error, ${theme.error})` : `var(--gw-card-border, ${theme.cardBorder || theme.border})`}; overflow:hidden; display:flex; flex-direction:column; transition:border-color 0.2s;`;
 
                     const statusDotColor = group.is_online ? `var(--theme-success, ${theme.success})` : `var(--theme-textSecondary, ${theme.textMuted})`;
                     const statusTitle = group.is_online ? "Online" : "Offline";
@@ -668,7 +670,7 @@ if (!approved || !VPS_HOST || !deviceSecret) {
 
                     if (isExpanded) {
                         const body = document.createElement("div");
-                        body.style.cssText = `padding:12px; border-top:1px solid ${theme.border}; background:var(--theme-bg1, ${theme.bg1}); display:flex; flex-direction:column; gap:10px;`;
+                        body.style.cssText = `padding:12px; border-top:1px solid ${theme.border}; background:var(--gw-bg1, ${theme.bg1}); display:flex; flex-direction:column; gap:10px;`;
 
                         let devicesHtml = '';
                         (group.devices || []).forEach(d => {
@@ -695,7 +697,7 @@ if (!approved || !VPS_HOST || !deviceSecret) {
                                 <div style="font-size:11px; color:var(--theme-textSecondary, ${theme.textMuted}); padding:6px 0; border-bottom:1px solid ${theme.border}; display:flex; justify-content:space-between; align-items:center; gap:8px;">
                                     <div style="display:flex; align-items:center; gap:6px; min-width:0; flex:1;">
                                         <div style="width:6px; height:6px; border-radius:50%; background:${devOnlineColor}; flex-shrink:0;"></div>
-                                        <span style="overflow:hidden; text-overflow:ellipsis; white-space:nowrap; color:var(--theme-text, ${theme.text});"><strong>${safeDevLabel}</strong> ${devBannedBadge}${allowanceBadge}${devDebugBadge} <span class="gw-code-chip">${safeBidShort}...</span></span>
+                                        <span style="overflow:hidden; text-overflow:ellipsis; white-space:nowrap; color:var(--theme-text, ${theme.text});"><strong>${safeDevLabel}</strong> ${devBannedBadge}${allowanceBadge}${devDebugBadge} <span role="button" tabindex="0" class="gw-code-chip gw-copy-chip" data-copy-id="${safeBid}" title="Click to copy full browser ID (${safeBid})">${safeBidShort}...</span></span>
                                     </div>
                                     <div style="display:flex; gap:4px; align-items:center;">
                                         ${devDebugBtn}
@@ -769,6 +771,8 @@ if (!approved || !VPS_HOST || !deviceSecret) {
 
                     container.appendChild(el);
                 });
+
+                attachCopyChipHandlers(container);
 
                 contentHost.querySelectorAll(".client-card-header").forEach(h => {
                     h.onclick = (e) => {
@@ -1025,7 +1029,7 @@ if (!approved || !VPS_HOST || !deviceSecret) {
 
                 <div style="padding-top:10px; border-top:1px solid ${theme.border};">
                     <span class="gw-stat-label" style="display:block; margin-bottom:5px;">Linked Browsers (Up to 3)</span>
-                    <div id="operator-linked-devices" class="gw-details-note" style="margin-top:0;">
+                    <div id="operator-linked-devices" class="gw-details-note" style="margin-top:0; display:flex; flex-direction:column; gap:4px;">
                         No other active links.
                     </div>
                 </div>
@@ -1094,8 +1098,13 @@ if (!approved || !VPS_HOST || !deviceSecret) {
                     const devicesEl = contentHost.querySelector('#operator-linked-devices');
                     if (devicesEl && data.linked_devices && data.linked_devices.length > 0) {
                         devicesEl.innerHTML = data.linked_devices
-                            .map(d => `<div><span class="gw-code-chip">${escapeHtml((d.id || '').substring(0, 10))}...</span> ${escapeHtml(d.label)}</div>`)
+                            .map(d => {
+                                const fullId = escapeHtml(d.id || '');
+                                const shortId = escapeHtml((d.id || '').substring(0, 10));
+                                return `<div><span role="button" tabindex="0" class="gw-code-chip gw-copy-chip" data-copy-id="${fullId}" title="Click to copy full browser ID (${fullId})">${shortId}...</span> ${escapeHtml(d.label)}</div>`;
+                            })
                             .join('');
+                        attachCopyChipHandlers(devicesEl);
                     }
                 }
             }).catch(() => {});

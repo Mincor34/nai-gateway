@@ -13,7 +13,8 @@
  * 3. Hijacks unsafeWindow.fetch calls to mock tier-specific capabilities.
  * 4. Polls `/auth/status` to keep Rolling Allowance (when Metered), V5 Allowance, Shared Bonus Pool,
  *    cycle-segregated activity counters, and Anlas debt lockouts synchronized across HUD and modal.
- * 5. Escapes all untrusted identifiers before DOM insertion and manages in-band debug consent.
+ * 5. Escapes all untrusted identifiers before DOM insertion, binds click-to-copy on linked browser
+ *    ID chips, and manages in-band debug consent.
  */
 
 'use strict';
@@ -31,7 +32,8 @@ import {
   setClientPolicyState,
   initDOMObserver,
   ensureGuildWeaveStyles,
-  escapeHtml
+  escapeHtml,
+  attachCopyChipHandlers
 } from '../shared/ui.js';
 import { V5_HIGH_NCP_COST, V5_MEDIUM_NCP_COST } from '../shared/pricing.js';
 import { initInterceptor } from '../shared/interceptor.js';
@@ -93,7 +95,7 @@ function renderSetupWizard(container) {
     const safeNick = escapeHtml(GM_getValue("device_nickname", ""));
 
     container.innerHTML = `
-        <div class="setup-wizard-card gw-card" style="background:var(--theme-bg1, ${theme.bg1}); padding:28px; border-radius:12px; border:1px solid var(--theme-bg2, ${theme.borderStrong}); box-shadow:0 12px 36px rgba(0,0,0,0.6); max-width:90vw; width:430px; color:var(--theme-text, ${theme.text});">
+        <div class="setup-wizard-card gw-card" style="background:var(--gw-bg1, ${theme.bg1}); padding:28px; border-radius:12px; border:1px solid var(--gw-card-border, ${theme.cardBorder || theme.borderStrong}); box-shadow:0 12px 36px rgba(0,0,0,0.6); max-width:90vw; width:430px; color:var(--theme-text, ${theme.text});">
             <h3 style="margin:0 0 18px 0; color:var(--theme-accent, ${theme.accent}); text-align:center; font-size:18px; font-weight:700;">GuildWeave Setup</h3>
             
             <div id="step-1-container" style="margin-bottom:18px;">
@@ -219,14 +221,16 @@ function renderSetupWizard(container) {
     }
 
     function showStep3() {
+        const safeFullBid = escapeHtml(browserId);
         step3Content.innerHTML = `
             <p style="margin: 0 0 8px 0; font-weight: 600; color: var(--theme-text, ${theme.text});">Link this browser via Discord:</p>
             <p style="margin: 0 0 10px 0;">Run this command in your Discord server to finish linking:</p>
-            <div class="gw-code-chip" style="display:block; padding:10px; text-align:center; word-break:break-all; color:var(--theme-warning, ${theme.warning}); margin-bottom:10px;">
-                /link browser_id:${escapeHtml(browserId)}
+            <div role="button" tabindex="0" class="gw-code-chip gw-copy-chip" data-copy-id="/link browser_id:${safeFullBid}" title="Click to copy command" style="display:block; padding:10px; text-align:center; word-break:break-all; color:var(--theme-warning, ${theme.warning}); margin-bottom:10px;">
+                /link browser_id:${safeFullBid}
             </div>
             <p style="margin:0; font-size:11px; text-align:center; animation: gwPulse 1.5s infinite alternate;">Waiting for approval...</p>
         `;
+        attachCopyChipHandlers(step3Content);
 
         const checkAuth = async () => {
             try {
@@ -386,7 +390,8 @@ if (!approved || !VPS_HOST) {
 
     /**
      * Renders the guest settings dashboard with user-friendly language, live theme styling,
-     * cycle-segregated server usage telemetry, V5 Allowance explanation, and XSS escaping.
+     * cycle-segregated server usage telemetry, V5 Allowance explanation, clickable copy chips,
+     * and XSS escaping.
      *
      * @param {HTMLElement} container - Mount destination.
      * @param {Function} [onClose] - Close callback.
@@ -485,7 +490,7 @@ if (!approved || !VPS_HOST) {
 
                 <div style="padding-top:10px; border-top:1px solid ${theme.border};">
                     <span class="gw-stat-label" style="display:block; margin-bottom:5px;">Linked Browsers (Up to 3)</span>
-                    <div id="guest-linked-devices" class="gw-details-note" style="margin-top:0;">
+                    <div id="guest-linked-devices" class="gw-details-note" style="margin-top:0; display:flex; flex-direction:column; gap:4px;">
                         No linked browsers found.
                     </div>
                     <div class="gw-details-note">Remove old browsers in Discord using <span class="gw-code-chip">/mygateway unlink</span>.</div>
@@ -496,7 +501,7 @@ if (!approved || !VPS_HOST) {
                 <label class="gw-toggle-row" for="settings-debug">
                     <div class="gw-toggle-copy">
                         <span class="gw-toggle-title">Share Generation Logs for Troubleshooting</span>
-                        <span class="gw-toggle-desc">When authorized by an admin, shares your prompt and generation parameters in server logs to diagnose issues. Personal account tokens stay strictly on your device.</span>
+                        <span class="gw-toggle-desc">When authorized by an admin, shares your prompt and generation parameters in server logs to diagnose issues. <b>This includes input images (e.g., image2image, Precise References).</b> Personal account tokens stay strictly on your device. <b>When turned off (default), your prompts remain fully private.</b></span>
                     </div>
                     <input type="checkbox" id="settings-debug" class="gw-switch" ${debugActive ? 'checked' : ''}>
                 </label>
@@ -634,8 +639,13 @@ if (!approved || !VPS_HOST) {
                     const devicesEl = container.querySelector("#guest-linked-devices");
                     if (devicesEl && data.linked_devices && data.linked_devices.length > 0) {
                         devicesEl.innerHTML = data.linked_devices
-                            .map(d => `<div><span class="gw-code-chip">${escapeHtml((d.id || '').substring(0, 10))}...</span> ${escapeHtml(d.label)}</div>`)
+                            .map(d => {
+                                const fullId = escapeHtml(d.id || '');
+                                const shortId = escapeHtml((d.id || '').substring(0, 10));
+                                return `<div><span role="button" tabindex="0" class="gw-code-chip gw-copy-chip" data-copy-id="${fullId}" title="Click to copy full browser ID (${fullId})">${shortId}...</span> ${escapeHtml(d.label)}</div>`;
+                            })
                             .join('');
+                        attachCopyChipHandlers(devicesEl);
                     }
 
                     const debugStatus = container.querySelector("#debug-intent-status");
