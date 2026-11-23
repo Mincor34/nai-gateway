@@ -2,21 +2,26 @@
  * DYNAMIC CLASS HARVESTER & DOM INJECTION ENGINE (src/userscripts/shared/domEngine.js)
  * 
  * ARCHITECTURAL MANDATE:
- * Implements the runtime "Anchor -> Scrape -> Inject" paradigm with live NovelAI theme parity.
- * 1. Semantic Query Anchoring: Targets permanent semantic anchors (.image-gen-nav-row,
- *    .image-gen-footer, .image-gen-model-mode-row) to locate mount targets and observe native
- *    Model, Effort, Width/Height, Steps, and Sample selections without coupling to transient sc-* hashes.
+ * Implements the runtime "Anchor -> Scrape -> Inject" paradigm with live NovelAI theme parity
+ * across both desktop and mobile layouts.
+ * 1. Semantic Query Anchoring: Targets visible permanent semantic anchors (`button[aria-label="menu"]`,
+ *    `.image-gen-generate-button`, `.image-gen-model-mode-row`) while skipping hidden (`display: none`)
+ *    duplicate desktop/mobile nodes so mounts, theme colors, and native Model/Effort/Spec reads stay
+ *    locked to the active layout across viewport resizes.
  * 2. Point-in-Time Class & Style Synchronization: Extracts compiled styled-components class strings
  *    from native DOM nodes (like `button[aria-label="menu"]`) AND continuously synchronizes class
  *    and computed color changes onto `#gw-nav-badge` when NovelAI loads user theme preferences
  *    asynchronously or swaps themes live.
- * 3. Live Theme Parity & Human-Readable Dual-Ledger HUD:
+ * 3. Live Theme Parity & Compact Mobile Dual-Ledger HUD:
  *    - Scrapes active NovelAI surface, text, border, control, and accent colors via `theme.js`,
  *      dynamically refreshing `#gw-v5-bar`, `#gw-allowance-bar`, and `#gw-button-shield` inline
  *      surfaces while preserving `var(--theme-bg0, <scraped>)` and `var(--theme-bg2, <scraped>)`
  *      wrappers for contract safety.
  *    - Renders the Dual-Ledger HUD (`#gw-v5-bar`) directly ABOVE `#gw-allowance-bar` so that
  *      `#gw-allowance-bar.nextElementSibling === .image-gen-generate-button` always remains intact.
+ *    - Automatically engages compact `.gw-v5-compact` mobile formatting (`window.innerWidth <= 640`
+ *      or narrow container `< 310px`), condensing rows to two crisp non-wrapping single lines
+ *      without truncating V5 High/Med generation counts or bloating mobile drawer height.
  *    - Translates internal V5 NCP units into human-readable High/Medium generation counts bounded
  *      against spendable master tank capacity, suppresses V5 generation cost display when configured
  *      for non-addon Anlas bypass (`>1MP`, `>1` sample, or `>28` steps on V5 High), and hides
@@ -27,9 +32,9 @@
  *    triggered by `#gw-nav-badge`.
  * 5. Ephemeral Telemetry Isolation: Keeps server telemetry strictly in page RAM (`cachedPolicyState`)
  *    and persists only explicit user preferences (`anlas_bypass_enabled`) in `GM_setValue`.
- * 6. Guarded MutationObserver & Head Stylesheet Observer: Employs requestAnimationFrame debouncing,
- *    strict self-mutation filtering (including `#gw-ui-styles`), and guarded input listeners for
- *    live deadband, cost, and theme updates.
+ * 6. Guarded MutationObserver, Head Stylesheet Observer & Resize Listener: Employs requestAnimationFrame
+ *    debouncing, strict self-mutation filtering (including `#gw-ui-styles`), and guarded input/resize
+ *    listeners for live deadband, cost, compact-mode, and theme updates.
  * 7. Zero Node.js Leaks: Strictly browser-safe.
  */
 
@@ -148,6 +153,113 @@ export function setClientPolicyState(partial = {}) {
 }
 
 /**
+ * Checks whether a DOM node and its ancestors are visible, remaining safe when
+ * `window.getComputedStyle` is unavailable (e.g. minimal VM sandboxes).
+ *
+ * @param {Element|null} node - Target DOM node.
+ * @returns {boolean} True if visible.
+ */
+function isDomNodeVisible(node) {
+  if (!node) return false;
+  const hasComputedStyle = typeof window !== 'undefined' && typeof window.getComputedStyle === 'function';
+
+  const isStyleHidden = (el) => {
+    if (!el) return true;
+    if (hasComputedStyle) {
+      try {
+        const st = window.getComputedStyle(el);
+        if (st && (st.display === 'none' || st.visibility === 'hidden' || st.opacity === '0')) {
+          return true;
+        }
+      } catch (_) {}
+    }
+    const inline = el.style;
+    if (inline && (inline.display === 'none' || inline.visibility === 'hidden' || inline.opacity === '0')) {
+      return true;
+    }
+    return false;
+  };
+
+  if (isStyleHidden(node)) return false;
+
+  let cur = node.parentElement;
+  let hops = 0;
+  while (cur && hops < 16) {
+    if (hasComputedStyle) {
+      try {
+        const st = window.getComputedStyle(cur);
+        if (st && (st.display === 'none' || st.opacity === '0')) {
+          return false;
+        }
+      } catch (_) {}
+    }
+    if (cur.style && (cur.style.display === 'none' || cur.style.opacity === '0')) {
+      return false;
+    }
+    if (typeof document !== 'undefined' && (cur === document.body || cur === document.documentElement)) break;
+    cur = cur.parentElement;
+    hops++;
+  }
+  return true;
+}
+
+/**
+ * Selects the first visible matching element for a CSS selector, falling back to
+ * the first DOM match if all matches are currently hidden.
+ *
+ * @param {string} selector - CSS selector string.
+ * @returns {Element|null} Matched element or null.
+ */
+function pickVisibleDomElement(selector) {
+  if (typeof document === 'undefined') return null;
+  if (typeof document.querySelectorAll === 'function') {
+    const matches = document.querySelectorAll(selector);
+    if (matches && matches.length > 0) {
+      for (const el of matches) {
+        if (el && !isInsideGuildWeaveNode(el) && isDomNodeVisible(el)) {
+          return el;
+        }
+      }
+      for (const el of matches) {
+        if (el && !isInsideGuildWeaveNode(el)) {
+          return el;
+        }
+      }
+    }
+  }
+  return typeof document.querySelector === 'function' ? document.querySelector(selector) : null;
+}
+
+/**
+ * Determines whether the GuildWeave HUD should render in compact mobile layout
+ * (`window.innerWidth <= 640` or narrow `#gw-v5-bar` width `< 310px`).
+ *
+ * @returns {boolean} True when compact layout should be applied.
+ */
+export function isCompactHudLayout() {
+  if (
+    typeof window !== 'undefined' &&
+    typeof window.innerWidth === 'number' &&
+    window.innerWidth > 0 &&
+    window.innerWidth <= 640
+  ) {
+    return true;
+  }
+  if (typeof document !== 'undefined' && typeof document.getElementById === 'function') {
+    const v5Root = document.getElementById('gw-v5-bar');
+    if (v5Root && typeof v5Root.getBoundingClientRect === 'function') {
+      try {
+        const rect = v5Root.getBoundingClientRect();
+        if (rect && typeof rect.width === 'number' && rect.width > 0 && rect.width < 310) {
+          return true;
+        }
+      } catch (_) {}
+    }
+  }
+  return false;
+}
+
+/**
  * Parses an `rgb()` / `rgba()` CSS color string into RGBA components.
  *
  * @param {string} cssColor - Computed CSS color value.
@@ -256,9 +368,10 @@ function isInsideGuildWeaveNode(node) {
 
 /**
  * Reads NovelAI's live generation geometry (width, height, steps, sample count) from
- * native UI controls so `#gw-v5-cost` accurately suppresses V5 credit charges whenever
- * the user has configured a non-addon Anlas bypass (`>1MP`, `>1` sample, or `>28` steps
- * on V5 High) while keeping V5 credit charges visible for addon-only Anlas usage.
+ * native UI controls (prioritizing visible controls over hidden drawer duplicates)
+ * so `#gw-v5-cost` accurately suppresses V5 credit charges whenever the user has
+ * configured a non-addon Anlas bypass (`>1MP`, `>1` sample, or `>28` steps on V5 High)
+ * while keeping V5 credit charges visible for addon-only Anlas usage.
  *
  * @param {string} [activeModel=''] - Active model identifier.
  * @returns {{ width: number, height: number, area: number, steps: number, samples: number }}
@@ -279,6 +392,11 @@ export function readNativeGenerationSpecsFromDOM(activeModel = '') {
   let foundSteps = null;
   let foundSamples = null;
 
+  let hiddenWidth = null;
+  let hiddenHeight = null;
+  let hiddenSteps = null;
+  let hiddenSamples = null;
+
   const inputs = document.querySelectorAll('input');
   for (const input of inputs) {
     if (!input || isInsideGuildWeaveNode(input)) continue;
@@ -289,25 +407,35 @@ export function readNativeGenerationSpecsFromDOM(activeModel = '') {
     const numVal = parseInt(input.value, 10);
     if (!Number.isFinite(numVal) || numVal <= 0) continue;
 
+    const visible = isDomNodeVisible(input);
     if (isStepControlInput(input)) {
-      foundSteps = numVal;
+      if (visible) foundSteps = numVal;
+      else if (hiddenSteps === null) hiddenSteps = numVal;
     } else if (aria === 'width' || placeholder === 'width' || name === 'width' || id.includes('width')) {
-      foundWidth = numVal;
+      if (visible) foundWidth = numVal;
+      else if (hiddenWidth === null) hiddenWidth = numVal;
     } else if (aria === 'height' || placeholder === 'height' || name === 'height' || id.includes('height')) {
-      foundHeight = numVal;
+      if (visible) foundHeight = numVal;
+      else if (hiddenHeight === null) hiddenHeight = numVal;
     } else if (
       aria.includes('number of images') ||
       aria.includes('samples') ||
       name === 'n_samples' ||
       id.includes('sample')
     ) {
-      foundSamples = numVal;
+      if (visible) foundSamples = numVal;
+      else if (hiddenSamples === null) hiddenSamples = numVal;
     }
   }
 
+  if (foundWidth === null) foundWidth = hiddenWidth;
+  if (foundHeight === null) foundHeight = hiddenHeight;
+  if (foundSteps === null) foundSteps = hiddenSteps;
+  if (foundSamples === null) foundSamples = hiddenSamples;
+
   // Fallback for sample count inside `.image-gen-generate-button` ("Generate 4 Images")
-  if (foundSamples === null && typeof document.querySelector === 'function') {
-    const genBtn = document.querySelector('.image-gen-generate-button');
+  if (foundSamples === null) {
+    const genBtn = pickVisibleDomElement('.image-gen-generate-button');
     if (genBtn) {
       const btnTextParts = [];
       for (const child of genBtn.children) {
@@ -332,7 +460,7 @@ export function readNativeGenerationSpecsFromDOM(activeModel = '') {
     if (typeof document.querySelectorAll === 'function') {
       candidateGroups.push(...document.querySelectorAll('div, span, button'));
     }
-    const footerEl = typeof document.querySelector === 'function' ? document.querySelector('.image-gen-footer') : null;
+    const footerEl = pickVisibleDomElement('.image-gen-footer');
     for (const el of candidateGroups) {
       if (!el || isInsideGuildWeaveNode(el)) continue;
       const cls = el.getAttribute('class') || '';
@@ -379,12 +507,12 @@ export function readNativeGenerationSpecsFromDOM(activeModel = '') {
 export function readNativeModelAndEffortFromDOM() {
   if (typeof document === 'undefined' || typeof document.querySelector !== 'function') return null;
 
-  const modelRow = document.querySelector('.image-gen-model-mode-row');
+  const modelRow = pickVisibleDomElement('.image-gen-model-mode-row');
   if (!modelRow) return null;
 
   let modelText = '';
   const modelInput = modelRow.querySelector('input[aria-label="Select the Model"]') ||
-    document.querySelector('input[aria-label="Select the Model"]');
+    pickVisibleDomElement('input[aria-label="Select the Model"]');
 
   if (modelInput && modelInput.parentElement) {
     const prev = modelInput.previousElementSibling;
@@ -497,15 +625,15 @@ function syncNavBadgeAppearance(badgeBtn, menuBtn) {
 }
 
 /**
- * Injects the Guild Badge trigger button into `.image-gen-nav-row` and keeps
- * its classes and computed colors synced to `button[aria-label="menu"]`.
- * Preserves the 3-item flex distribution by nesting inside the hamburger menu's wrapper.
+ * Injects the Guild Badge trigger button into the visible `button[aria-label="menu"]`
+ * wrapper (supporting both desktop `.image-gen-nav-row` and mobile top bars) and keeps
+ * its classes and computed colors synced across theme changes and viewport resizes.
  *
  * @param {Function} onClickHandler - Callback invoked when the badge button is clicked.
  * @returns {boolean} True if element is mounted and synced.
  */
 export function injectNavBadge(onClickHandler) {
-  const menuBtn = document.querySelector('button[aria-label="menu"]');
+  const menuBtn = pickVisibleDomElement('button[aria-label="menu"]');
   if (!menuBtn || !menuBtn.parentElement) return false;
 
   const existing = document.getElementById('gw-nav-badge');
@@ -554,18 +682,25 @@ export function injectNavBadge(onClickHandler) {
 }
 
 /**
- * Constructs and injects the standalone Rolling Allowance Bar directly above
- * .image-gen-generate-button inside .image-gen-footer.
+ * Constructs and injects the standalone Rolling Allowance Bar directly above the visible
+ * `.image-gen-generate-button` inside its parent wrapper. Automatically relocates if
+ * responsive layout switches which Generate button is visible.
  * Hidden by default (`display: none`) until `/auth/status` confirms a Metered tier (`session !== null`),
- * preserving `allowanceBar.nextElementSibling === genBtn` without cluttering unlimited tiers.
+ * preserving `allowanceBar.nextElementSibling === genBtn`.
  *
- * @returns {boolean} True if element was injected or already exists.
+ * @returns {boolean} True if element was injected or already exists in the active slot.
  */
 export function injectAllowanceBar() {
-  if (document.getElementById('gw-allowance-bar')) return true;
-
-  const genBtn = document.querySelector('.image-gen-generate-button');
+  const genBtn = pickVisibleDomElement('.image-gen-generate-button');
   if (!genBtn || !genBtn.parentElement) return false;
+
+  const existing = document.getElementById('gw-allowance-bar');
+  if (existing) {
+    if (existing.parentElement === genBtn.parentElement && existing.nextElementSibling === genBtn) {
+      return true;
+    }
+    existing.remove();
+  }
 
   const theme = ensureGuildWeaveStyles();
 
@@ -661,14 +796,20 @@ export function refreshDualLedgerHud() {
  * Constructs and injects the ACS-1 Dual-Ledger HUD (`#gw-v5-bar`) immediately ABOVE
  * `#gw-allowance-bar`, preserving `#gw-allowance-bar.nextElementSibling === genBtn`.
  *
- * @returns {boolean} True if mounted or already present.
+ * @returns {boolean} True if mounted or already present in the active slot.
  */
 export function injectDualLedgerBar() {
   injectAllowanceBar();
-  if (document.getElementById('gw-v5-bar')) return true;
-
   const allowanceBar = document.getElementById('gw-allowance-bar');
   if (!allowanceBar || !allowanceBar.parentElement) return false;
+
+  const existing = document.getElementById('gw-v5-bar');
+  if (existing) {
+    if (existing.parentElement === allowanceBar.parentElement && existing.nextElementSibling === allowanceBar) {
+      return true;
+    }
+    existing.remove();
+  }
 
   const theme = ensureGuildWeaveStyles();
 
@@ -690,6 +831,7 @@ export function injectDualLedgerBar() {
 
   // Row 1: V5 Free Allowance (in readable High / Med images) + Shared Pool Status & Recharge ETA
   const v5HeaderRow = document.createElement('div');
+  v5HeaderRow.className = 'gw-hud-row';
   v5HeaderRow.style.cssText = 'display: flex; flex-direction: row; align-items: center; justify-content: space-between; gap: 6px;';
 
   const v5Label = document.createElement('span');
@@ -717,6 +859,7 @@ export function injectDualLedgerBar() {
 
   // Row 2: Monthly Anlas + Active V5 Cost (hidden during non-addon Anlas bypass) + Use Monthly Anlas Toggle
   const controlsRow = document.createElement('div');
+  controlsRow.className = 'gw-hud-row';
   controlsRow.style.cssText = 'display: flex; flex-direction: row; align-items: center; justify-content: space-between; gap: 6px; flex-wrap: wrap;';
 
   const anlasLabel = document.createElement('span');
@@ -726,6 +869,7 @@ export function injectDualLedgerBar() {
   anlasLabel.setAttribute('title', 'Resets each billing cycle; unused Anlas does not roll over.');
 
   const rightControls = document.createElement('div');
+  rightControls.className = 'gw-hud-right';
   rightControls.style.cssText = 'display: flex; align-items: center; gap: 8px;';
 
   const costBadge = document.createElement('span');
@@ -831,16 +975,17 @@ export function setHudAlert(message, severity = 'warning') {
  * Formats milliseconds until next percent into compact human-readable countdown text.
  *
  * @param {number|null|undefined} etaMs - Milliseconds until next percent.
+ * @param {boolean} [compact=false] - Whether to omit verbose `"in "` wording for mobile.
  * @returns {string} Formatted countdown badge.
  */
-function formatNextPercentEta(etaMs) {
+function formatNextPercentEta(etaMs, compact = false) {
   if (typeof etaMs !== 'number' || !Number.isFinite(etaMs)) return '';
   if (etaMs <= 0) return 'Full';
   const mins = Math.max(0.1, etaMs / 60000);
   if (mins >= 60) {
-    return `+1% in ${(mins / 60).toFixed(1)}h`;
+    return compact ? `+${(mins / 60).toFixed(1)}h` : `+1% in ${(mins / 60).toFixed(1)}h`;
   }
-  return `+1% in ${mins.toFixed(1)}m`;
+  return compact ? `+${mins.toFixed(1)}m` : `+1% in ${mins.toFixed(1)}m`;
 }
 
 /**
@@ -903,14 +1048,15 @@ function computeClientSpendableMasterNcp(state) {
 }
 
 /**
- * Renders the `#gw-v5-bar` labels, native V5 generation credit indicator (suppressed when
- * spending non-addon Anlas), live scraped theme surface/border colors, progress fill,
- * debt warnings, and toggle state.
+ * Renders the `#gw-v5-bar` labels, compact mobile formatting (`gw-v5-compact`),
+ * native V5 generation credit indicator (suppressed when spending non-addon Anlas),
+ * live scraped theme surface/border colors, progress fill, debt warnings, and toggle state.
  *
  * @param {object} state - Normalized client policy state.
  */
 function renderDualLedgerHudFromState(state) {
   const theme = ensureGuildWeaveStyles();
+  const compact = isCompactHudLayout();
 
   const v5Root = document.getElementById('gw-v5-bar');
   const v5Track = document.getElementById('gw-v5-track');
@@ -928,10 +1074,15 @@ function renderDualLedgerHudFromState(state) {
   const shieldEl = document.getElementById('gw-button-shield');
   const shieldTextEl = document.getElementById('gw-shield-text');
 
-  // Continuously keep injected bars synced with live NovelAI theme colors
+  // Continuously keep injected bars synced with live NovelAI theme colors & compact state
   if (v5Root) {
     v5Root.style.backgroundColor = `var(--theme-bg0, ${theme.bg0})`;
     v5Root.style.border = `1px solid var(--theme-bg2, ${theme.borderStrong})`;
+    if (compact) {
+      v5Root.className = 'gw-v5-compact';
+    } else if (v5Root.className === 'gw-v5-compact') {
+      v5Root.className = '';
+    }
   }
   if (v5Track) {
     v5Track.style.background = theme.border;
@@ -965,30 +1116,30 @@ function renderDualLedgerHudFromState(state) {
   );
 
   const spendableMasterNcp = computeClientSpendableMasterNcp(state);
+  const pctText = typeof state.masterV5Percent === 'number' && Number.isFinite(state.masterV5Percent)
+    ? `${state.masterV5Percent.toFixed(1)}%`
+    : '--%';
 
   if (v5Label && v5Fill) {
     v5Label.style.color = `var(--theme-text, ${theme.text})`;
-    const pctText = typeof state.masterV5Percent === 'number' && Number.isFinite(state.masterV5Percent)
-      ? `${state.masterV5Percent.toFixed(1)}%`
-      : '--%';
 
     if (state.masterTokenExpired || state.clusterState === 'token_expired') {
-      v5Label.textContent = 'Master Token Expired (Awaiting Admin)';
+      v5Label.textContent = compact ? 'Token Expired' : 'Master Token Expired (Awaiting Admin)';
       v5Label.setAttribute('title', 'The shared NovelAI session token expired and needs to be refreshed by an admin.');
       v5Fill.style.width = '0%';
       v5Fill.style.backgroundColor = `var(--theme-error, ${theme.error})`;
     } else if (state.subscriptionActive === false && state.lastFetchedAt > 0) {
-      v5Label.textContent = 'Master Subscription Inactive';
+      v5Label.textContent = compact ? 'Sub Inactive' : 'Master Subscription Inactive';
       v5Fill.style.width = '0%';
       v5Fill.style.backgroundColor = `var(--theme-error, ${theme.error})`;
     } else if (state.isHardLocked) {
-      v5Label.textContent = `V5 Recharging (${pctText} <= 5.5%)`;
+      v5Label.textContent = compact ? `Recharging (${pctText})` : `V5 Recharging (${pctText} <= 5.5%)`;
       v5Label.setAttribute('title', 'Shared V5 capacity must stay above 5.5% to prevent a cluster-wide cooldown. Legacy models and Anlas-paid specs still work.');
       const widthPct = typeof state.masterV5Percent === 'number' ? Math.max(0, Math.min(100, state.masterV5Percent)) : 0;
       v5Fill.style.width = `${widthPct}%`;
       v5Fill.style.backgroundColor = `var(--theme-error, ${theme.error})`;
     } else if (state.isUnlimitedV5) {
-      v5Label.textContent = `V5 Allowance: Unlimited · Pool: ${pctText}`;
+      v5Label.textContent = compact ? 'V5: Unlimited' : `V5 Allowance: Unlimited · Pool: ${pctText}`;
       v5Fill.style.width = '100%';
       v5Fill.style.backgroundColor = resolveClusterStateColor(state.clusterState, theme);
     } else if (typeof state.v5AvailableNcp === 'number') {
@@ -1007,9 +1158,16 @@ function renderDualLedgerHudFromState(state) {
         : 0;
       const surplusSuffix = surplusHigh > 0 ? ` (+${surplusHigh} Bonus)` : '';
       const depleted = effectiveNcp < V5_MEDIUM_NCP_COST && (!state.v5SurplusEligible || effectiveSurplus < V5_MEDIUM_NCP_COST);
-      v5Label.textContent = depleted
-        ? `V5 Limit Reached · Pool: ${pctText}`
-        : `V5 Free: ${highLeft} High / ${medLeft} Med${surplusSuffix} · Pool: ${pctText}`;
+
+      if (compact) {
+        v5Label.textContent = depleted
+          ? 'V5 Limit Reached'
+          : `V5: ${highLeft}H/${medLeft}M${surplusHigh > 0 ? `+${surplusHigh}` : ''}`;
+      } else {
+        v5Label.textContent = depleted
+          ? `V5 Limit Reached · Pool: ${pctText}`
+          : `V5 Free: ${highLeft} High / ${medLeft} Med${surplusSuffix} · Pool: ${pctText}`;
+      }
       v5Label.setAttribute(
         'title',
         `Personal Reserve: ${effectiveNcp}/${maxNcp} V5 credits (accumulates daily up to 3 days). Bonus Pool activates above 50% shared pool.`
@@ -1018,15 +1176,31 @@ function renderDualLedgerHudFromState(state) {
       v5Fill.style.width = `${barPct}%`;
       v5Fill.style.backgroundColor = resolveClusterStateColor(state.clusterState, theme);
     } else {
-      v5Label.textContent = `V5 Allowance: Syncing · Pool: ${pctText}`;
+      v5Label.textContent = compact ? 'V5: Syncing' : `V5 Allowance: Syncing · Pool: ${pctText}`;
     }
   }
 
   if (v5Eta) {
     v5Eta.style.color = `var(--theme-textSecondary, ${theme.textMuted})`;
-    const etaStr = formatNextPercentEta(state.nextPercentEtaMs);
-    const stateLabel = formatReadableClusterState(state.clusterState);
-    v5Eta.textContent = [stateLabel, etaStr].filter(Boolean).join(' · ');
+    const fullEtaStr = formatNextPercentEta(state.nextPercentEtaMs, false);
+    const fullStateLabel = formatReadableClusterState(state.clusterState);
+    const fullCombo = [fullStateLabel, fullEtaStr].filter(Boolean).join(' · ');
+
+    if (compact) {
+      if (state.masterTokenExpired || state.clusterState === 'token_expired') {
+        v5Eta.textContent = 'Admin Reset';
+      } else if (state.subscriptionActive === false && state.lastFetchedAt > 0) {
+        v5Eta.textContent = 'Paused';
+      } else {
+        const shortEta = formatNextPercentEta(state.nextPercentEtaMs, true);
+        v5Eta.textContent = [pctText !== '--%' ? pctText : '', shortEta].filter(Boolean).join(' · ') || fullStateLabel;
+      }
+      if (fullCombo) {
+        v5Eta.setAttribute('title', `${fullCombo} (Shared Pool ${pctText})`);
+      }
+    } else {
+      v5Eta.textContent = fullCombo;
+    }
   }
 
   if (costBadge) {
@@ -1035,34 +1209,38 @@ function renderDualLedgerHudFromState(state) {
       costBadge.textContent = '';
     } else if (isMed) {
       costBadge.style.display = '';
-      costBadge.textContent = `Uses ${V5_MEDIUM_NCP_COST} V5 pts (Med)`;
+      costBadge.textContent = compact ? `${V5_MEDIUM_NCP_COST} pts` : `Uses ${V5_MEDIUM_NCP_COST} V5 pts (Med)`;
       costBadge.setAttribute('title', `Medium effort uses ${V5_MEDIUM_NCP_COST} credits vs ${V5_HIGH_NCP_COST} on High.`);
       costBadge.style.color = `var(--theme-text, ${theme.text})`;
     } else if (isV5) {
       costBadge.style.display = '';
-      costBadge.textContent = `Uses ${V5_HIGH_NCP_COST} V5 pts (High)`;
+      costBadge.textContent = compact ? `${V5_HIGH_NCP_COST} pts` : `Uses ${V5_HIGH_NCP_COST} V5 pts (High)`;
       costBadge.setAttribute('title', `High effort uses ${V5_HIGH_NCP_COST} credits per free-size generation.`);
       costBadge.style.color = `var(--theme-text, ${theme.text})`;
     } else {
       costBadge.style.display = '';
-      costBadge.textContent = 'Legacy (0 V5 pts)';
+      costBadge.textContent = compact ? 'Legacy' : 'Legacy (0 V5 pts)';
       costBadge.style.color = `var(--theme-textSecondary, ${theme.textMuted})`;
     }
   }
 
   if (anlasLabel) {
     if (state.isUnlimitedAnlas) {
-      anlasLabel.textContent = 'Monthly Anlas: Unlimited';
+      anlasLabel.textContent = compact ? 'Anlas: Unlimited' : 'Monthly Anlas: Unlimited';
       anlasLabel.style.color = `var(--theme-text, ${theme.text})`;
     } else if (state.isInDebt) {
-      anlasLabel.textContent = `Anlas Overdrawn: ${state.virtualBalance} (Paid Paused)`;
+      anlasLabel.textContent = compact
+        ? `Anlas: ${state.virtualBalance} (Paused)`
+        : `Anlas Overdrawn: ${state.virtualBalance} (Paid Paused)`;
       anlasLabel.style.color = `var(--theme-error, ${theme.error})`;
     } else if (typeof state.availableAnlas === 'number') {
       const quotaSuffix = typeof state.monthlyQuota === 'number' ? `/${state.monthlyQuota}` : '';
-      anlasLabel.textContent = `Monthly Anlas: ${state.availableAnlas}${quotaSuffix}`;
+      anlasLabel.textContent = compact
+        ? `Anlas: ${state.availableAnlas}${quotaSuffix}`
+        : `Monthly Anlas: ${state.availableAnlas}${quotaSuffix}`;
       anlasLabel.style.color = `var(--theme-textSecondary, ${theme.textMuted})`;
     } else {
-      anlasLabel.textContent = 'Monthly Anlas: --';
+      anlasLabel.textContent = compact ? 'Anlas: --' : 'Monthly Anlas: --';
       anlasLabel.style.color = `var(--theme-textSecondary, ${theme.textMuted})`;
     }
   }
@@ -1071,7 +1249,7 @@ function renderDualLedgerHudFromState(state) {
     if (state.isInDebt) {
       bypassCheckbox.checked = false;
       bypassCheckbox.disabled = true;
-      bypassText.textContent = 'Anlas Paused';
+      bypassText.textContent = compact ? 'Paused' : 'Anlas Paused';
       bypassText.style.color = `var(--theme-error, ${theme.error})`;
     } else {
       bypassCheckbox.disabled = false;
@@ -1244,16 +1422,16 @@ export function syncUIControlConstraints(state = getClientPolicyState()) {
 }
 
 /**
- * Scrapes NovelAI's rendered Anlas cost integer from `.image-gen-generate-button` children
- * (ignoring `#gw-button-shield` and sample-count numbers nested inside `"Generate N Image"` labels).
- * Prioritizes `.native-anlas-container`, then explicit `"<N> Anlas"` spans, and finally
+ * Scrapes NovelAI's rendered Anlas cost integer from the visible `.image-gen-generate-button`
+ * children (ignoring `#gw-button-shield` and sample-count numbers nested inside `"Generate N Image"`
+ * labels). Prioritizes `.native-anlas-container`, then explicit `"<N> Anlas"` spans, and finally
  * pure numeric spans whose ancestor chain inside the button contains no Generate/Image text.
  *
  * @returns {number|null} Scraped integer Anlas cost or null if absent.
  */
 export function scrapeDisplayedAnlasCost() {
   if (typeof document === 'undefined' || typeof document.querySelector !== 'function') return null;
-  const genBtn = document.querySelector('.image-gen-generate-button');
+  const genBtn = pickVisibleDomElement('.image-gen-generate-button');
   if (!genBtn) return null;
 
   const isInsideShield = (node) => {
@@ -1360,16 +1538,22 @@ export function updateAllowanceBar(allowance, maxAllowance, nextRefillMs = 0) {
 }
 
 /**
- * Mounts an absolute pointer-event shield over .image-gen-generate-button.
+ * Mounts an absolute pointer-event shield over the visible `.image-gen-generate-button`.
  * Strictly avoids polluting the overlay element with the button's own CSS class hashes.
  *
- * @returns {boolean} True if shield is mounted or exists.
+ * @returns {boolean} True if shield is mounted or exists on the active button.
  */
 export function injectQueueShield() {
-  const genBtn = document.querySelector('.image-gen-generate-button');
+  const genBtn = pickVisibleDomElement('.image-gen-generate-button');
   if (!genBtn) return false;
 
-  if (document.getElementById('gw-button-shield')) return true;
+  const existing = document.getElementById('gw-button-shield');
+  if (existing) {
+    if (existing.parentElement === genBtn) {
+      return true;
+    }
+    existing.remove();
+  }
 
   const theme = ensureGuildWeaveStyles();
 
@@ -1479,11 +1663,12 @@ let headObserverInstance = null;
 let rafScheduled = false;
 let observedInputRoot = null;
 let inputConstraintHandler = null;
+let resizeHandler = null;
 
 /**
- * Initializes the unified MutationObserver lifecycle engine, head stylesheet observer, and
- * reactive input listeners. Executes idempotent mounts and tracks native Model / Effort /
- * Theme / Spec mutations via requestAnimationFrame.
+ * Initializes the unified MutationObserver lifecycle engine, head stylesheet observer,
+ * viewport resize handler, and reactive input listeners. Executes idempotent mounts
+ * and tracks native Model / Effort / Theme / Spec mutations via requestAnimationFrame.
  *
  * @param {object} options - Lifecycle callbacks.
  * @param {Function} [options.onOpenSettings] - Triggered by the nav row badge.
@@ -1575,11 +1760,16 @@ export function initDOMObserver(options = {}) {
     });
   }
 
+  if (typeof window !== 'undefined' && typeof window.addEventListener === 'function') {
+    resizeHandler = scheduleSync;
+    window.addEventListener('resize', resizeHandler);
+  }
+
   runSync();
 }
 
 /**
- * Disconnects active MutationObservers and removes reactive step-input listeners.
+ * Disconnects active MutationObservers and removes reactive step-input and resize listeners.
  */
 export function stopDOMObserver() {
   if (observerInstance) {
@@ -1594,6 +1784,10 @@ export function stopDOMObserver() {
     observedInputRoot.removeEventListener('input', inputConstraintHandler, true);
     observedInputRoot.removeEventListener('change', inputConstraintHandler, true);
   }
+  if (resizeHandler && typeof window !== 'undefined' && typeof window.removeEventListener === 'function') {
+    window.removeEventListener('resize', resizeHandler);
+  }
   observedInputRoot = null;
   inputConstraintHandler = null;
+  resizeHandler = null;
 }

@@ -4,26 +4,28 @@
  * DESIGN PRINCIPLES:
  * 1. Dynamic Runtime Theme Matching: NovelAI styles via compiled styled-components without
  *    global `:root` CSS variables, often keeping base dark-navy fallback CSS on `document.body`,
- *    outer wrappers beneath `linear-gradient(...)` surfaces, or ancestor-hidden `[role="dialog"]` nodes
- *    while painting the active theme onto inner `.image-gen-*` wrappers, `.image-gen-character-prompts`
- *    cards, `[data-prompt-input="true"]` / `.prompt-input-box-prompt` inputs, and effort pills.
- *    Inspects visible `backgroundImage` gradient stops BEFORE `backgroundColor`, skips hidden nodes
- *    and subtrees under `display: none` / `opacity: 0` ancestors, rejects elevation drop shadows
- *    while accepting `0 0 0 <N>px` border rings, walks the exact editor lineage inside
- *    `promptBoxEl` (skipping sibling toolbars regardless of DOM order), alpha-composites explicit
- *    card/input anchors over `bg0`, and scopes `--theme-*` and `--gw-*` tokens onto GuildWeave
- *    root containers to neutralize stale `:root` defaults.
+ *    outer wrappers beneath `linear-gradient(...)` surfaces, hidden desktop layout containers on
+ *    mobile breakpoints, or ancestor-hidden `[role="dialog"]` nodes while painting the active theme
+ *    onto visible layout containers, `.image-gen-character-prompts` cards, `[data-prompt-input="true"]`
+ *    / `.prompt-input-box-prompt` inputs, and effort pills.
+ *    Skips hidden (`display: none` / `visibility: hidden` / `opacity: 0`) DOM branches so mobile
+ *    layouts never scrape hidden desktop nodes, inspects visible `backgroundImage` gradient stops
+ *    BEFORE `backgroundColor` (supporting comma/space `rgb()`/`hsl()`/`#hex` syntax), rejects blurred
+ *    elevation drop shadows while accepting `0 0 0 <N>px` border rings, walks bounded visible layout
+ *    descendants of `#__next`/`body` plus visible `menuBtn`/`genBtn`/`promptNode` ancestors (outer-to-inner),
+ *    guards against stale `#13152c` body fallbacks when visible warm/colored card surfaces exist,
+ *    and scopes `--theme-*` and `--gw-*` tokens onto GuildWeave root containers.
  * 2. Preserves `--theme-bg0` / `--theme-bg2` Fallback Wrappers: Emits `var(--theme-bg0, <scraped>)`
  *    so existing Phase 6 and Commit 10 contracts hold while live NovelAI colors win at runtime.
- * 3. Scoped Stylesheet Isolation: Injects a single `<style id="gw-ui-styles">` sheet scoped
- *    strictly to `#gw-v5-bar`, `#gw-allowance-bar`, `#vps-settings-modal`, `#vps-admin-panel`,
- *    and `#vps-approval-overlay`, locking checkbox geometry against NovelAI global `input`
- *    rules and only mutating `styleEl.textContent` when computed CSS actually changes.
+ * 3. Scoped Stylesheet Isolation & Compact Mobile Rules: Injects a single `<style id="gw-ui-styles">`
+ *    sheet scoped strictly to `#gw-v5-bar`, `#gw-allowance-bar`, `#vps-settings-modal`, `#vps-admin-panel`,
+ *    and `#vps-approval-overlay`, locking switch geometry and providing compact `@media (max-width: 640px)`
+ *    + `.gw-v5-compact` rules that keep mobile HUD rows single-line without vertical bloat.
  * 4. Strict XSS Defense & Clipboard Hygiene: Exposes `escapeHtml()`, `copyTextToClipboard()`, and
  *    `attachCopyChipHandlers()` with monotonic `copySeq` timer cancellation for safe untrusted
  *    string rendering and full-ID copying across rapid clicks.
  * 5. Pure Browser Sandbox Compatibility: Guards `window.getComputedStyle`, `document.head`,
- *    `navigator.clipboard`, and `document.execCommand` for minimal VM harnesses.
+ *    `document.querySelectorAll`, `navigator.clipboard`, and `document.execCommand` for minimal VM harnesses.
  */
 
 'use strict';
@@ -160,8 +162,45 @@ export function attachCopyChipHandlers(rootEl) {
   }
 }
 
+function parseAlphaToken(rawAlpha) {
+  if (rawAlpha === undefined || rawAlpha === null || rawAlpha === '') return 1;
+  const trimmed = String(rawAlpha).trim();
+  if (trimmed.endsWith('%')) {
+    const pct = parseFloat(trimmed.slice(0, -1));
+    return Number.isFinite(pct) ? Math.max(0, Math.min(1, pct / 100)) : 1;
+  }
+  const num = parseFloat(trimmed);
+  return Number.isFinite(num) ? Math.max(0, Math.min(1, num)) : 1;
+}
+
+function hslToRgb(hDeg, sPct, lPct) {
+  const h = ((hDeg % 360) + 360) % 360 / 360;
+  const s = Math.max(0, Math.min(1, sPct / 100));
+  const l = Math.max(0, Math.min(1, lPct / 100));
+  if (s === 0) {
+    const v = Math.round(l * 255);
+    return { r: v, g: v, b: v };
+  }
+  const hue2rgb = (p, q, t) => {
+    let tt = t;
+    if (tt < 0) tt += 1;
+    if (tt > 1) tt -= 1;
+    if (tt < 1 / 6) return p + (q - p) * 6 * tt;
+    if (tt < 1 / 2) return q;
+    if (tt < 2 / 3) return p + (q - p) * (2 / 3 - tt) * 6;
+    return p;
+  };
+  const q = l < 0.5 ? l * (1 + s) : l + s - l * s;
+  const p = 2 * l - q;
+  return {
+    r: Math.round(hue2rgb(p, q, h + 1 / 3) * 255),
+    g: Math.round(hue2rgb(p, q, h) * 255),
+    b: Math.round(hue2rgb(p, q, h - 1 / 3) * 255)
+  };
+}
+
 /**
- * Parses an `rgb()`, `rgba()`, or `#hex` color string into numeric RGBA channels.
+ * Parses comma/space `rgb()`, `rgba()`, `hsl()`, `hsla()`, or `#hex` color strings into RGBA channels.
  *
  * @param {string} colorStr - CSS color value.
  * @returns {{r: number, g: number, b: number, a: number}|null}
@@ -172,15 +211,38 @@ export function parseCssColor(colorStr) {
   if (!trimmed || trimmed === 'transparent') {
     return { r: 0, g: 0, b: 0, a: 0 };
   }
-  const rgbMatch = trimmed.match(/^rgba?\(\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)(?:\s*,\s*([0-9.]+))?\s*\)$/);
-  if (rgbMatch) {
+
+  const rgbComma = trimmed.match(/^rgba?\(\s*([0-9.]+)\s*,\s*([0-9.]+)\s*,\s*([0-9.]+)(?:\s*,\s*([0-9.%]+))?\s*\)$/);
+  if (rgbComma) {
     return {
-      r: parseInt(rgbMatch[1], 10),
-      g: parseInt(rgbMatch[2], 10),
-      b: parseInt(rgbMatch[3], 10),
-      a: rgbMatch[4] !== undefined ? parseFloat(rgbMatch[4]) : 1
+      r: Math.round(parseFloat(rgbComma[1])),
+      g: Math.round(parseFloat(rgbComma[2])),
+      b: Math.round(parseFloat(rgbComma[3])),
+      a: parseAlphaToken(rgbComma[4])
     };
   }
+
+  const rgbSpace = trimmed.match(/^rgba?\(\s*([0-9.]+)\s+([0-9.]+)\s+([0-9.]+)(?:\s*\/\s*([0-9.%]+))?\s*\)$/);
+  if (rgbSpace) {
+    return {
+      r: Math.round(parseFloat(rgbSpace[1])),
+      g: Math.round(parseFloat(rgbSpace[2])),
+      b: Math.round(parseFloat(rgbSpace[3])),
+      a: parseAlphaToken(rgbSpace[4])
+    };
+  }
+
+  const hslMatch = trimmed.match(/^hsla?\(\s*([0-9.]+)(?:deg)?[\s,]+([0-9.]+)%[\s,]+([0-9.]+)%(?:\s*[,\/]\s*([0-9.%]+))?\s*\)$/);
+  if (hslMatch) {
+    const rgb = hslToRgb(parseFloat(hslMatch[1]), parseFloat(hslMatch[2]), parseFloat(hslMatch[3]));
+    return {
+      r: rgb.r,
+      g: rgb.g,
+      b: rgb.b,
+      a: parseAlphaToken(hslMatch[4])
+    };
+  }
+
   const hexMatch = trimmed.match(/^#([0-9a-f]{3}|[0-9a-f]{6}|[0-9a-f]{8})$/);
   if (hexMatch) {
     const h = hexMatch[1];
@@ -210,8 +272,8 @@ function isOpaque(parsed) {
   return Boolean(parsed && parsed.a > 0.05);
 }
 
-function isSolidSurface(parsed) {
-  return Boolean(parsed && parsed.a >= 0.75);
+function isSolidSurface(parsed, minAlpha = 0.75) {
+  return Boolean(parsed && parsed.a >= minAlpha);
 }
 
 function isHiddenStyle(st) {
@@ -236,6 +298,26 @@ function isElementVisible(node, safeGetStyle) {
     hops++;
   }
   return true;
+}
+
+function pickVisibleElement(root, selector, safeGetStyle) {
+  if (!root) return null;
+  if (typeof root.querySelectorAll === 'function') {
+    const allMatches = root.querySelectorAll(selector);
+    if (allMatches && allMatches.length > 0) {
+      for (const el of allMatches) {
+        if (el && !isInsideGuildWeave(el) && isElementVisible(el, safeGetStyle)) {
+          return el;
+        }
+      }
+      for (const el of allMatches) {
+        if (el && !isInsideGuildWeave(el)) {
+          return el;
+        }
+      }
+    }
+  }
+  return typeof root.querySelector === 'function' ? root.querySelector(selector) : null;
 }
 
 function relativeLuminance(rgb) {
@@ -300,19 +382,55 @@ function collectAncestors(el, maxHops = 6, { excludeRoot = false, stopAt = null 
   return out;
 }
 
+function collectVisibleDescendants(root, maxDepth, maxNodes, stopDescendSet, safeGetStyle) {
+  const result = [];
+  if (!root || !root.children) return result;
+  const queue = [];
+  for (const child of Array.from(root.children)) {
+    queue.push({ node: child, depth: 1 });
+  }
+  let head = 0;
+  while (head < queue.length && result.length < maxNodes) {
+    const { node, depth } = queue[head++];
+    if (!node || stopDescendSet.has(node) || isInsideGuildWeave(node)) continue;
+    const role = typeof node.getAttribute === 'function' ? node.getAttribute('role') : null;
+    const modalAttr = typeof node.getAttribute === 'function' ? node.getAttribute('aria-modal') : null;
+    if (role === 'dialog' || modalAttr === 'true') continue;
+    const st = safeGetStyle(node);
+    if (isHiddenStyle(st)) continue;
+    result.push(node);
+    if (depth < maxDepth && node.children && node.children.length > 0) {
+      for (const child of Array.from(node.children)) {
+        queue.push({ node: child, depth: depth + 1 });
+      }
+    }
+  }
+  return result;
+}
+
+function isPureBlackScrim(parsed) {
+  return Boolean(parsed && parsed.a < 0.75 && parsed.r < 5 && parsed.g < 5 && parsed.b < 5);
+}
+
+function isStaleNavyColor(parsed) {
+  return Boolean(parsed && parsed.r <= 28 && parsed.g <= 30 && parsed.b >= 36 && (parsed.b - parsed.r) >= 12);
+}
+
 /**
  * Extracts a rendered surface color from `backgroundImage` gradients first (since CSS paints
  * gradients above `backgroundColor`, hiding stale base-theme fallbacks underneath) and then
  * inspects `backgroundColor`. Supports alpha-compositing translucent surfaces over `backdropParsed`
- * strictly when `allowTranslucent` is enabled for explicit card or input anchors.
+ * when `allowTranslucent` is enabled for explicit card or input anchors, or extracting solid RGB
+ * from semi-opaque non-scrim theme layers (`minAlpha`).
  *
  * @param {CSSStyleDeclaration|object|null} st - Computed style declaration.
  * @param {{r: number, g: number, b: number, a: number}|null} [backdropParsed=null] - Backdrop RGB for compositing.
  * @param {object} [options={}] - Extraction behavior options.
  * @param {boolean} [options.allowTranslucent=false] - Whether to composite translucent rgba surfaces.
+ * @param {number} [options.minAlpha=0.75] - Minimum alpha to accept a surface directly.
  * @returns {{color: string, parsed: {r: number, g: number, b: number, a: number}}|null}
  */
-function extractSurfaceColor(st, backdropParsed = null, { allowTranslucent = false } = {}) {
+function extractSurfaceColor(st, backdropParsed = null, { allowTranslucent = false, minAlpha = 0.75 } = {}) {
   if (isHiddenStyle(st)) return null;
 
   const bgCol = st.backgroundColor;
@@ -320,13 +438,16 @@ function extractSurfaceColor(st, backdropParsed = null, { allowTranslucent = fal
   const bgImg = st.backgroundImage;
 
   if (typeof bgImg === 'string' && bgImg !== 'none' && bgImg.includes('gradient')) {
-    const stopMatches = bgImg.match(/rgba?\([^)]+\)|#[0-9a-fA-F]{3,8}/g);
+    const stopMatches = bgImg.match(/hsla?\([^)]+\)|rgba?\([^)]+\)|#[0-9a-fA-F]{3,8}/g);
     if (stopMatches) {
       let firstTranslucentStop = null;
       for (const stop of stopMatches) {
         const parsedStop = parseCssColor(stop);
-        if (isSolidSurface(parsedStop)) {
-          return { color: `rgb(${parsedStop.r}, ${parsedStop.g}, ${parsedStop.b})`, parsed: parsedStop };
+        if (isSolidSurface(parsedStop, minAlpha) && (minAlpha >= 0.75 || !isPureBlackScrim(parsedStop))) {
+          return {
+            color: `rgb(${parsedStop.r}, ${parsedStop.g}, ${parsedStop.b})`,
+            parsed: { r: parsedStop.r, g: parsedStop.g, b: parsedStop.b, a: 1 }
+          };
         }
         if (!firstTranslucentStop && parsedStop && parsedStop.a >= 0.03) {
           firstTranslucentStop = parsedStop;
@@ -342,8 +463,14 @@ function extractSurfaceColor(st, backdropParsed = null, { allowTranslucent = fal
     }
   }
 
-  if (isSolidSurface(parsedBg)) {
-    return { color: bgCol, parsed: parsedBg };
+  if (isSolidSurface(parsedBg, minAlpha) && (minAlpha >= 0.75 || !isPureBlackScrim(parsedBg))) {
+    const normalizedColor = parsedBg.a < 0.99
+      ? `rgb(${parsedBg.r}, ${parsedBg.g}, ${parsedBg.b})`
+      : bgCol;
+    return {
+      color: normalizedColor,
+      parsed: { r: parsedBg.r, g: parsedBg.g, b: parsedBg.b, a: parsedBg.a >= 0.99 ? 1 : parsedBg.a }
+    };
   }
 
   if (allowTranslucent && parsedBg && parsedBg.a >= 0.03 && backdropParsed) {
@@ -383,7 +510,7 @@ function extractBoxShadowBorderRing(boxShadow) {
   if (current.trim()) layers.push(current.trim());
 
   for (const layer of layers) {
-    const colorMatch = layer.match(/rgba?\([^)]+\)|#[0-9a-fA-F]{3,8}/);
+    const colorMatch = layer.match(/hsla?\([^)]+\)|rgba?\([^)]+\)|#[0-9a-fA-F]{3,8}/);
     if (!colorMatch) continue;
     const colorStr = colorMatch[0];
     const parsed = parseCssColor(colorStr);
@@ -459,9 +586,9 @@ function extractElementBorderColor(st) {
 
 /**
  * Scrapes NovelAI's currently active theme directly from computed DOM styles across
- * inner layout ancestors, `backgroundImage` gradient stops, `.image-gen-character-prompts`
- * sidebar cards + outlines, `[data-prompt-input="true"]` / `.prompt-input-box-prompt`
- * input surfaces, active effort pills, and the primary Generate button.
+ * visible desktop & mobile layout containers, `backgroundImage` gradient stops,
+ * `.image-gen-character-prompts` sidebar cards + outlines, `[data-prompt-input="true"]` /
+ * `.prompt-input-box-prompt` input surfaces, active effort pills, and the primary Generate button.
  * Falls back cleanly inside headless DOM sandboxes.
  *
  * @returns {{bg0: string, bg1: string, bg2: string, cardBorder: string, inputBg: string, inputBorder: string, border: string, borderStrong: string, text: string, textMuted: string, accent: string, accentText: string, controlAccent: string, controlAccentText: string, success: string, warning: string, error: string, font: string}}
@@ -481,74 +608,123 @@ export function scrapeNovelAITheme() {
     const bodyEl = document.body || document.documentElement;
     if (!bodyEl) return palette;
 
-    const safeGetStyle = (el) => {
+    const safeGetStyle = (el, pseudoElt) => {
       if (!el) return null;
-      try { return window.getComputedStyle(el); } catch (_) { return null; }
-    };
-
-    const navRow = typeof document.querySelector === 'function' ? document.querySelector('.image-gen-nav-row') : null;
-    const footerEl = typeof document.querySelector === 'function' ? document.querySelector('.image-gen-footer') : null;
-    const modelRow = typeof document.querySelector === 'function' ? document.querySelector('.image-gen-model-mode-row') : null;
-    const genBtn = typeof document.querySelector === 'function' ? document.querySelector('.image-gen-generate-button') : null;
-    const menuBtn = typeof document.querySelector === 'function' ? document.querySelector('button[aria-label="menu"]') : null;
-    const charPromptsEl = typeof document.querySelector === 'function' ? document.querySelector('.image-gen-character-prompts') : null;
-    const charPromptsHeader = typeof document.querySelector === 'function' ? document.querySelector('.image-gen-character-prompts-header') : null;
-    const promptMainEl = typeof document.querySelector === 'function' ? document.querySelector('.image-gen-prompt-main') : null;
-    const promptBoxEl = (promptMainEl && typeof promptMainEl.querySelector === 'function'
-      ? (promptMainEl.querySelector('[data-prompt-input="true"]') || promptMainEl.querySelector('.prompt-input-box-prompt'))
-      : null) ||
-      (typeof document.querySelector === 'function'
-        ? (document.querySelector('[data-prompt-input="true"]') || document.querySelector('.prompt-input-box-prompt'))
-        : null);
-    const boxEditorNode = (promptBoxEl && typeof promptBoxEl.querySelector === 'function')
-      ? promptBoxEl.querySelector('[contenteditable="true"], textarea')
-      : null;
-    const promptNode = boxEditorNode ||
-      (promptMainEl && typeof promptMainEl.querySelector === 'function'
-        ? promptMainEl.querySelector('[contenteditable="true"], textarea')
-        : null) ||
-      (typeof document.querySelector === 'function'
-        ? (document.querySelector('textarea') || document.querySelector('[contenteditable="true"]'))
-        : null);
-
-    // 1. Active Theme Workspace Background (`bg0`):
-    //    Walk inner-to-outer layout containers around semantic anchors BEFORE document.body so
-    //    stale base CSS on `body`/`html` never masks the active styled-components theme wrapper.
-    const nextRoot = typeof document.getElementById === 'function' ? document.getElementById('__next') : null;
-    const topDownWrappers = [];
-    const pushChain = (startNode, depth = 4) => {
-      let cur = startNode;
-      for (let i = 0; cur && i < depth; i++) {
-        topDownWrappers.push(cur);
-        cur = cur.firstElementChild;
+      try {
+        return pseudoElt !== undefined
+          ? window.getComputedStyle(el, pseudoElt)
+          : window.getComputedStyle(el);
+      } catch (_) {
+        return null;
       }
     };
-    pushChain(nextRoot, 4);
-    pushChain(bodyEl.firstElementChild, 4);
 
-    const bg0Candidates = [
-      ...collectAncestors(navRow, 24, { excludeRoot: true }),
-      ...collectAncestors(modelRow, 24, { excludeRoot: true }),
-      ...collectAncestors(footerEl, 24, { excludeRoot: true }),
+    const navRow = pickVisibleElement(document, '.image-gen-nav-row', safeGetStyle);
+    const footerEl = pickVisibleElement(document, '.image-gen-footer', safeGetStyle);
+    const modelRow = pickVisibleElement(document, '.image-gen-model-mode-row', safeGetStyle);
+    const genBtn = pickVisibleElement(document, '.image-gen-generate-button', safeGetStyle);
+    const menuBtn = pickVisibleElement(document, 'button[aria-label="menu"]', safeGetStyle);
+    const charPromptsEl = pickVisibleElement(document, '.image-gen-character-prompts', safeGetStyle);
+    const charPromptsHeader = pickVisibleElement(document, '.image-gen-character-prompts-header', safeGetStyle);
+    const promptMainEl = pickVisibleElement(document, '.image-gen-prompt-main', safeGetStyle);
+    const promptBoxEl =
+      pickVisibleElement(promptMainEl, '[data-prompt-input="true"]', safeGetStyle) ||
+      pickVisibleElement(promptMainEl, '.prompt-input-box-prompt', safeGetStyle) ||
+      pickVisibleElement(document, '[data-prompt-input="true"]', safeGetStyle) ||
+      pickVisibleElement(document, '.prompt-input-box-prompt', safeGetStyle);
+    const boxEditorNode =
+      pickVisibleElement(promptBoxEl, '[contenteditable="true"], textarea', safeGetStyle);
+    const promptNode = boxEditorNode ||
+      pickVisibleElement(promptMainEl, '[contenteditable="true"], textarea', safeGetStyle) ||
+      pickVisibleElement(document, 'textarea, [contenteditable="true"]', safeGetStyle);
+
+    // 1. Active Theme Workspace Background (`bg0`):
+    //    Walk outer-to-inner visible layout ancestors of nav/menu/footer/generate/prompt anchors
+    //    plus bounded visible `#__next` / `body` BFS descendants BEFORE `document.body` so stale
+    //    base CSS on `body`/`html` or hidden desktop sidebars never force a navy `#13152c` shell.
+    const nextRoot = typeof document.getElementById === 'function' ? document.getElementById('__next') : null;
+    const stopDescendSet = new Set(
+      [genBtn, menuBtn, promptNode, promptBoxEl, promptMainEl, charPromptsEl, charPromptsHeader, footerEl].filter(Boolean)
+    );
+
+    const outerToInner = (node, hops = 24) => collectAncestors(node, hops, { excludeRoot: true }).reverse();
+
+    const nonRootBg0Candidates = [
+      ...outerToInner(navRow, 24),
       navRow,
+      ...outerToInner(menuBtn, 24),
+      ...collectVisibleDescendants(nextRoot, 6, 48, stopDescendSet, safeGetStyle),
+      ...collectVisibleDescendants(document.body, 4, 32, stopDescendSet, safeGetStyle),
+      ...outerToInner(modelRow, 24),
       modelRow,
+      ...outerToInner(footerEl, 24),
       footerEl,
-      ...topDownWrappers,
-      document.body,
-      document.documentElement
-    ];
+      ...outerToInner(genBtn, 24),
+      ...outerToInner(promptMainEl, 24),
+      ...outerToInner(promptNode, 24)
+    ].filter(Boolean);
 
+    const excludedBg0Nodes = new Set(
+      [genBtn, menuBtn, promptNode, promptBoxEl, charPromptsEl, charPromptsHeader].filter(Boolean)
+    );
+
+    const uniqueNonRootBg0 = [];
     const seenBg0 = new Set();
-    let bg0Parsed = null;
-    for (const node of bg0Candidates) {
-      if (!node || seenBg0.has(node) || node === genBtn || node === promptNode || node === promptBoxEl || isInsideGuildWeave(node) || !isElementVisible(node, safeGetStyle)) continue;
+    for (const node of nonRootBg0Candidates) {
+      if (!node || seenBg0.has(node) || excludedBg0Nodes.has(node) || isInsideGuildWeave(node) || !isElementVisible(node, safeGetStyle)) continue;
       seenBg0.add(node);
+      uniqueNonRootBg0.push(node);
+    }
+
+    let bg0Parsed = null;
+    let usedBodyFallbackForBg0 = false;
+
+    for (const node of uniqueNonRootBg0) {
       const st = safeGetStyle(node);
-      const extracted = extractSurfaceColor(st, null, { allowTranslucent: false });
+      const extracted = extractSurfaceColor(st, null, { allowTranslucent: false, minAlpha: 0.75 });
       if (extracted) {
         palette.bg0 = extracted.color;
         bg0Parsed = extracted.parsed;
         break;
+      }
+    }
+
+    if (!bg0Parsed) {
+      for (const node of uniqueNonRootBg0) {
+        const st = safeGetStyle(node);
+        const extracted = extractSurfaceColor(st, null, { allowTranslucent: false, minAlpha: 0.45 });
+        if (extracted) {
+          palette.bg0 = extracted.color;
+          bg0Parsed = extracted.parsed;
+          break;
+        }
+      }
+    }
+
+    if (!bg0Parsed) {
+      for (const pseudoHost of [nextRoot, document.body, document.documentElement].filter(Boolean)) {
+        const pSt = safeGetStyle(pseudoHost, '::before');
+        if (pSt && pSt.content && pSt.content !== 'none' && pSt.content !== 'normal') {
+          const extracted = extractSurfaceColor(pSt, null, { allowTranslucent: false, minAlpha: 0.45 });
+          if (extracted) {
+            palette.bg0 = extracted.color;
+            bg0Parsed = extracted.parsed;
+            break;
+          }
+        }
+      }
+    }
+
+    if (!bg0Parsed) {
+      for (const rootEl of [document.body, document.documentElement].filter(Boolean)) {
+        const st = safeGetStyle(rootEl);
+        const extracted = extractSurfaceColor(st, null, { allowTranslucent: false, minAlpha: 0.75 });
+        if (extracted) {
+          palette.bg0 = extracted.color;
+          bg0Parsed = extracted.parsed;
+          usedBodyFallbackForBg0 = true;
+          break;
+        }
       }
     }
 
@@ -566,10 +742,13 @@ export function scrapeNovelAITheme() {
       nextRoot,
       navRow,
       ...collectAncestors(navRow, 6, { excludeRoot: true }),
+      menuBtn,
+      ...collectAncestors(menuBtn, 6, { excludeRoot: true }),
       modelRow,
       footerEl,
+      ...collectAncestors(genBtn, 4, { excludeRoot: true }),
       promptNode,
-      typeof document.querySelector === 'function' ? document.querySelector('span, label, p, button, h1, h2') : null,
+      pickVisibleElement(document, 'span, label, p, button, h1, h2', safeGetStyle),
       document.body,
       document.documentElement
     ];
@@ -629,6 +808,8 @@ export function scrapeNovelAITheme() {
 
     let bg1Parsed = null;
     let foundExplicitCardBg = false;
+    let foundNonRootCardBg = false;
+
     for (const node of explicitCardNodes) {
       if (!node || node === genBtn || isInsideGuildWeave(node) || !isElementVisible(node, safeGetStyle)) continue;
       const st = safeGetStyle(node);
@@ -640,38 +821,49 @@ export function scrapeNovelAITheme() {
         bg1Parsed = extracted.parsed;
         palette.bg2 = shiftColor(extracted.parsed, isDark ? 10 : -10);
         foundExplicitCardBg = true;
+        foundNonRootCardBg = true;
         break;
       }
     }
 
     if (!foundExplicitCardBg) {
-      const dialogNode = typeof document.querySelector === 'function' ? document.querySelector('[role="dialog"]') : null;
+      const dialogNode = pickVisibleElement(document, '[role="dialog"]', safeGetStyle);
       const fallbackCardNodes = [
         dialogNode,
         promptNode,
-        ...collectAncestors(promptNode, 3, { excludeRoot: true })
+        ...collectAncestors(promptNode, 3, { excludeRoot: true }),
+        ...collectAncestors(genBtn, 3, { excludeRoot: true })
       ].filter(Boolean);
 
       for (const node of fallbackCardNodes) {
         if (!node || node === genBtn || isInsideGuildWeave(node) || !isElementVisible(node, safeGetStyle)) continue;
         const st = safeGetStyle(node);
-        const extracted = extractSurfaceColor(st, null, { allowTranslucent: false });
+        const extracted = extractSurfaceColor(st, null, { allowTranslucent: false, minAlpha: 0.75 }) ||
+          extractSurfaceColor(st, null, { allowTranslucent: false, minAlpha: 0.45 });
         if (!extracted || extracted.color === palette.bg0) continue;
         const lum = relativeLuminance(extracted.parsed);
         if (isDark ? lum < 0.35 : lum > 0.65) {
           palette.bg1 = extracted.color;
           bg1Parsed = extracted.parsed;
           palette.bg2 = shiftColor(extracted.parsed, isDark ? 10 : -10);
+          foundNonRootCardBg = true;
           break;
         }
       }
     }
 
-    // If no opaque workspace background was detectable anywhere, derive bg0 from bg1
-    if (!bg0Parsed && bg1Parsed) {
+    // If bg0 fell back solely to NovelAI's stale base navy `document.body` (`#13152c`) while
+    // visible DOM cards resolved to a distinct non-navy theme (e.g., mobile warm brown drawer),
+    // derive bg0 from `bg1Parsed` so modals and bars never render a mismatched navy shell.
+    if ((!bg0Parsed || (usedBodyFallbackForBg0 && isStaleNavyColor(bg0Parsed) && !isStaleNavyColor(bg1Parsed))) && foundNonRootCardBg && bg1Parsed) {
       const bg1IsDark = relativeLuminance(bg1Parsed) < 0.5;
-      palette.bg0 = shiftColor(bg1Parsed, bg1IsDark ? 10 : -10);
-      palette.inputBg = palette.bg0;
+      const derivedBg0 = shiftColor(bg1Parsed, bg1IsDark ? -8 : 8);
+      palette.bg0 = derivedBg0;
+      bg0Parsed = parseCssColor(derivedBg0) || bg1Parsed;
+      palette.inputBg = derivedBg0;
+      if (textParsed) {
+        palette.accentText = derivedBg0;
+      }
     }
 
     // 4. Prompt Input Box Background & Border (`inputBg`, `inputBorder`)
@@ -820,8 +1012,10 @@ export function scrapeNovelAITheme() {
         ...(navRow && typeof navRow.querySelectorAll === 'function' ? Array.from(navRow.querySelectorAll('button, div')).slice(0, 12) : []),
         ...modelButtons,
         ...(modelRow && typeof modelRow.querySelectorAll === 'function' ? Array.from(modelRow.querySelectorAll('div, button')).slice(0, 12) : []),
+        promptBoxEl,
         promptNode,
-        ...collectAncestors(promptNode, 3, { excludeRoot: true }),
+        ...collectAncestors(promptNode, 4, { excludeRoot: true }),
+        ...collectAncestors(genBtn, 4, { excludeRoot: true }),
         ...(typeof document.querySelectorAll === 'function' ? Array.from(document.querySelectorAll('input, button')).slice(0, 20) : [])
       ].filter(Boolean);
 
@@ -973,6 +1167,115 @@ export function ensureGuildWeaveStyles() {
     @keyframes gwPulse {
       0% { opacity: 0.45; transform: scale(0.92); }
       100% { opacity: 1; transform: scale(1.08); }
+    }
+    #gw-v5-bar.gw-v5-compact {
+      padding: 3px 6px 4px !important;
+      gap: 2px !important;
+      margin-bottom: 2px !important;
+      border-radius: 6px !important;
+    }
+    #gw-v5-bar.gw-v5-compact .gw-hud-row {
+      flex-wrap: nowrap !important;
+      gap: 4px !important;
+    }
+    #gw-v5-bar.gw-v5-compact .gw-hud-right {
+      gap: 5px !important;
+      flex-shrink: 0 !important;
+    }
+    #gw-v5-bar.gw-v5-compact #gw-v5-track {
+      height: 3px !important;
+    }
+    #gw-v5-bar.gw-v5-compact #gw-v5-label,
+    #gw-v5-bar.gw-v5-compact #gw-anlas-label,
+    #gw-v5-bar.gw-v5-compact #gw-v5-cost,
+    #gw-v5-bar.gw-v5-compact #gw-bypass-text {
+      font-size: 10px !important;
+      line-height: 1.2 !important;
+    }
+    #gw-v5-bar.gw-v5-compact #gw-v5-eta {
+      font-size: 9.5px !important;
+      line-height: 1.2 !important;
+      flex-shrink: 0 !important;
+    }
+    #gw-v5-bar.gw-v5-compact #gw-bypass-label {
+      gap: 4px !important;
+      font-size: 10px !important;
+    }
+    #gw-v5-bar.gw-v5-compact #gw-bypass-toggle {
+      width: 12px !important;
+      min-width: 12px !important;
+      max-width: 12px !important;
+      height: 12px !important;
+      flex: 0 0 12px !important;
+    }
+    #gw-v5-bar.gw-v5-compact #gw-hud-alert {
+      font-size: 10px !important;
+      padding: 3px 5px !important;
+    }
+    @media (max-width: 640px) {
+      #gw-v5-bar {
+        padding: 3px 6px 4px !important;
+        gap: 2px !important;
+        margin-bottom: 2px !important;
+        border-radius: 6px !important;
+      }
+      #gw-v5-bar .gw-hud-row {
+        flex-wrap: nowrap !important;
+        gap: 4px !important;
+      }
+      #gw-v5-bar .gw-hud-right {
+        gap: 5px !important;
+        flex-shrink: 0 !important;
+      }
+      #gw-v5-bar #gw-v5-track {
+        height: 3px !important;
+      }
+      #gw-v5-bar #gw-v5-label,
+      #gw-v5-bar #gw-anlas-label,
+      #gw-v5-bar #gw-v5-cost,
+      #gw-v5-bar #gw-bypass-text {
+        font-size: 10px !important;
+        line-height: 1.2 !important;
+      }
+      #gw-v5-bar #gw-v5-eta {
+        font-size: 9.5px !important;
+        line-height: 1.2 !important;
+        flex-shrink: 0 !important;
+      }
+      #gw-v5-bar #gw-bypass-label {
+        gap: 4px !important;
+        font-size: 10px !important;
+      }
+      #gw-v5-bar #gw-bypass-toggle {
+        width: 12px !important;
+        min-width: 12px !important;
+        max-width: 12px !important;
+        height: 12px !important;
+        flex: 0 0 12px !important;
+      }
+      #gw-allowance-bar {
+        padding: 4px 6px !important;
+        gap: 2px !important;
+      }
+      #vps-settings-modal, #vps-admin-panel {
+        padding: 14px !important;
+        width: 94vw !important;
+        max-height: 88vh !important;
+      }
+      #vps-settings-modal .gw-modal-header, #vps-admin-panel .gw-modal-header {
+        padding-bottom: 8px;
+        margin-bottom: 10px;
+      }
+      #vps-settings-modal .gw-card, #vps-admin-panel .gw-card {
+        padding: 10px 12px;
+        margin-bottom: 10px;
+      }
+      #vps-settings-modal .gw-stat-grid, #vps-admin-panel .gw-stat-grid {
+        gap: 8px 10px;
+      }
+      #vps-settings-modal .gw-btn, #vps-admin-panel .gw-btn {
+        padding: 7px 9px;
+      }
     }
     .gw-modal-header {
       display: flex;

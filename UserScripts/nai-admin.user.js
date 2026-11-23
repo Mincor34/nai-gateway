@@ -772,19 +772,73 @@
       };
     }
   }
+  function parseAlphaToken(rawAlpha) {
+    if (rawAlpha === void 0 || rawAlpha === null || rawAlpha === "") return 1;
+    const trimmed = String(rawAlpha).trim();
+    if (trimmed.endsWith("%")) {
+      const pct = parseFloat(trimmed.slice(0, -1));
+      return Number.isFinite(pct) ? Math.max(0, Math.min(1, pct / 100)) : 1;
+    }
+    const num = parseFloat(trimmed);
+    return Number.isFinite(num) ? Math.max(0, Math.min(1, num)) : 1;
+  }
+  function hslToRgb(hDeg, sPct, lPct) {
+    const h = (hDeg % 360 + 360) % 360 / 360;
+    const s = Math.max(0, Math.min(1, sPct / 100));
+    const l = Math.max(0, Math.min(1, lPct / 100));
+    if (s === 0) {
+      const v = Math.round(l * 255);
+      return { r: v, g: v, b: v };
+    }
+    const hue2rgb = (p2, q2, t) => {
+      let tt = t;
+      if (tt < 0) tt += 1;
+      if (tt > 1) tt -= 1;
+      if (tt < 1 / 6) return p2 + (q2 - p2) * 6 * tt;
+      if (tt < 1 / 2) return q2;
+      if (tt < 2 / 3) return p2 + (q2 - p2) * (2 / 3 - tt) * 6;
+      return p2;
+    };
+    const q = l < 0.5 ? l * (1 + s) : l + s - l * s;
+    const p = 2 * l - q;
+    return {
+      r: Math.round(hue2rgb(p, q, h + 1 / 3) * 255),
+      g: Math.round(hue2rgb(p, q, h) * 255),
+      b: Math.round(hue2rgb(p, q, h - 1 / 3) * 255)
+    };
+  }
   function parseCssColor(colorStr) {
     if (typeof colorStr !== "string") return null;
     const trimmed = colorStr.trim().toLowerCase();
     if (!trimmed || trimmed === "transparent") {
       return { r: 0, g: 0, b: 0, a: 0 };
     }
-    const rgbMatch = trimmed.match(/^rgba?\(\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)(?:\s*,\s*([0-9.]+))?\s*\)$/);
-    if (rgbMatch) {
+    const rgbComma = trimmed.match(/^rgba?\(\s*([0-9.]+)\s*,\s*([0-9.]+)\s*,\s*([0-9.]+)(?:\s*,\s*([0-9.%]+))?\s*\)$/);
+    if (rgbComma) {
       return {
-        r: parseInt(rgbMatch[1], 10),
-        g: parseInt(rgbMatch[2], 10),
-        b: parseInt(rgbMatch[3], 10),
-        a: rgbMatch[4] !== void 0 ? parseFloat(rgbMatch[4]) : 1
+        r: Math.round(parseFloat(rgbComma[1])),
+        g: Math.round(parseFloat(rgbComma[2])),
+        b: Math.round(parseFloat(rgbComma[3])),
+        a: parseAlphaToken(rgbComma[4])
+      };
+    }
+    const rgbSpace = trimmed.match(/^rgba?\(\s*([0-9.]+)\s+([0-9.]+)\s+([0-9.]+)(?:\s*\/\s*([0-9.%]+))?\s*\)$/);
+    if (rgbSpace) {
+      return {
+        r: Math.round(parseFloat(rgbSpace[1])),
+        g: Math.round(parseFloat(rgbSpace[2])),
+        b: Math.round(parseFloat(rgbSpace[3])),
+        a: parseAlphaToken(rgbSpace[4])
+      };
+    }
+    const hslMatch = trimmed.match(/^hsla?\(\s*([0-9.]+)(?:deg)?[\s,]+([0-9.]+)%[\s,]+([0-9.]+)%(?:\s*[,\/]\s*([0-9.%]+))?\s*\)$/);
+    if (hslMatch) {
+      const rgb = hslToRgb(parseFloat(hslMatch[1]), parseFloat(hslMatch[2]), parseFloat(hslMatch[3]));
+      return {
+        r: rgb.r,
+        g: rgb.g,
+        b: rgb.b,
+        a: parseAlphaToken(hslMatch[4])
       };
     }
     const hexMatch = trimmed.match(/^#([0-9a-f]{3}|[0-9a-f]{6}|[0-9a-f]{8})$/);
@@ -813,8 +867,8 @@
   function isOpaque(parsed) {
     return Boolean(parsed && parsed.a > 0.05);
   }
-  function isSolidSurface(parsed) {
-    return Boolean(parsed && parsed.a >= 0.75);
+  function isSolidSurface(parsed, minAlpha = 0.75) {
+    return Boolean(parsed && parsed.a >= minAlpha);
   }
   function isHiddenStyle(st) {
     if (!st) return true;
@@ -836,6 +890,25 @@
       hops++;
     }
     return true;
+  }
+  function pickVisibleElement(root, selector, safeGetStyle) {
+    if (!root) return null;
+    if (typeof root.querySelectorAll === "function") {
+      const allMatches = root.querySelectorAll(selector);
+      if (allMatches && allMatches.length > 0) {
+        for (const el of allMatches) {
+          if (el && !isInsideGuildWeave(el) && isElementVisible(el, safeGetStyle)) {
+            return el;
+          }
+        }
+        for (const el of allMatches) {
+          if (el && !isInsideGuildWeave(el)) {
+            return el;
+          }
+        }
+      }
+    }
+    return typeof root.querySelector === "function" ? root.querySelector(selector) : null;
   }
   function relativeLuminance(rgb) {
     return (0.2126 * rgb.r + 0.7152 * rgb.g + 0.0722 * rgb.b) / 255;
@@ -892,19 +965,53 @@
     }
     return out;
   }
-  function extractSurfaceColor(st, backdropParsed = null, { allowTranslucent = false } = {}) {
+  function collectVisibleDescendants(root, maxDepth, maxNodes, stopDescendSet, safeGetStyle) {
+    const result = [];
+    if (!root || !root.children) return result;
+    const queue = [];
+    for (const child of Array.from(root.children)) {
+      queue.push({ node: child, depth: 1 });
+    }
+    let head = 0;
+    while (head < queue.length && result.length < maxNodes) {
+      const { node, depth } = queue[head++];
+      if (!node || stopDescendSet.has(node) || isInsideGuildWeave(node)) continue;
+      const role = typeof node.getAttribute === "function" ? node.getAttribute("role") : null;
+      const modalAttr = typeof node.getAttribute === "function" ? node.getAttribute("aria-modal") : null;
+      if (role === "dialog" || modalAttr === "true") continue;
+      const st = safeGetStyle(node);
+      if (isHiddenStyle(st)) continue;
+      result.push(node);
+      if (depth < maxDepth && node.children && node.children.length > 0) {
+        for (const child of Array.from(node.children)) {
+          queue.push({ node: child, depth: depth + 1 });
+        }
+      }
+    }
+    return result;
+  }
+  function isPureBlackScrim(parsed) {
+    return Boolean(parsed && parsed.a < 0.75 && parsed.r < 5 && parsed.g < 5 && parsed.b < 5);
+  }
+  function isStaleNavyColor(parsed) {
+    return Boolean(parsed && parsed.r <= 28 && parsed.g <= 30 && parsed.b >= 36 && parsed.b - parsed.r >= 12);
+  }
+  function extractSurfaceColor(st, backdropParsed = null, { allowTranslucent = false, minAlpha = 0.75 } = {}) {
     if (isHiddenStyle(st)) return null;
     const bgCol = st.backgroundColor;
     const parsedBg = parseCssColor(bgCol);
     const bgImg = st.backgroundImage;
     if (typeof bgImg === "string" && bgImg !== "none" && bgImg.includes("gradient")) {
-      const stopMatches = bgImg.match(/rgba?\([^)]+\)|#[0-9a-fA-F]{3,8}/g);
+      const stopMatches = bgImg.match(/hsla?\([^)]+\)|rgba?\([^)]+\)|#[0-9a-fA-F]{3,8}/g);
       if (stopMatches) {
         let firstTranslucentStop = null;
         for (const stop of stopMatches) {
           const parsedStop = parseCssColor(stop);
-          if (isSolidSurface(parsedStop)) {
-            return { color: `rgb(${parsedStop.r}, ${parsedStop.g}, ${parsedStop.b})`, parsed: parsedStop };
+          if (isSolidSurface(parsedStop, minAlpha) && (minAlpha >= 0.75 || !isPureBlackScrim(parsedStop))) {
+            return {
+              color: `rgb(${parsedStop.r}, ${parsedStop.g}, ${parsedStop.b})`,
+              parsed: { r: parsedStop.r, g: parsedStop.g, b: parsedStop.b, a: 1 }
+            };
           }
           if (!firstTranslucentStop && parsedStop && parsedStop.a >= 0.03) {
             firstTranslucentStop = parsedStop;
@@ -919,8 +1026,12 @@
         }
       }
     }
-    if (isSolidSurface(parsedBg)) {
-      return { color: bgCol, parsed: parsedBg };
+    if (isSolidSurface(parsedBg, minAlpha) && (minAlpha >= 0.75 || !isPureBlackScrim(parsedBg))) {
+      const normalizedColor = parsedBg.a < 0.99 ? `rgb(${parsedBg.r}, ${parsedBg.g}, ${parsedBg.b})` : bgCol;
+      return {
+        color: normalizedColor,
+        parsed: { r: parsedBg.r, g: parsedBg.g, b: parsedBg.b, a: parsedBg.a >= 0.99 ? 1 : parsedBg.a }
+      };
     }
     if (allowTranslucent && parsedBg && parsedBg.a >= 0.03 && backdropParsed) {
       const comp = compositeOver(parsedBg, backdropParsed);
@@ -948,7 +1059,7 @@
     }
     if (current.trim()) layers.push(current.trim());
     for (const layer of layers) {
-      const colorMatch = layer.match(/rgba?\([^)]+\)|#[0-9a-fA-F]{3,8}/);
+      const colorMatch = layer.match(/hsla?\([^)]+\)|rgba?\([^)]+\)|#[0-9a-fA-F]{3,8}/);
       if (!colorMatch) continue;
       const colorStr = colorMatch[0];
       const parsed = parseCssColor(colorStr);
@@ -1011,58 +1122,99 @@
     try {
       const bodyEl = document.body || document.documentElement;
       if (!bodyEl) return palette;
-      const safeGetStyle = (el) => {
+      const safeGetStyle = (el, pseudoElt) => {
         if (!el) return null;
         try {
-          return window.getComputedStyle(el);
+          return pseudoElt !== void 0 ? window.getComputedStyle(el, pseudoElt) : window.getComputedStyle(el);
         } catch (_) {
           return null;
         }
       };
-      const navRow = typeof document.querySelector === "function" ? document.querySelector(".image-gen-nav-row") : null;
-      const footerEl = typeof document.querySelector === "function" ? document.querySelector(".image-gen-footer") : null;
-      const modelRow = typeof document.querySelector === "function" ? document.querySelector(".image-gen-model-mode-row") : null;
-      const genBtn = typeof document.querySelector === "function" ? document.querySelector(".image-gen-generate-button") : null;
-      const menuBtn = typeof document.querySelector === "function" ? document.querySelector('button[aria-label="menu"]') : null;
-      const charPromptsEl = typeof document.querySelector === "function" ? document.querySelector(".image-gen-character-prompts") : null;
-      const charPromptsHeader = typeof document.querySelector === "function" ? document.querySelector(".image-gen-character-prompts-header") : null;
-      const promptMainEl = typeof document.querySelector === "function" ? document.querySelector(".image-gen-prompt-main") : null;
-      const promptBoxEl = (promptMainEl && typeof promptMainEl.querySelector === "function" ? promptMainEl.querySelector('[data-prompt-input="true"]') || promptMainEl.querySelector(".prompt-input-box-prompt") : null) || (typeof document.querySelector === "function" ? document.querySelector('[data-prompt-input="true"]') || document.querySelector(".prompt-input-box-prompt") : null);
-      const boxEditorNode = promptBoxEl && typeof promptBoxEl.querySelector === "function" ? promptBoxEl.querySelector('[contenteditable="true"], textarea') : null;
-      const promptNode = boxEditorNode || (promptMainEl && typeof promptMainEl.querySelector === "function" ? promptMainEl.querySelector('[contenteditable="true"], textarea') : null) || (typeof document.querySelector === "function" ? document.querySelector("textarea") || document.querySelector('[contenteditable="true"]') : null);
+      const navRow = pickVisibleElement(document, ".image-gen-nav-row", safeGetStyle);
+      const footerEl = pickVisibleElement(document, ".image-gen-footer", safeGetStyle);
+      const modelRow = pickVisibleElement(document, ".image-gen-model-mode-row", safeGetStyle);
+      const genBtn = pickVisibleElement(document, ".image-gen-generate-button", safeGetStyle);
+      const menuBtn = pickVisibleElement(document, 'button[aria-label="menu"]', safeGetStyle);
+      const charPromptsEl = pickVisibleElement(document, ".image-gen-character-prompts", safeGetStyle);
+      const charPromptsHeader = pickVisibleElement(document, ".image-gen-character-prompts-header", safeGetStyle);
+      const promptMainEl = pickVisibleElement(document, ".image-gen-prompt-main", safeGetStyle);
+      const promptBoxEl = pickVisibleElement(promptMainEl, '[data-prompt-input="true"]', safeGetStyle) || pickVisibleElement(promptMainEl, ".prompt-input-box-prompt", safeGetStyle) || pickVisibleElement(document, '[data-prompt-input="true"]', safeGetStyle) || pickVisibleElement(document, ".prompt-input-box-prompt", safeGetStyle);
+      const boxEditorNode = pickVisibleElement(promptBoxEl, '[contenteditable="true"], textarea', safeGetStyle);
+      const promptNode = boxEditorNode || pickVisibleElement(promptMainEl, '[contenteditable="true"], textarea', safeGetStyle) || pickVisibleElement(document, 'textarea, [contenteditable="true"]', safeGetStyle);
       const nextRoot = typeof document.getElementById === "function" ? document.getElementById("__next") : null;
-      const topDownWrappers = [];
-      const pushChain = (startNode, depth = 4) => {
-        let cur = startNode;
-        for (let i = 0; cur && i < depth; i++) {
-          topDownWrappers.push(cur);
-          cur = cur.firstElementChild;
-        }
-      };
-      pushChain(nextRoot, 4);
-      pushChain(bodyEl.firstElementChild, 4);
-      const bg0Candidates = [
-        ...collectAncestors(navRow, 24, { excludeRoot: true }),
-        ...collectAncestors(modelRow, 24, { excludeRoot: true }),
-        ...collectAncestors(footerEl, 24, { excludeRoot: true }),
+      const stopDescendSet = new Set(
+        [genBtn, menuBtn, promptNode, promptBoxEl, promptMainEl, charPromptsEl, charPromptsHeader, footerEl].filter(Boolean)
+      );
+      const outerToInner = (node, hops = 24) => collectAncestors(node, hops, { excludeRoot: true }).reverse();
+      const nonRootBg0Candidates = [
+        ...outerToInner(navRow, 24),
         navRow,
+        ...outerToInner(menuBtn, 24),
+        ...collectVisibleDescendants(nextRoot, 6, 48, stopDescendSet, safeGetStyle),
+        ...collectVisibleDescendants(document.body, 4, 32, stopDescendSet, safeGetStyle),
+        ...outerToInner(modelRow, 24),
         modelRow,
+        ...outerToInner(footerEl, 24),
         footerEl,
-        ...topDownWrappers,
-        document.body,
-        document.documentElement
-      ];
+        ...outerToInner(genBtn, 24),
+        ...outerToInner(promptMainEl, 24),
+        ...outerToInner(promptNode, 24)
+      ].filter(Boolean);
+      const excludedBg0Nodes = new Set(
+        [genBtn, menuBtn, promptNode, promptBoxEl, charPromptsEl, charPromptsHeader].filter(Boolean)
+      );
+      const uniqueNonRootBg0 = [];
       const seenBg0 = /* @__PURE__ */ new Set();
-      let bg0Parsed = null;
-      for (const node of bg0Candidates) {
-        if (!node || seenBg0.has(node) || node === genBtn || node === promptNode || node === promptBoxEl || isInsideGuildWeave(node) || !isElementVisible(node, safeGetStyle)) continue;
+      for (const node of nonRootBg0Candidates) {
+        if (!node || seenBg0.has(node) || excludedBg0Nodes.has(node) || isInsideGuildWeave(node) || !isElementVisible(node, safeGetStyle)) continue;
         seenBg0.add(node);
+        uniqueNonRootBg0.push(node);
+      }
+      let bg0Parsed = null;
+      let usedBodyFallbackForBg0 = false;
+      for (const node of uniqueNonRootBg0) {
         const st = safeGetStyle(node);
-        const extracted = extractSurfaceColor(st, null, { allowTranslucent: false });
+        const extracted = extractSurfaceColor(st, null, { allowTranslucent: false, minAlpha: 0.75 });
         if (extracted) {
           palette.bg0 = extracted.color;
           bg0Parsed = extracted.parsed;
           break;
+        }
+      }
+      if (!bg0Parsed) {
+        for (const node of uniqueNonRootBg0) {
+          const st = safeGetStyle(node);
+          const extracted = extractSurfaceColor(st, null, { allowTranslucent: false, minAlpha: 0.45 });
+          if (extracted) {
+            palette.bg0 = extracted.color;
+            bg0Parsed = extracted.parsed;
+            break;
+          }
+        }
+      }
+      if (!bg0Parsed) {
+        for (const pseudoHost of [nextRoot, document.body, document.documentElement].filter(Boolean)) {
+          const pSt = safeGetStyle(pseudoHost, "::before");
+          if (pSt && pSt.content && pSt.content !== "none" && pSt.content !== "normal") {
+            const extracted = extractSurfaceColor(pSt, null, { allowTranslucent: false, minAlpha: 0.45 });
+            if (extracted) {
+              palette.bg0 = extracted.color;
+              bg0Parsed = extracted.parsed;
+              break;
+            }
+          }
+        }
+      }
+      if (!bg0Parsed) {
+        for (const rootEl of [document.body, document.documentElement].filter(Boolean)) {
+          const st = safeGetStyle(rootEl);
+          const extracted = extractSurfaceColor(st, null, { allowTranslucent: false, minAlpha: 0.75 });
+          if (extracted) {
+            palette.bg0 = extracted.color;
+            bg0Parsed = extracted.parsed;
+            usedBodyFallbackForBg0 = true;
+            break;
+          }
         }
       }
       const isDark = !bg0Parsed || relativeLuminance(bg0Parsed) < 0.5;
@@ -1077,10 +1229,13 @@
         nextRoot,
         navRow,
         ...collectAncestors(navRow, 6, { excludeRoot: true }),
+        menuBtn,
+        ...collectAncestors(menuBtn, 6, { excludeRoot: true }),
         modelRow,
         footerEl,
+        ...collectAncestors(genBtn, 4, { excludeRoot: true }),
         promptNode,
-        typeof document.querySelector === "function" ? document.querySelector("span, label, p, button, h1, h2") : null,
+        pickVisibleElement(document, "span, label, p, button, h1, h2", safeGetStyle),
         document.body,
         document.documentElement
       ];
@@ -1123,6 +1278,7 @@
       ].filter(Boolean);
       let bg1Parsed = null;
       let foundExplicitCardBg = false;
+      let foundNonRootCardBg = false;
       for (const node of explicitCardNodes) {
         if (!node || node === genBtn || isInsideGuildWeave(node) || !isElementVisible(node, safeGetStyle)) continue;
         const st = safeGetStyle(node);
@@ -1134,34 +1290,42 @@
           bg1Parsed = extracted.parsed;
           palette.bg2 = shiftColor(extracted.parsed, isDark ? 10 : -10);
           foundExplicitCardBg = true;
+          foundNonRootCardBg = true;
           break;
         }
       }
       if (!foundExplicitCardBg) {
-        const dialogNode = typeof document.querySelector === "function" ? document.querySelector('[role="dialog"]') : null;
+        const dialogNode = pickVisibleElement(document, '[role="dialog"]', safeGetStyle);
         const fallbackCardNodes = [
           dialogNode,
           promptNode,
-          ...collectAncestors(promptNode, 3, { excludeRoot: true })
+          ...collectAncestors(promptNode, 3, { excludeRoot: true }),
+          ...collectAncestors(genBtn, 3, { excludeRoot: true })
         ].filter(Boolean);
         for (const node of fallbackCardNodes) {
           if (!node || node === genBtn || isInsideGuildWeave(node) || !isElementVisible(node, safeGetStyle)) continue;
           const st = safeGetStyle(node);
-          const extracted = extractSurfaceColor(st, null, { allowTranslucent: false });
+          const extracted = extractSurfaceColor(st, null, { allowTranslucent: false, minAlpha: 0.75 }) || extractSurfaceColor(st, null, { allowTranslucent: false, minAlpha: 0.45 });
           if (!extracted || extracted.color === palette.bg0) continue;
           const lum = relativeLuminance(extracted.parsed);
           if (isDark ? lum < 0.35 : lum > 0.65) {
             palette.bg1 = extracted.color;
             bg1Parsed = extracted.parsed;
             palette.bg2 = shiftColor(extracted.parsed, isDark ? 10 : -10);
+            foundNonRootCardBg = true;
             break;
           }
         }
       }
-      if (!bg0Parsed && bg1Parsed) {
+      if ((!bg0Parsed || usedBodyFallbackForBg0 && isStaleNavyColor(bg0Parsed) && !isStaleNavyColor(bg1Parsed)) && foundNonRootCardBg && bg1Parsed) {
         const bg1IsDark = relativeLuminance(bg1Parsed) < 0.5;
-        palette.bg0 = shiftColor(bg1Parsed, bg1IsDark ? 10 : -10);
-        palette.inputBg = palette.bg0;
+        const derivedBg0 = shiftColor(bg1Parsed, bg1IsDark ? -8 : 8);
+        palette.bg0 = derivedBg0;
+        bg0Parsed = parseCssColor(derivedBg0) || bg1Parsed;
+        palette.inputBg = derivedBg0;
+        if (textParsed) {
+          palette.accentText = derivedBg0;
+        }
       }
       const promptEditorChain = [];
       if (promptBoxEl) {
@@ -1295,8 +1459,10 @@
           ...navRow && typeof navRow.querySelectorAll === "function" ? Array.from(navRow.querySelectorAll("button, div")).slice(0, 12) : [],
           ...modelButtons,
           ...modelRow && typeof modelRow.querySelectorAll === "function" ? Array.from(modelRow.querySelectorAll("div, button")).slice(0, 12) : [],
+          promptBoxEl,
           promptNode,
-          ...collectAncestors(promptNode, 3, { excludeRoot: true }),
+          ...collectAncestors(promptNode, 4, { excludeRoot: true }),
+          ...collectAncestors(genBtn, 4, { excludeRoot: true }),
           ...typeof document.querySelectorAll === "function" ? Array.from(document.querySelectorAll("input, button")).slice(0, 20) : []
         ].filter(Boolean);
         for (const ctrl of borderPool) {
@@ -1420,6 +1586,115 @@
     @keyframes gwPulse {
       0% { opacity: 0.45; transform: scale(0.92); }
       100% { opacity: 1; transform: scale(1.08); }
+    }
+    #gw-v5-bar.gw-v5-compact {
+      padding: 3px 6px 4px !important;
+      gap: 2px !important;
+      margin-bottom: 2px !important;
+      border-radius: 6px !important;
+    }
+    #gw-v5-bar.gw-v5-compact .gw-hud-row {
+      flex-wrap: nowrap !important;
+      gap: 4px !important;
+    }
+    #gw-v5-bar.gw-v5-compact .gw-hud-right {
+      gap: 5px !important;
+      flex-shrink: 0 !important;
+    }
+    #gw-v5-bar.gw-v5-compact #gw-v5-track {
+      height: 3px !important;
+    }
+    #gw-v5-bar.gw-v5-compact #gw-v5-label,
+    #gw-v5-bar.gw-v5-compact #gw-anlas-label,
+    #gw-v5-bar.gw-v5-compact #gw-v5-cost,
+    #gw-v5-bar.gw-v5-compact #gw-bypass-text {
+      font-size: 10px !important;
+      line-height: 1.2 !important;
+    }
+    #gw-v5-bar.gw-v5-compact #gw-v5-eta {
+      font-size: 9.5px !important;
+      line-height: 1.2 !important;
+      flex-shrink: 0 !important;
+    }
+    #gw-v5-bar.gw-v5-compact #gw-bypass-label {
+      gap: 4px !important;
+      font-size: 10px !important;
+    }
+    #gw-v5-bar.gw-v5-compact #gw-bypass-toggle {
+      width: 12px !important;
+      min-width: 12px !important;
+      max-width: 12px !important;
+      height: 12px !important;
+      flex: 0 0 12px !important;
+    }
+    #gw-v5-bar.gw-v5-compact #gw-hud-alert {
+      font-size: 10px !important;
+      padding: 3px 5px !important;
+    }
+    @media (max-width: 640px) {
+      #gw-v5-bar {
+        padding: 3px 6px 4px !important;
+        gap: 2px !important;
+        margin-bottom: 2px !important;
+        border-radius: 6px !important;
+      }
+      #gw-v5-bar .gw-hud-row {
+        flex-wrap: nowrap !important;
+        gap: 4px !important;
+      }
+      #gw-v5-bar .gw-hud-right {
+        gap: 5px !important;
+        flex-shrink: 0 !important;
+      }
+      #gw-v5-bar #gw-v5-track {
+        height: 3px !important;
+      }
+      #gw-v5-bar #gw-v5-label,
+      #gw-v5-bar #gw-anlas-label,
+      #gw-v5-bar #gw-v5-cost,
+      #gw-v5-bar #gw-bypass-text {
+        font-size: 10px !important;
+        line-height: 1.2 !important;
+      }
+      #gw-v5-bar #gw-v5-eta {
+        font-size: 9.5px !important;
+        line-height: 1.2 !important;
+        flex-shrink: 0 !important;
+      }
+      #gw-v5-bar #gw-bypass-label {
+        gap: 4px !important;
+        font-size: 10px !important;
+      }
+      #gw-v5-bar #gw-bypass-toggle {
+        width: 12px !important;
+        min-width: 12px !important;
+        max-width: 12px !important;
+        height: 12px !important;
+        flex: 0 0 12px !important;
+      }
+      #gw-allowance-bar {
+        padding: 4px 6px !important;
+        gap: 2px !important;
+      }
+      #vps-settings-modal, #vps-admin-panel {
+        padding: 14px !important;
+        width: 94vw !important;
+        max-height: 88vh !important;
+      }
+      #vps-settings-modal .gw-modal-header, #vps-admin-panel .gw-modal-header {
+        padding-bottom: 8px;
+        margin-bottom: 10px;
+      }
+      #vps-settings-modal .gw-card, #vps-admin-panel .gw-card {
+        padding: 10px 12px;
+        margin-bottom: 10px;
+      }
+      #vps-settings-modal .gw-stat-grid, #vps-admin-panel .gw-stat-grid {
+        gap: 8px 10px;
+      }
+      #vps-settings-modal .gw-btn, #vps-admin-panel .gw-btn {
+        padding: 7px 9px;
+      }
     }
     .gw-modal-header {
       display: flex;
@@ -1775,6 +2050,85 @@
     cachedPolicyState = next;
     return { ...next };
   }
+  function isDomNodeVisible(node) {
+    if (!node) return false;
+    const hasComputedStyle = typeof window !== "undefined" && typeof window.getComputedStyle === "function";
+    const isStyleHidden = (el) => {
+      if (!el) return true;
+      if (hasComputedStyle) {
+        try {
+          const st = window.getComputedStyle(el);
+          if (st && (st.display === "none" || st.visibility === "hidden" || st.opacity === "0")) {
+            return true;
+          }
+        } catch (_) {
+        }
+      }
+      const inline = el.style;
+      if (inline && (inline.display === "none" || inline.visibility === "hidden" || inline.opacity === "0")) {
+        return true;
+      }
+      return false;
+    };
+    if (isStyleHidden(node)) return false;
+    let cur = node.parentElement;
+    let hops = 0;
+    while (cur && hops < 16) {
+      if (hasComputedStyle) {
+        try {
+          const st = window.getComputedStyle(cur);
+          if (st && (st.display === "none" || st.opacity === "0")) {
+            return false;
+          }
+        } catch (_) {
+        }
+      }
+      if (cur.style && (cur.style.display === "none" || cur.style.opacity === "0")) {
+        return false;
+      }
+      if (typeof document !== "undefined" && (cur === document.body || cur === document.documentElement)) break;
+      cur = cur.parentElement;
+      hops++;
+    }
+    return true;
+  }
+  function pickVisibleDomElement(selector) {
+    if (typeof document === "undefined") return null;
+    if (typeof document.querySelectorAll === "function") {
+      const matches = document.querySelectorAll(selector);
+      if (matches && matches.length > 0) {
+        for (const el of matches) {
+          if (el && !isInsideGuildWeaveNode(el) && isDomNodeVisible(el)) {
+            return el;
+          }
+        }
+        for (const el of matches) {
+          if (el && !isInsideGuildWeaveNode(el)) {
+            return el;
+          }
+        }
+      }
+    }
+    return typeof document.querySelector === "function" ? document.querySelector(selector) : null;
+  }
+  function isCompactHudLayout() {
+    if (typeof window !== "undefined" && typeof window.innerWidth === "number" && window.innerWidth > 0 && window.innerWidth <= 640) {
+      return true;
+    }
+    if (typeof document !== "undefined" && typeof document.getElementById === "function") {
+      const v5Root = document.getElementById("gw-v5-bar");
+      if (v5Root && typeof v5Root.getBoundingClientRect === "function") {
+        try {
+          const rect = v5Root.getBoundingClientRect();
+          if (rect && typeof rect.width === "number" && rect.width > 0 && rect.width < 310) {
+            return true;
+          }
+        } catch (_) {
+        }
+      }
+    }
+    return false;
+  }
   function parseRgbaColor(cssColor) {
     if (typeof cssColor !== "string") return null;
     const trimmed = cssColor.trim().toLowerCase();
@@ -1863,6 +2217,10 @@
     let foundHeight = null;
     let foundSteps = null;
     let foundSamples = null;
+    let hiddenWidth = null;
+    let hiddenHeight = null;
+    let hiddenSteps = null;
+    let hiddenSamples = null;
     const inputs = document.querySelectorAll("input");
     for (const input of inputs) {
       if (!input || isInsideGuildWeaveNode(input)) continue;
@@ -1872,18 +2230,27 @@
       const id = (input.id || "").toLowerCase();
       const numVal = parseInt(input.value, 10);
       if (!Number.isFinite(numVal) || numVal <= 0) continue;
+      const visible = isDomNodeVisible(input);
       if (isStepControlInput(input)) {
-        foundSteps = numVal;
+        if (visible) foundSteps = numVal;
+        else if (hiddenSteps === null) hiddenSteps = numVal;
       } else if (aria === "width" || placeholder === "width" || name === "width" || id.includes("width")) {
-        foundWidth = numVal;
+        if (visible) foundWidth = numVal;
+        else if (hiddenWidth === null) hiddenWidth = numVal;
       } else if (aria === "height" || placeholder === "height" || name === "height" || id.includes("height")) {
-        foundHeight = numVal;
+        if (visible) foundHeight = numVal;
+        else if (hiddenHeight === null) hiddenHeight = numVal;
       } else if (aria.includes("number of images") || aria.includes("samples") || name === "n_samples" || id.includes("sample")) {
-        foundSamples = numVal;
+        if (visible) foundSamples = numVal;
+        else if (hiddenSamples === null) hiddenSamples = numVal;
       }
     }
-    if (foundSamples === null && typeof document.querySelector === "function") {
-      const genBtn = document.querySelector(".image-gen-generate-button");
+    if (foundWidth === null) foundWidth = hiddenWidth;
+    if (foundHeight === null) foundHeight = hiddenHeight;
+    if (foundSteps === null) foundSteps = hiddenSteps;
+    if (foundSamples === null) foundSamples = hiddenSamples;
+    if (foundSamples === null) {
+      const genBtn = pickVisibleDomElement(".image-gen-generate-button");
       if (genBtn) {
         const btnTextParts = [];
         for (const child of genBtn.children) {
@@ -1906,7 +2273,7 @@
       if (typeof document.querySelectorAll === "function") {
         candidateGroups.push(...document.querySelectorAll("div, span, button"));
       }
-      const footerEl = typeof document.querySelector === "function" ? document.querySelector(".image-gen-footer") : null;
+      const footerEl = pickVisibleDomElement(".image-gen-footer");
       for (const el of candidateGroups) {
         if (!el || isInsideGuildWeaveNode(el)) continue;
         const cls = el.getAttribute("class") || "";
@@ -1936,10 +2303,10 @@
   }
   function readNativeModelAndEffortFromDOM() {
     if (typeof document === "undefined" || typeof document.querySelector !== "function") return null;
-    const modelRow = document.querySelector(".image-gen-model-mode-row");
+    const modelRow = pickVisibleDomElement(".image-gen-model-mode-row");
     if (!modelRow) return null;
     let modelText = "";
-    const modelInput = modelRow.querySelector('input[aria-label="Select the Model"]') || document.querySelector('input[aria-label="Select the Model"]');
+    const modelInput = modelRow.querySelector('input[aria-label="Select the Model"]') || pickVisibleDomElement('input[aria-label="Select the Model"]');
     if (modelInput && modelInput.parentElement) {
       const prev = modelInput.previousElementSibling;
       const parentPrev = modelInput.parentElement.previousElementSibling;
@@ -2027,7 +2394,7 @@
     }
   }
   function injectNavBadge(onClickHandler) {
-    const menuBtn = document.querySelector('button[aria-label="menu"]');
+    const menuBtn = pickVisibleDomElement('button[aria-label="menu"]');
     if (!menuBtn || !menuBtn.parentElement) return false;
     const existing = document.getElementById("gw-nav-badge");
     if (existing) {
@@ -2068,9 +2435,15 @@
     return true;
   }
   function injectAllowanceBar() {
-    if (document.getElementById("gw-allowance-bar")) return true;
-    const genBtn = document.querySelector(".image-gen-generate-button");
+    const genBtn = pickVisibleDomElement(".image-gen-generate-button");
     if (!genBtn || !genBtn.parentElement) return false;
+    const existing = document.getElementById("gw-allowance-bar");
+    if (existing) {
+      if (existing.parentElement === genBtn.parentElement && existing.nextElementSibling === genBtn) {
+        return true;
+      }
+      existing.remove();
+    }
     const theme = ensureGuildWeaveStyles();
     const barRoot = document.createElement("div");
     barRoot.id = "gw-allowance-bar";
@@ -2147,9 +2520,15 @@
   }
   function injectDualLedgerBar() {
     injectAllowanceBar();
-    if (document.getElementById("gw-v5-bar")) return true;
     const allowanceBar = document.getElementById("gw-allowance-bar");
     if (!allowanceBar || !allowanceBar.parentElement) return false;
+    const existing = document.getElementById("gw-v5-bar");
+    if (existing) {
+      if (existing.parentElement === allowanceBar.parentElement && existing.nextElementSibling === allowanceBar) {
+        return true;
+      }
+      existing.remove();
+    }
     const theme = ensureGuildWeaveStyles();
     const v5Root = document.createElement("div");
     v5Root.id = "gw-v5-bar";
@@ -2167,6 +2546,7 @@
     box-sizing: border-box;
   `.replace(/\s+/g, " ").trim();
     const v5HeaderRow = document.createElement("div");
+    v5HeaderRow.className = "gw-hud-row";
     v5HeaderRow.style.cssText = "display: flex; flex-direction: row; align-items: center; justify-content: space-between; gap: 6px;";
     const v5Label = document.createElement("span");
     v5Label.id = "gw-v5-label";
@@ -2186,6 +2566,7 @@
     v5Fill.style.cssText = `height: 100%; width: 100%; background-color: var(--theme-accent, ${theme.accent}); border-radius: 999px; transition: width 0.35s ease-in-out, background-color 0.35s ease-in-out;`;
     v5Track.appendChild(v5Fill);
     const controlsRow = document.createElement("div");
+    controlsRow.className = "gw-hud-row";
     controlsRow.style.cssText = "display: flex; flex-direction: row; align-items: center; justify-content: space-between; gap: 6px; flex-wrap: wrap;";
     const anlasLabel = document.createElement("span");
     anlasLabel.id = "gw-anlas-label";
@@ -2193,6 +2574,7 @@
     anlasLabel.textContent = "Monthly Anlas: --";
     anlasLabel.setAttribute("title", "Resets each billing cycle; unused Anlas does not roll over.");
     const rightControls = document.createElement("div");
+    rightControls.className = "gw-hud-right";
     rightControls.style.cssText = "display: flex; align-items: center; gap: 8px;";
     const costBadge = document.createElement("span");
     costBadge.id = "gw-v5-cost";
@@ -2270,14 +2652,14 @@
       alertEl.style.color = `var(--theme-warning, ${theme.warning})`;
     }
   }
-  function formatNextPercentEta(etaMs) {
+  function formatNextPercentEta(etaMs, compact = false) {
     if (typeof etaMs !== "number" || !Number.isFinite(etaMs)) return "";
     if (etaMs <= 0) return "Full";
     const mins = Math.max(0.1, etaMs / 6e4);
     if (mins >= 60) {
-      return `+1% in ${(mins / 60).toFixed(1)}h`;
+      return compact ? `+${(mins / 60).toFixed(1)}h` : `+1% in ${(mins / 60).toFixed(1)}h`;
     }
-    return `+1% in ${mins.toFixed(1)}m`;
+    return compact ? `+${mins.toFixed(1)}m` : `+1% in ${mins.toFixed(1)}m`;
   }
   function formatReadableClusterState(clusterState) {
     switch (clusterState) {
@@ -2314,6 +2696,7 @@
   }
   function renderDualLedgerHudFromState(state) {
     const theme = ensureGuildWeaveStyles();
+    const compact = isCompactHudLayout();
     const v5Root = document.getElementById("gw-v5-bar");
     const v5Track = document.getElementById("gw-v5-track");
     const v5Label = document.getElementById("gw-v5-label");
@@ -2332,6 +2715,11 @@
     if (v5Root) {
       v5Root.style.backgroundColor = `var(--theme-bg0, ${theme.bg0})`;
       v5Root.style.border = `1px solid var(--theme-bg2, ${theme.borderStrong})`;
+      if (compact) {
+        v5Root.className = "gw-v5-compact";
+      } else if (v5Root.className === "gw-v5-compact") {
+        v5Root.className = "";
+      }
     }
     if (v5Track) {
       v5Track.style.background = theme.border;
@@ -2359,26 +2747,26 @@
     const specs = readNativeGenerationSpecsFromDOM(activeModel);
     const isBaseAnlasBypass = Boolean(state.bypassEnabled) && (specs.area > FIREWALL_MAX_PIXELS || specs.samples !== FIREWALL_MAX_SAMPLES || isV5 && !isMed && specs.steps > FIREWALL_MAX_STEPS);
     const spendableMasterNcp = computeClientSpendableMasterNcp(state);
+    const pctText = typeof state.masterV5Percent === "number" && Number.isFinite(state.masterV5Percent) ? `${state.masterV5Percent.toFixed(1)}%` : "--%";
     if (v5Label && v5Fill) {
       v5Label.style.color = `var(--theme-text, ${theme.text})`;
-      const pctText = typeof state.masterV5Percent === "number" && Number.isFinite(state.masterV5Percent) ? `${state.masterV5Percent.toFixed(1)}%` : "--%";
       if (state.masterTokenExpired || state.clusterState === "token_expired") {
-        v5Label.textContent = "Master Token Expired (Awaiting Admin)";
+        v5Label.textContent = compact ? "Token Expired" : "Master Token Expired (Awaiting Admin)";
         v5Label.setAttribute("title", "The shared NovelAI session token expired and needs to be refreshed by an admin.");
         v5Fill.style.width = "0%";
         v5Fill.style.backgroundColor = `var(--theme-error, ${theme.error})`;
       } else if (state.subscriptionActive === false && state.lastFetchedAt > 0) {
-        v5Label.textContent = "Master Subscription Inactive";
+        v5Label.textContent = compact ? "Sub Inactive" : "Master Subscription Inactive";
         v5Fill.style.width = "0%";
         v5Fill.style.backgroundColor = `var(--theme-error, ${theme.error})`;
       } else if (state.isHardLocked) {
-        v5Label.textContent = `V5 Recharging (${pctText} <= 5.5%)`;
+        v5Label.textContent = compact ? `Recharging (${pctText})` : `V5 Recharging (${pctText} <= 5.5%)`;
         v5Label.setAttribute("title", "Shared V5 capacity must stay above 5.5% to prevent a cluster-wide cooldown. Legacy models and Anlas-paid specs still work.");
         const widthPct = typeof state.masterV5Percent === "number" ? Math.max(0, Math.min(100, state.masterV5Percent)) : 0;
         v5Fill.style.width = `${widthPct}%`;
         v5Fill.style.backgroundColor = `var(--theme-error, ${theme.error})`;
       } else if (state.isUnlimitedV5) {
-        v5Label.textContent = `V5 Allowance: Unlimited \xB7 Pool: ${pctText}`;
+        v5Label.textContent = compact ? "V5: Unlimited" : `V5 Allowance: Unlimited \xB7 Pool: ${pctText}`;
         v5Fill.style.width = "100%";
         v5Fill.style.backgroundColor = resolveClusterStateColor(state.clusterState, theme);
       } else if (typeof state.v5AvailableNcp === "number") {
@@ -2390,7 +2778,11 @@
         const surplusHigh = state.v5SurplusEligible && effectiveSurplus >= V5_HIGH_NCP_COST ? Math.floor(effectiveSurplus / V5_HIGH_NCP_COST) : 0;
         const surplusSuffix = surplusHigh > 0 ? ` (+${surplusHigh} Bonus)` : "";
         const depleted = effectiveNcp < V5_MEDIUM_NCP_COST && (!state.v5SurplusEligible || effectiveSurplus < V5_MEDIUM_NCP_COST);
-        v5Label.textContent = depleted ? `V5 Limit Reached \xB7 Pool: ${pctText}` : `V5 Free: ${highLeft} High / ${medLeft} Med${surplusSuffix} \xB7 Pool: ${pctText}`;
+        if (compact) {
+          v5Label.textContent = depleted ? "V5 Limit Reached" : `V5: ${highLeft}H/${medLeft}M${surplusHigh > 0 ? `+${surplusHigh}` : ""}`;
+        } else {
+          v5Label.textContent = depleted ? `V5 Limit Reached \xB7 Pool: ${pctText}` : `V5 Free: ${highLeft} High / ${medLeft} Med${surplusSuffix} \xB7 Pool: ${pctText}`;
+        }
         v5Label.setAttribute(
           "title",
           `Personal Reserve: ${effectiveNcp}/${maxNcp} V5 credits (accumulates daily up to 3 days). Bonus Pool activates above 50% shared pool.`
@@ -2399,14 +2791,29 @@
         v5Fill.style.width = `${barPct}%`;
         v5Fill.style.backgroundColor = resolveClusterStateColor(state.clusterState, theme);
       } else {
-        v5Label.textContent = `V5 Allowance: Syncing \xB7 Pool: ${pctText}`;
+        v5Label.textContent = compact ? "V5: Syncing" : `V5 Allowance: Syncing \xB7 Pool: ${pctText}`;
       }
     }
     if (v5Eta) {
       v5Eta.style.color = `var(--theme-textSecondary, ${theme.textMuted})`;
-      const etaStr = formatNextPercentEta(state.nextPercentEtaMs);
-      const stateLabel = formatReadableClusterState(state.clusterState);
-      v5Eta.textContent = [stateLabel, etaStr].filter(Boolean).join(" \xB7 ");
+      const fullEtaStr = formatNextPercentEta(state.nextPercentEtaMs, false);
+      const fullStateLabel = formatReadableClusterState(state.clusterState);
+      const fullCombo = [fullStateLabel, fullEtaStr].filter(Boolean).join(" \xB7 ");
+      if (compact) {
+        if (state.masterTokenExpired || state.clusterState === "token_expired") {
+          v5Eta.textContent = "Admin Reset";
+        } else if (state.subscriptionActive === false && state.lastFetchedAt > 0) {
+          v5Eta.textContent = "Paused";
+        } else {
+          const shortEta = formatNextPercentEta(state.nextPercentEtaMs, true);
+          v5Eta.textContent = [pctText !== "--%" ? pctText : "", shortEta].filter(Boolean).join(" \xB7 ") || fullStateLabel;
+        }
+        if (fullCombo) {
+          v5Eta.setAttribute("title", `${fullCombo} (Shared Pool ${pctText})`);
+        }
+      } else {
+        v5Eta.textContent = fullCombo;
+      }
     }
     if (costBadge) {
       if (!activeModel || isV5 && isBaseAnlasBypass) {
@@ -2414,33 +2821,33 @@
         costBadge.textContent = "";
       } else if (isMed) {
         costBadge.style.display = "";
-        costBadge.textContent = `Uses ${V5_MEDIUM_NCP_COST} V5 pts (Med)`;
+        costBadge.textContent = compact ? `${V5_MEDIUM_NCP_COST} pts` : `Uses ${V5_MEDIUM_NCP_COST} V5 pts (Med)`;
         costBadge.setAttribute("title", `Medium effort uses ${V5_MEDIUM_NCP_COST} credits vs ${V5_HIGH_NCP_COST} on High.`);
         costBadge.style.color = `var(--theme-text, ${theme.text})`;
       } else if (isV5) {
         costBadge.style.display = "";
-        costBadge.textContent = `Uses ${V5_HIGH_NCP_COST} V5 pts (High)`;
+        costBadge.textContent = compact ? `${V5_HIGH_NCP_COST} pts` : `Uses ${V5_HIGH_NCP_COST} V5 pts (High)`;
         costBadge.setAttribute("title", `High effort uses ${V5_HIGH_NCP_COST} credits per free-size generation.`);
         costBadge.style.color = `var(--theme-text, ${theme.text})`;
       } else {
         costBadge.style.display = "";
-        costBadge.textContent = "Legacy (0 V5 pts)";
+        costBadge.textContent = compact ? "Legacy" : "Legacy (0 V5 pts)";
         costBadge.style.color = `var(--theme-textSecondary, ${theme.textMuted})`;
       }
     }
     if (anlasLabel) {
       if (state.isUnlimitedAnlas) {
-        anlasLabel.textContent = "Monthly Anlas: Unlimited";
+        anlasLabel.textContent = compact ? "Anlas: Unlimited" : "Monthly Anlas: Unlimited";
         anlasLabel.style.color = `var(--theme-text, ${theme.text})`;
       } else if (state.isInDebt) {
-        anlasLabel.textContent = `Anlas Overdrawn: ${state.virtualBalance} (Paid Paused)`;
+        anlasLabel.textContent = compact ? `Anlas: ${state.virtualBalance} (Paused)` : `Anlas Overdrawn: ${state.virtualBalance} (Paid Paused)`;
         anlasLabel.style.color = `var(--theme-error, ${theme.error})`;
       } else if (typeof state.availableAnlas === "number") {
         const quotaSuffix = typeof state.monthlyQuota === "number" ? `/${state.monthlyQuota}` : "";
-        anlasLabel.textContent = `Monthly Anlas: ${state.availableAnlas}${quotaSuffix}`;
+        anlasLabel.textContent = compact ? `Anlas: ${state.availableAnlas}${quotaSuffix}` : `Monthly Anlas: ${state.availableAnlas}${quotaSuffix}`;
         anlasLabel.style.color = `var(--theme-textSecondary, ${theme.textMuted})`;
       } else {
-        anlasLabel.textContent = "Monthly Anlas: --";
+        anlasLabel.textContent = compact ? "Anlas: --" : "Monthly Anlas: --";
         anlasLabel.style.color = `var(--theme-textSecondary, ${theme.textMuted})`;
       }
     }
@@ -2448,7 +2855,7 @@
       if (state.isInDebt) {
         bypassCheckbox.checked = false;
         bypassCheckbox.disabled = true;
-        bypassText.textContent = "Anlas Paused";
+        bypassText.textContent = compact ? "Paused" : "Anlas Paused";
         bypassText.style.color = `var(--theme-error, ${theme.error})`;
       } else {
         bypassCheckbox.disabled = false;
@@ -2578,7 +2985,7 @@
   }
   function scrapeDisplayedAnlasCost() {
     if (typeof document === "undefined" || typeof document.querySelector !== "function") return null;
-    const genBtn = document.querySelector(".image-gen-generate-button");
+    const genBtn = pickVisibleDomElement(".image-gen-generate-button");
     if (!genBtn) return null;
     const isInsideShield = (node) => {
       let cur = node;
@@ -2660,9 +3067,15 @@
     }
   }
   function injectQueueShield() {
-    const genBtn = document.querySelector(".image-gen-generate-button");
+    const genBtn = pickVisibleDomElement(".image-gen-generate-button");
     if (!genBtn) return false;
-    if (document.getElementById("gw-button-shield")) return true;
+    const existing = document.getElementById("gw-button-shield");
+    if (existing) {
+      if (existing.parentElement === genBtn) {
+        return true;
+      }
+      existing.remove();
+    }
     const theme = ensureGuildWeaveStyles();
     genBtn.style.position = "relative";
     genBtn.style.overflow = "hidden";
@@ -2738,6 +3151,7 @@
   var rafScheduled = false;
   var observedInputRoot = null;
   var inputConstraintHandler = null;
+  var resizeHandler = null;
   function initDOMObserver(options = {}) {
     stopDOMObserver();
     const runSync = () => {
@@ -2814,6 +3228,10 @@
         characterData: true
       });
     }
+    if (typeof window !== "undefined" && typeof window.addEventListener === "function") {
+      resizeHandler = scheduleSync;
+      window.addEventListener("resize", resizeHandler);
+    }
     runSync();
   }
   function stopDOMObserver() {
@@ -2829,8 +3247,12 @@
       observedInputRoot.removeEventListener("input", inputConstraintHandler, true);
       observedInputRoot.removeEventListener("change", inputConstraintHandler, true);
     }
+    if (resizeHandler && typeof window !== "undefined" && typeof window.removeEventListener === "function") {
+      window.removeEventListener("resize", resizeHandler);
+    }
     observedInputRoot = null;
     inputConstraintHandler = null;
+    resizeHandler = null;
   }
 
   // src/userscripts/shared/ui.js

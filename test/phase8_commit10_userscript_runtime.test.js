@@ -21,21 +21,26 @@
  *    - Verifies `params.js` matches `auditEngine.extractParametersFromRawBody` 1-to-1, routing
  *      `reference_image_multiple` into `vibe_reference_count` and counting strictly Character References
  *      in `precise_refs` so `X-Precise-Refs` never diverges from Stage 5.
- * 3. Happy Path & Theme Inheritance:
+ * 3. Happy Path & Theme Inheritance (Desktop & Mobile Layouts):
  *    - Polls `/auth/status` with full Commit 9 + cycle-segregated payload and verifies `#gw-v5-bar`
  *      mounts above `#gw-allowance-bar` while preserving `allowanceBar.nextElementSibling === genBtn`.
  *    - Verifies `scrapeNovelAITheme()` skips stale navy `document.body` CSS (`rgb(19, 21, 44)`),
- *      ignores hidden `[role="dialog"]` (`display: none`) and ancestor-hidden subtrees, ignores stale
- *      fallback `backgroundColor` buried under `linear-gradient(...)`, ignores low-alpha translucent
- *      overlays (`rgba(255,255,255,0.08)`), rejects blurred drop shadows while accepting spread-only
- *      `0 0 0 <N>px` rings, extracts `#__next`/ancestor backgrounds, `.image-gen-character-prompts`
- *      card background + outline (`--gw-bg1`, `--gw-card-border`), `[data-prompt-input="true"]` /
- *      `.prompt-input-box-prompt` background (`--gw-input-bg`, ignoring `.sc-b7a086c6-0` inner button
- *      row regardless of child order), card container `borderTopColor`, and active effort fills,
- *      keeps dark-button bright-text themes legible, refreshes `#gw-nav-badge` classes & computed colors
- *      when `button[aria-label="menu"]` transitions post-hydration, reacts to `document.head` `<style>`
- *      swaps while ignoring `#gw-ui-styles`, locks `.gw-switch` dimensions, and hides `#gw-allowance-bar`
+ *      ignores hidden `[role="dialog"]`, hidden desktop layouts (`display: none`) on mobile, and
+ *      ancestor-hidden subtrees, ignores stale fallback `backgroundColor` buried under `linear-gradient(...)`,
+ *      ignores low-alpha translucent overlays (`rgba(255,255,255,0.08)`), rejects blurred drop shadows
+ *      while accepting spread-only `0 0 0 <N>px` rings, supports CSS Color 4 space-separated `rgb()`
+ *      & semi-opaque mobile canvas/drawer layers, extracts `#__next`/layout backgrounds,
+ *      `.image-gen-character-prompts` card background + outline (`--gw-bg1`, `--gw-card-border`),
+ *      `[data-prompt-input="true"]` / `.prompt-input-box-prompt` background (`--gw-input-bg`, ignoring
+ *      `.sc-b7a086c6-0` inner button row regardless of child order), card container `borderTopColor`,
+ *      and active effort fills, keeps dark-button bright-text themes legible, refreshes `#gw-nav-badge`
+ *      classes & computed colors when `button[aria-label="menu"]` transitions post-hydration, reacts to
+ *      `document.head` `<style>` swaps while ignoring `#gw-ui-styles`, and hides `#gw-allowance-bar`
  *      for unlimited tiers.
+ *    - Verifies mobile layout (`window.innerWidth = 375`) skips hidden desktop `.image-gen-nav-row` /
+ *      `.image-gen-footer`, mounts onto visible mobile buttons, avoids `#13152c` navy bleed on both
+ *      `#gw-v5-bar` and `#vps-settings-modal`, applies `.gw-v5-compact` single-line compact rows
+ *      without truncating V5 generation counts, and adapts dynamically on `resize` back to desktop.
  *    - Verifies linked browser ID chips (`#guest-linked-devices`, Admin Governance, and Operator Settings)
  *      copy the full `browser_id` to clipboard on click, `Space`, and `Enter` key, cancel stale timers
  *      across rapid double clicks, display `'Copied!'` / `'Copy failed'` accurately, and fall back to
@@ -190,6 +195,7 @@ function createBrowserSandbox(initialStorage = {}, scriptSource = null) {
   const intervals = [];
   const elements = new Map();
   const observerCallbacks = [];
+  const windowListeners = new Map();
   const promptQueue = [];
   const confirmQueue = [];
   const alertLog = [];
@@ -690,6 +696,7 @@ function createBrowserSandbox(initialStorage = {}, scriptSource = null) {
   };
 
   const windowMock = {
+    innerWidth: 1280,
     document: documentMock,
     unsafeWindow: unsafeWindowMock,
     sessionStorage: {
@@ -699,6 +706,13 @@ function createBrowserSandbox(initialStorage = {}, scriptSource = null) {
     },
     location: { reloaded: false, reload() { this.reloaded = true; } },
     requestAnimationFrame: (fn) => setTimeout(fn, 0),
+    addEventListener: (type, fn) => {
+      if (!windowListeners.has(type)) windowListeners.set(type, new Set());
+      windowListeners.get(type).add(fn);
+    },
+    removeEventListener: (type, fn) => {
+      if (windowListeners.has(type)) windowListeners.get(type).delete(fn);
+    },
     getComputedStyle: (el) => ({
       backgroundColor: (el && el.style && el.style.backgroundColor) ? el.style.backgroundColor : 'rgba(0, 0, 0, 0)',
       backgroundImage: (el && el.style && el.style.backgroundImage) ? el.style.backgroundImage : 'none',
@@ -809,6 +823,13 @@ function createBrowserSandbox(initialStorage = {}, scriptSource = null) {
     setClipboardError: (err) => { clipboardError = err; },
     setExecCommandReturn: (val) => { execCommandReturn = Boolean(val); },
     setPageFetch: (fn) => { originalPageFetch = fn; },
+    triggerResize: (newWidth) => {
+      windowMock.innerWidth = newWidth;
+      const set = windowListeners.get('resize');
+      if (set) {
+        for (const fn of set) fn();
+      }
+    },
     triggerIntervalAtMs: (ms) => {
       for (const entry of intervals) {
         if (entry.ms === ms) entry.fn();
@@ -1791,6 +1812,135 @@ test('Phase 8 Commit 10: Client UserScript Runtime, Dynamic Design Engine & Prod
     const hiddenCardCss = hellSandbox.context.document.getElementById('gw-ui-styles').textContent;
     assert.doesNotMatch(hiddenCardCss, /--theme-bg1:\s*rgb\(66,\s*45,\s*34\)/, 'opacity: 0 ancestor must exclude hidden character prompts card');
     assert.doesNotMatch(hiddenCardCss, /--theme-bg1:\s*rgb\(19,\s*21,\s*44\)/, 'display: none ancestor around [role="dialog"] must never leak navy bg1');
+  });
+
+  // ---------------------------------------------------------------------------
+  // 3b-iii. HELL PATH: MOBILE LAYOUT THEME INHERITANCE, HIDDEN DESKTOP DUPLICATES & COMPACT HUD
+  // ---------------------------------------------------------------------------
+  await t.test('Mobile Layout Hell Path: Skips hidden desktop DOM & stale body navy, mounts on mobile controls & renders compact single-line HUD', async () => {
+    const mobileSandbox = createBrowserSandbox({
+      approved: true,
+      vps_host: 'https://vps.example.duckdns.org',
+      device_secret: 'sec_mobile',
+      browser_id: 'b_mobile',
+      anlas_bypass_enabled: true
+    }, guestCode);
+    const { context, networkCalls, triggerIntervalAtMs, triggerObserverSync, triggerResize } = mobileSandbox;
+
+    context.window.innerWidth = 375;
+    context.document.body.style.backgroundColor = 'rgb(19, 21, 44)';
+    context.document.body.style.color = 'rgb(245, 243, 194)';
+
+    // Emulates NovelAI mobile DOM:
+    // - Child 0 under #__next is the desktop layout hidden via display: none (with .image-gen-nav-row / .image-gen-footer)
+    // - Child 1 is the visible mobile layout without .image-gen-nav-row / .image-gen-footer / .image-gen-model-mode-row,
+    //   painting warm brown via CSS Color 4 space-separated `rgb(45 22 11)` on the main mobile wrapper
+    //   and semi-opaque brown drawer around prompt + mobile Generate button.
+    context.document.body.innerHTML = `
+      <div id="__next">
+        <div id="desktop-hidden" style="display: none; background-color: rgb(19, 21, 44);">
+          <div class="image-gen-nav-row"><button aria-label="menu"></button></div>
+          <div class="image-gen-character-prompts" style="background-color: rgb(19, 21, 44);"></div>
+          <div class="image-gen-footer"><button class="image-gen-generate-button"><span>Generate 1 Image</span></button></div>
+        </div>
+        <div id="mobile-shell" style="background-color: rgb(45 22 11); color: rgb(245, 243, 194);">
+          <div id="mobile-top-bar" style="background-color: rgba(0, 0, 0, 0);">
+            <button id="mobile-menu-btn" aria-label="menu" style="background-color: rgb(75, 43, 26); border-top-color: rgb(102, 62, 38); border-top-width: 1px; color: rgb(245, 243, 194);"></button>
+          </div>
+          <div id="mobile-canvas" style="background-color: rgba(0, 0, 0, 0);"></div>
+          <div id="mobile-drawer" style="background-color: rgb(66, 45, 34); border-top-color: rgb(102, 62, 38); border-top-width: 1px;">
+            <div class="prompt-input-box-prompt" data-prompt-input="true" style="background-color: rgb(37, 7, 3);">
+              <div contenteditable="true" class="ProseMirror"><p>minccino</p></div>
+            </div>
+            <div id="mobile-action-row">
+              <button id="mobile-gen-btn" class="image-gen-generate-button" style="background-color: rgb(245, 203, 92); color: rgb(26, 15, 10);">
+                <span>Generate 1 Image</span>
+              </button>
+            </div>
+          </div>
+        </div>
+      </div>
+    `;
+
+    vm.runInContext(guestCode, context);
+    triggerObserverSync();
+
+    // Verify theme inherited mobile brown rgb(45 22 11) and NEVER stale body navy rgb(19, 21, 44)
+    const styleEl = context.document.getElementById('gw-ui-styles');
+    assert.ok(styleEl);
+    assert.match(styleEl.textContent, /--theme-bg0:\s*rgb\(45\s+22\s+11\)/, 'Mobile layout must extract active theme bg0 instead of falling back to body #13152c');
+    assert.doesNotMatch(styleEl.textContent, /--theme-bg0:\s*rgb\(19,\s*21,\s*44\)/);
+    assert.match(styleEl.textContent, /#gw-v5-bar\.gw-v5-compact/, 'Stylesheet must include compact mobile HUD CSS rules');
+
+    // Verify #gw-nav-badge & #gw-v5-bar mounted on VISIBLE mobile controls (NOT hidden desktop!)
+    const navBadge = context.document.getElementById('gw-nav-badge');
+    const v5Bar = context.document.getElementById('gw-v5-bar');
+    const allowanceBar = context.document.getElementById('gw-allowance-bar');
+    const mobileGenBtn = context.document.getElementById('mobile-gen-btn');
+    const mobileMenuBtn = context.document.getElementById('mobile-menu-btn');
+    assert.strictEqual(navBadge.parentElement, mobileMenuBtn.parentElement, 'Badge must mount next to visible mobile menu button');
+    assert.strictEqual(v5Bar.parentElement, mobileGenBtn.parentElement, '#gw-v5-bar must mount inside visible mobile drawer');
+    assert.strictEqual(allowanceBar.nextElementSibling, mobileGenBtn);
+    assert.strictEqual(v5Bar.className, 'gw-v5-compact', 'Mobile viewport must apply .gw-v5-compact class');
+    assert.match(v5Bar.style.backgroundColor, /rgb\(45\s+22\s+11\)/);
+
+    // Poll /auth/status and verify compact non-truncating single-line text on mobile
+    triggerIntervalAtMs(10000);
+    await new Promise(r => setTimeout(r, 20));
+    const statusCall = networkCalls.find(c => c.url.includes('/auth/status'));
+    statusCall.onload({
+      status: 200,
+      responseText: JSON.stringify({
+        approved: true,
+        tier: 'Low',
+        anlas: { virtual_balance: 88, available_balance: 88, monthly_quota: 250, is_unlimited: false, is_in_debt: false },
+        v5: { banked_ncp: 2180, available_ncp: 2180, max_bank_ncp: 2700, surplus_available_ncp: 0, surplus_eligible: true, is_unlimited: false },
+        telemetry: { master_v5_percent: 19.0, cluster_state: 'reserve_mode', next_percent_eta_ms: 7200000, is_hard_locked: false, subscription_active: true, last_fetched_at: Date.now() }
+      })
+    });
+    await new Promise(r => setTimeout(r, 20));
+
+    assert.strictEqual(context.document.getElementById('gw-v5-label').textContent, 'V5: 121H/218M', 'Mobile must keep High & Med counts compact so they never clip into ellipsis');
+    assert.strictEqual(context.document.getElementById('gw-v5-eta').textContent, '19.0% · +2.0h');
+    assert.strictEqual(context.document.getElementById('gw-anlas-label').textContent, 'Anlas: 88/250');
+
+    // Open mobile settings modal -> modal outer shell must also inherit warm brown (not navy #13152c)
+    navBadge.onclick({ preventDefault: () => {}, stopPropagation: () => {} });
+    await new Promise(r => setTimeout(r, 20));
+    const modal = context.document.getElementById('vps-settings-modal');
+    assert.ok(modal);
+    assert.match(modal.style.background, /rgb\(45\s+22\s+11\)/, 'Mobile modal must not revert to navy #13152c');
+    context.document.getElementById('guest-close-modal-btn').onclick();
+
+    // Second mobile edge case: ONLY mobile drawer card has background color (no outer #mobile-shell color) + stale body navy
+    const fallbackMobile = createBrowserSandbox({
+      approved: true,
+      vps_host: 'https://vps.example.duckdns.org',
+      device_secret: 'sec_mobile2',
+      browser_id: 'b_mobile2'
+    }, guestCode);
+    fallbackMobile.context.window.innerWidth = 375;
+    fallbackMobile.context.document.body.style.backgroundColor = 'rgb(19, 21, 44)';
+    fallbackMobile.context.document.body.innerHTML = `
+      <div id="__next">
+        <div id="mobile-drawer" style="background-color: rgba(54, 28, 15, 0.72);">
+          <textarea>prompt</textarea>
+          <button class="image-gen-generate-button" style="background-color: rgb(245, 203, 92);"><span>Generate 1 Image</span></button>
+        </div>
+      </div>
+    `;
+    vm.runInContext(guestCode, fallbackMobile.context);
+    fallbackMobile.triggerObserverSync();
+    const fallbackCss = fallbackMobile.context.document.getElementById('gw-ui-styles').textContent;
+    assert.match(fallbackCss, /--theme-bg0:\s*rgb\(54,\s*28,\s*15\)/, 'Semi-opaque mobile drawer layer must beat stale navy body fallback');
+    assert.doesNotMatch(fallbackCss, /--theme-bg0:\s*rgb\(19,\s*21,\s*44\)/);
+
+    // Resizing back to desktop (1280px) dynamically drops .gw-v5-compact and restores full desktop HUD copy
+    triggerResize(1280);
+    await new Promise(r => setTimeout(r, 20));
+    assert.strictEqual(v5Bar.className, '', 'Resizing to desktop width must clear .gw-v5-compact');
+    assert.match(context.document.getElementById('gw-v5-label').textContent, /121 High \/ 218 Med/);
+    assert.match(context.document.getElementById('gw-anlas-label').textContent, /Monthly Anlas: 88\/250/);
   });
 
   // ---------------------------------------------------------------------------
