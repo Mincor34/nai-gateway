@@ -6,7 +6,8 @@
  * and operator CLI callers that authenticate via ADMIN_SECRET_KEY without userscript headers.
  * Exposes dual-ledger Anlas/V5 NCP telemetry, Cluster Surplus state, billing-cycle-segregated
  * period usage & historical archives (`GET /admin/cycles`, `?cycle_epoch=` on `/devices` & `/global-stats`),
- * and atomic balance adjustment / debt reconciliation controls.
+ * immediate principal ledger sync on approval/linking/tier updates, and atomic balance adjustment /
+ * debt reconciliation controls.
  * Supports canonical user_id, discord_id, and browser_id resolution across governance endpoints
  * (including pruned unlinked user records lacking active rows in devices).
  * Relational Normalization: Operates on canonical users as parents and devices as children.
@@ -117,6 +118,54 @@ async function resolveTargetUserId(body) {
   }
 
   return { ok: false, status: 400, error: 'Missing target identifier (user_id, discord_id, or browser_id).' };
+}
+
+/**
+ * Synchronizes V5 accrual and billing-cycle Anlas quotas immediately after administrative
+ * approval, linking, or tier mutations when the canonical principal is unbanned and holds
+ * at least one approved device. Preserves cold-boot reset guards when telemetry is offline.
+ *
+ * @param {string} userId - Canonical Security Principal identifier.
+ * @param {object} req - Express request carrying telemetry context.
+ * @returns {Promise<void>}
+ */
+async function syncPrincipalLedgersOnAdminMutation(userId, req) {
+  if (typeof userId !== 'string' || userId.trim().length === 0 || userId === 'admin') {
+    return;
+  }
+
+  const eligible = await get(
+    `SELECT u.user_id
+     FROM users u
+     WHERE u.user_id = ?
+       AND u.banned = 0
+       AND EXISTS (SELECT 1 FROM devices d WHERE d.user_id = u.user_id AND d.approved = 1)`,
+    [userId]
+  );
+  if (!eligible) return;
+
+  const now = Date.now();
+  const skipColdBootReset = Boolean(
+    req.telemetry &&
+    req.telemetry.lastFetched === 0 &&
+    req.telemetry.activeCycleEpoch === null
+  );
+
+  if (!skipColdBootReset) {
+    await auditEngine.evaluateAnlasReset(userId, {
+      now,
+      activeCycleEpoch: req.telemetry?.activeCycleEpoch ?? null,
+      isGracePeriod: req.telemetry?.isGracePeriod ?? false,
+      subscriptionActive: req.telemetry?.subscriptionActive ?? true
+    });
+  }
+
+  if (!req.telemetry || (req.telemetry.subscriptionActive !== false && !req.telemetry.masterTokenExpired)) {
+    await auditEngine.evaluateV5Accrual(userId, {
+      now,
+      nominalDailyCompute: req.telemetry?.nominalDailyCompute ?? null
+    });
+  }
 }
 
 // Strict Middleware for Administrative Endpoints
@@ -470,16 +519,19 @@ router.post('/approve', async (req, res) => {
     if (canonicalUserId) {
       await run('UPDATE users SET priority_tier = ? WHERE user_id = ?', [targetTier, canonicalUserId]);
       await run('UPDATE devices SET approved = 1 WHERE user_id = ?', [canonicalUserId]);
+      await syncPrincipalLedgersOnAdminMutation(canonicalUserId, req);
       console.log(`[GuildWeave Admin] Approved Canonical Account: "${canonicalUserId}". Priority: "${targetTier}"`);
     } else if (cleanBrowserId) {
       const dev = await get('SELECT user_id FROM devices WHERE browser_id = ?', [cleanBrowserId]);
       if (dev) {
         await run('UPDATE users SET priority_tier = ? WHERE user_id = ?', [targetTier, dev.user_id]);
         await run('UPDATE devices SET approved = 1 WHERE browser_id = ?', [cleanBrowserId]);
+        await syncPrincipalLedgersOnAdminMutation(dev.user_id, req);
         console.log(`[GuildWeave Admin] Approved Browser: "${cleanBrowserId}" (User: "${dev.user_id}"). Priority: "${targetTier}"`);
       } else {
         await run('UPDATE users SET priority_tier = ? WHERE user_id = ?', [targetTier, cleanBrowserId]);
         await run('UPDATE devices SET approved = 1 WHERE user_id = ? OR browser_id = ?', [cleanBrowserId, cleanBrowserId]);
+        await syncPrincipalLedgersOnAdminMutation(cleanBrowserId, req);
         console.log(`[GuildWeave Admin] Updated tier for pruned unlinked user: "${cleanBrowserId}". Priority: "${targetTier}"`);
       }
     }
@@ -887,6 +939,8 @@ router.post('/link', async (req, res) => {
       await run('DELETE FROM users WHERE user_id = ?', [device.user_id]);
     }
 
+    await syncPrincipalLedgersOnAdminMutation(discord_id, req);
+
     console.log(`[GuildWeave Admin API] Linked Discord ID ${discord_id} to browser ${browser_id} (${priority_tier})`);
     res.json({ success: true });
   } catch (err) { res.status(500).json({ error: err.message }); }
@@ -936,6 +990,7 @@ router.post('/sync-tier', async (req, res) => {
     if (user && user.banned === 1) return res.status(403).json({ error: "This Discord account is blacklisted." });
 
     await run('UPDATE users SET priority_tier = ? WHERE user_id = ?', [priority_tier, discord_id]);
+    await syncPrincipalLedgersOnAdminMutation(discord_id, req);
     console.log(`[GuildWeave Admin API] Updated tier for canonical user ${discord_id} to ${priority_tier}`);
     res.json({ success: true });
   } catch (err) { res.status(500).json({ error: err.message }); }

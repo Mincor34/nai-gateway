@@ -105,10 +105,11 @@
  *    - Simulates `/queue/join` returning `403 ALLOWANCE_EXHAUSTED` and `429 V5_CAPACITY_DEPLETED`, plus
  *      `/proxy/image/*` returning `503 MASTER_SUBSCRIPTION_INACTIVE` and `503 MASTER_TOKEN_EXPIRED`;
  *      asserts exact status, `#gw-hud-alert` update, `approved` preservation, and telemetry refresh.
- * 7. Happy Path & Hell Path: Admin Governance Cycle Selector, Stored XSS Escaping, Dual-Ledger Controls, Unlinked `user_id` Actions, Post-Push Refresh, Operator Cycle Telemetry & Strict Prompt Validation:
+ * 7. Happy Path & Hell Path: Admin Governance Cycle Selector, Stored XSS Escaping, `PENDING`/`(Pending)` Approval Badges, Dual-Ledger Controls, Unlinked `user_id` Actions, Post-Push Refresh, Operator Cycle Telemetry & Strict Prompt Validation:
  *    - Verifies Admin panel renders `/admin/cycles` dropdown, filters `/admin/devices?cycle_epoch=...` and
  *      `/admin/global-stats?cycle_epoch=...`, escapes stored XSS payloads (`<img>`, `<svg>`) across usernames
- *      and device labels, renders `[TOKEN EXPIRED]` / `[INACTIVE]` subscription alerts, handles `sortReqs`,
+ *      and device labels, renders `PENDING` / `(Pending)` badges exclusively on unapproved non-banned accounts/devices,
+ *      renders `[TOKEN EXPIRED]` / `[INACTIVE]` subscription alerts, handles `sortReqs`,
  *      triggers immediate HUD + governance refresh on `Save Token`, omits Rolling Allowance & backticks in
  *      Operator Settings while displaying `This Billing Cycle` (`#operator-period-usage`), sends `{ user_id: ... }`
  *      for unlinked principals across approve/revoke/ban, verifies `<select>` setter syncs `<option>` selections,
@@ -2780,7 +2781,53 @@ test('Phase 8 Commit 10: Client UserScript Runtime, Dynamic Design Engine & Prod
         total_requests: 2,
         last_active_at: Date.now() - 1000,
         is_online: false,
-        devices: []
+        devices: [{
+          browser_id: 'b_pruned_orphan',
+          label: '<img src=x onerror=alert(9)>PendingDev',
+          approved: 0,
+          banned: 0,
+          total_requests: 2,
+          last_active_at: Date.now() - 1000,
+          is_online: false,
+          metered_allowance: null,
+          debug_intent: false,
+          debug_authorized: false,
+          debug_expires_in_ms: 0
+        }]
+      },
+      {
+        user_id: 'u_ban_ui',
+        discord_id: 'u_ban_ui',
+        discord_username: 'BannedUser',
+        priority_tier: 'Normal',
+        approved: 0,
+        banned: 1,
+        anlas_consumed: 0,
+        virtual_anlas_balance: 0,
+        available_anlas_balance: 0,
+        is_in_debt: false,
+        anlas_unlimited: false,
+        v5_banked_balance: 0,
+        v5_available_balance: 0,
+        subscription_period_anlas: 0,
+        subscription_period_v5: 0,
+        subscription_period_requests: 0,
+        total_requests: 0,
+        last_active_at: 0,
+        is_online: false,
+        devices: [{
+          browser_id: 'b_ban_ui',
+          label: 'BanDev',
+          approved: 0,
+          banned: 1,
+          total_requests: 0,
+          last_active_at: 0,
+          is_online: false,
+          metered_allowance: null,
+          debug_intent: false,
+          debug_authorized: false,
+          debug_expires_in_ms: 0
+        }]
       }
     ];
 
@@ -2811,6 +2858,14 @@ test('Phase 8 Commit 10: Client UserScript Runtime, Dynamic Design Engine & Prod
     assert.strictEqual(clientListEl.querySelectorAll('img').length, 0, 'XSS <img> node must never mount in DOM');
     assert.doesNotMatch(clientListEl.innerHTML, /<img\s/i, 'XSS <img> tag must be escaped');
     assert.match(clientListEl.innerHTML, /&lt;img src=x onerror=alert\(1\)&gt;/);
+
+    // Verify governance panel renders 3 client cards (approved, unapproved, banned) with correct PENDING/BANNED badges
+    const initialHeaders = clientListEl.querySelectorAll('.client-card-header');
+    assert.strictEqual(initialHeaders.length, 3);
+    assert.doesNotMatch(initialHeaders[0].innerHTML, /PENDING/, 'Approved account header must not display PENDING badge');
+    assert.match(initialHeaders[1].innerHTML, /PENDING/, 'Unapproved account header must display PENDING badge');
+    assert.doesNotMatch(initialHeaders[2].innerHTML, /PENDING/, 'Banned account header must not display PENDING badge');
+    assert.match(initialHeaders[2].innerHTML, /BANNED/, 'Banned account header must display BANNED badge');
 
     // First global-stats response verifies [TOKEN EXPIRED]
     const statsCall1 = networkCalls.find(c => c.url.includes('/admin/global-stats'));
@@ -2917,6 +2972,9 @@ test('Phase 8 Commit 10: Client UserScript Runtime, Dynamic Design Engine & Prod
     deviceCalls = networkCalls.filter(c => c.url.includes('/admin/devices'));
     deviceCalls[deviceCalls.length - 1].onload({ status: 200, responseText: JSON.stringify(mockDeviceGroups) });
     await new Promise(r => setTimeout(r, 20));
+
+    const expandedListHtml = context.document.getElementById('vps-client-list').innerHTML;
+    assert.match(expandedListHtml, /\(Pending\)/, 'Unapproved device row must display (Pending) badge');
 
     alertLog.length = 0;
     networkCalls.length = 0;

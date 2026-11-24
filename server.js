@@ -9,6 +9,8 @@
  * - Resilient warm-boot telemetry harvester with shared Promise deduplication
  * - ACS-1 dynamic timeUntilNextPercent normalization, weighted V5 dispatch projection,
  *   adaptive polling escalation (10m -> 2m -> 60s floor), and 5.5% circuit breaker
+ * - Cold-to-warm V5 personal reserve seeding (`seedApprovedUserV5Ledgers`) for pre-existing
+ *   approved principals so offline users do not lose multi-day rollover days post-deploy
  * - Authoritative master subscription billing-cycle tracking (active, tier, expiresAt,
  *   isGracePeriod, trainingStepsLeft) with SQLite config + `subscription_periods` persistence
  * - Explicit master_token_expired clearing of stale cached capacity on upstream 401
@@ -25,7 +27,12 @@ const crypto = require('crypto');
 const { loadConfig } = require('./config');
 const database = require('./database');
 const queueManager = require('./queueManager');
-const { isV5ModelFamily, isV5MediumModel, recordSubscriptionPeriod } = require('./auditEngine');
+const {
+  isV5ModelFamily,
+  isV5MediumModel,
+  recordSubscriptionPeriod,
+  evaluateV5Accrual
+} = require('./auditEngine');
 
 // Route Controllers (Level 4)
 const proxyRouter = require('./routes/proxyRouter');
@@ -754,6 +761,55 @@ async function flushPendingSurplusPersist() {
 }
 
 /**
+ * Seeds initial V5 personal reserve banks (`v5_last_accrual_epoch IS NULL`) for
+ * pre-existing approved, unbanned principals upon cold-to-warm Opus telemetry sync
+ * (boot or token refresh). Ensures migrated users receive Day 1 V5 capacity and
+ * accrue multi-day rollover banks while offline rather than losing days prior to login.
+ * Skips zero-weight tiers (e.g. Metered) unless stale positive balances require clamping.
+ *
+ * @returns {Promise<number>} Count of principals seeded.
+ */
+async function seedApprovedUserV5Ledgers() {
+  if (isShuttingDown || !master_subscription_active || master_token_expired || last_fetched_at === 0) {
+    return 0;
+  }
+
+  const config = getRuntimeConfig();
+  const approvedUsers = await database.all(
+    `SELECT u.user_id, u.priority_tier, u.v5_last_accrual_epoch, u.v5_banked_balance
+     FROM users u
+     WHERE u.banned = 0
+       AND u.v5_last_accrual_epoch IS NULL
+       AND EXISTS (SELECT 1 FROM devices d WHERE d.user_id = u.user_id AND d.approved = 1)`
+  );
+
+  const now = Date.now();
+  let seeded = 0;
+
+  for (const row of approvedUsers) {
+    if (isShuttingDown) break;
+    const tierConfig = config.TIER_CONFIGS[row.priority_tier] || config.TIER_CONFIGS['Normal'];
+    const hasWeight = Number.isInteger(tierConfig.v5Weight) && tierConfig.v5Weight > 0;
+    if (!hasWeight && (row.v5_banked_balance || 0) <= 0) {
+      continue;
+    }
+
+    const res = await evaluateV5Accrual(row.user_id, {
+      now,
+      nominalDailyCompute: nominal_daily_v5_compute
+    });
+    if (res && res.accrual_applied) {
+      seeded += 1;
+    }
+  }
+
+  if (seeded > 0) {
+    console.log(`[GuildWeave Boot] Seeded initial V5 reserve allotments for ${seeded} approved principal(s).`);
+  }
+  return seeded;
+}
+
+/**
  * Schedules the next adaptive telemetry heartbeat using projected capacity:
  * 10m (>30%) -> 2m (15%-30%) -> 60s floor (<=15%).
  * Also flushes any deferred SQLite Bucket 2 surplus or billing-cycle persistence writes.
@@ -791,6 +847,7 @@ function scheduleNextHeartbeat() {
  * Leverages shared Promise resolution to prevent cache stampedes.
  * Clears stale cached telemetry and flags `master_token_expired` immediately if upstream
  * rejects with HTTP 401 so expired credentials never report phantom capacity or admit V5 tasks.
+ * Triggers initial V5 reserve seeding when telemetry transitions from uninitialized to active.
  *
  * @param {object} [options={}] - Execution options.
  * @param {boolean} [options.rescheduleHeartbeat=true] - Whether to reschedule adaptive heartbeat on completion.
@@ -842,8 +899,12 @@ function syncTelemetry({ rescheduleHeartbeat = true } = {}) {
             try {
               if (res.statusCode === 200) {
                 const payload = JSON.parse(rawData);
+                const wasUninitialized = last_fetched_at === 0;
                 const snapshot = applyUsageTelemetry(payload, config, Date.now());
                 await cyclePersistChain.catch(() => false);
+                if (wasUninitialized && snapshot.subscriptionActive && !isShuttingDown) {
+                  await seedApprovedUserV5Ledgers();
+                }
                 console.log(
                   `[GuildWeave Harvester] Telemetry sync successful. Capacity: ${snapshot.rawProjected.toFixed(2)}% (clamped: ${snapshot.percent.toFixed(2)}%), C_base: ${snapshot.nominalDailyCompute.toFixed(2)}, Active: ${snapshot.subscriptionActive}, Grace: ${snapshot.isGracePeriod}, NextPoll: ${Math.round(snapshot.pollingIntervalMs / 1000)}s, Locked: ${snapshot.isHardLocked}`
                 );
@@ -1065,6 +1126,7 @@ module.exports = {
   },
   queueManager,
   syncTelemetry,
+  seedApprovedUserV5Ledgers,
   normalizeTelemetryPeriod,
   computeProjectedCapacity,
   getPollingIntervalMs,

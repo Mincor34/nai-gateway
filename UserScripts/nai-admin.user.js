@@ -4754,6 +4754,7 @@
             const statusDotColor = group.is_online ? `var(--theme-success, ${theme.success})` : `var(--theme-textSecondary, ${theme.textMuted})`;
             const statusTitle = group.is_online ? "Online" : "Offline";
             const bannedBadge = group.banned === 1 ? `<span style="background:var(--theme-error, ${theme.error}); color:#fff; font-size:9px; padding:1px 5px; border-radius:999px; font-weight:700; margin-left:4px;">BANNED</span>` : "";
+            const pendingBadge = group.banned !== 1 && group.approved !== 1 ? `<span style="background:var(--theme-warning, ${theme.warning}); color:#1f1404; font-size:9px; padding:1px 5px; border-radius:999px; font-weight:700; margin-left:4px;">PENDING</span>` : "";
             const debtBadge = group.is_in_debt ? `<span style="background:var(--theme-error, ${theme.error}); color:#fff; font-size:9px; padding:1px 5px; border-radius:999px; font-weight:700; margin-left:4px;">DEBT</span>` : "";
             let headerDebugBadge = "";
             if (group.has_debug_authorized) {
@@ -4769,6 +4770,7 @@
                                 <div style="width:7px; height:7px; border-radius:50%; background:${statusDotColor}; flex-shrink:0;" title="${statusTitle}"></div>
                                 <span style="font-weight:600; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; color:var(--theme-text, ${theme.text});">${safeName}</span>
                                 ${bannedBadge}
+                                ${pendingBadge}
                                 ${debtBadge}
                                 ${headerDebugBadge}
                             </div>
@@ -4789,6 +4791,7 @@
                 const safeDevLabel = escapeHtml(d.label || "Unnamed Browser");
                 const devOnlineColor = d.is_online ? `var(--theme-success, ${theme.success})` : `var(--theme-textSecondary, ${theme.textMuted})`;
                 const devBannedBadge = d.banned === 1 ? `<span style="color:var(--theme-error, ${theme.error}); font-weight:700; margin-left:4px;">(Banned)</span>` : "";
+                const devPendingBadge = d.banned !== 1 && d.approved !== 1 ? `<span style="color:var(--theme-warning, ${theme.warning}); font-weight:700; margin-left:4px;">(Pending)</span>` : "";
                 const allowanceBadge = d.metered_allowance !== null ? `<span style="color:var(--theme-warning, ${theme.warning}); font-weight:600; margin-left:6px;">[${escapeHtml(d.metered_allowance)}/100]</span>` : "";
                 let devDebugBadge = "";
                 let devDebugBtn = "";
@@ -4804,7 +4807,7 @@
                                 <div style="font-size:11px; color:var(--theme-textSecondary, ${theme.textMuted}); padding:6px 0; border-bottom:1px solid ${theme.border}; display:flex; justify-content:space-between; align-items:center; gap:8px;">
                                     <div style="display:flex; align-items:center; gap:6px; min-width:0; flex:1;">
                                         <div style="width:6px; height:6px; border-radius:50%; background:${devOnlineColor}; flex-shrink:0;"></div>
-                                        <span style="overflow:hidden; text-overflow:ellipsis; white-space:nowrap; color:var(--theme-text, ${theme.text});"><strong>${safeDevLabel}</strong> ${devBannedBadge}${allowanceBadge}${devDebugBadge} <span role="button" tabindex="0" class="gw-code-chip gw-copy-chip" data-copy-id="${safeBid}" title="Click to copy full browser ID (${safeBid})">${safeBidShort}...</span></span>
+                                        <span style="overflow:hidden; text-overflow:ellipsis; white-space:nowrap; color:var(--theme-text, ${theme.text});"><strong>${safeDevLabel}</strong> ${devBannedBadge}${devPendingBadge}${allowanceBadge}${devDebugBadge} <span role="button" tabindex="0" class="gw-code-chip gw-copy-chip" data-copy-id="${safeBid}" title="Click to copy full browser ID (${safeBid})">${safeBidShort}...</span></span>
                                     </div>
                                     <div style="display:flex; gap:4px; align-items:center;">
                                         ${devDebugBtn}
