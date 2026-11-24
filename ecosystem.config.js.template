@@ -16,10 +16,10 @@ module.exports = {
       // Harmonized Tier Settings: Use 'null' to denote unlimited parameters (mapped to Infinity on boot)
       TIER_CONFIGS: JSON.stringify({
         'Admin':   { "basePriority": 30, "preciseLimit": null, "maxBurst": null, "refillRate": 0,      "maxAllowance": null, "refillRateMs": 0,       "monthlyAnlas": null, "v5Weight": 4, "v5MaxBankDays": null, "v5SurplusEligible": true },
-        'High':    { "basePriority": 20, "preciseLimit": null, "maxBurst": null, "refillRate": 0,      "maxAllowance": null, "refillRateMs": 0,       "monthlyAnlas": 1000, "v5Weight": 3, "v5MaxBankDays": 5,    "v5SurplusEligible": true },
-        'Normal':  { "basePriority": 10, "preciseLimit": null, "maxBurst": 15,   "refillRate": 120000, "maxAllowance": null, "refillRateMs": 0,       "monthlyAnlas": 500,  "v5Weight": 2, "v5MaxBankDays": 4,    "v5SurplusEligible": true },
+        'High':    { "basePriority": 20, "preciseLimit": null, "maxBurst": null, "refillRate": 0,      "maxAllowance": null, "refillRateMs": 0,       "monthlyAnlas": 1000, "v5Weight": 3, "v5MaxBankDays": 3,    "v5SurplusEligible": true },
+        'Normal':  { "basePriority": 10, "preciseLimit": null, "maxBurst": 15,   "refillRate": 120000, "maxAllowance": null, "refillRateMs": 0,       "monthlyAnlas": 500,  "v5Weight": 2, "v5MaxBankDays": 3,    "v5SurplusEligible": true },
         'Low':     { "basePriority": 0,  "preciseLimit": null, "maxBurst": 10,   "refillRate": 120000, "maxAllowance": null, "refillRateMs": 0,       "monthlyAnlas": 250,  "v5Weight": 1, "v5MaxBankDays": 3,    "v5SurplusEligible": true },
-        'Metered': { "basePriority": 0,  "preciseLimit": null, "maxBurst": 5,    "refillRate": 120000, "maxAllowance": 300,  "refillRateMs": 1800000, "monthlyAnlas": 0,    "v5Weight": 0, "v5MaxBankDays": 0,    "v5SurplusEligible": false }
+        'Metered': { "basePriority": 0,  "preciseLimit": null, "maxBurst": 5,    "refillRate": 120000, "maxAllowance": 300,  "refillRateMs": 1800000, "monthlyAnlas": 0,    "v5Weight": 0, "v5MaxBankDays": 0,    "v5SurplusEligible": true }
       })
     }
   }]
