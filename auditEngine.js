@@ -5,9 +5,10 @@
  * - Imports Level 0 (database.js) and Level 1 (config.js).
  * - Blind to HTTP transport (Express), socket streams, and queue RAM states.
  * - Handles parameter parsing, security auditing, Anlas tracking, authoritative principal authentication,
- *   synchronous security ban commits, and ACS-1 dual-ledger balance derivation, debt lockouts,
- *   temporal accruals, serialized administrative balance/debt mutations, binary image dimension
- *   inspection for /ai/upscale, and cycle-segregated period usage recording.
+ *   userscript SemVer gatekeeping (426 non-punitive rejection), synchronous security ban commits,
+ *   and ACS-1 dual-ledger balance derivation, debt lockouts, temporal accruals, serialized administrative
+ *   balance/debt mutations, binary image dimension inspection for /ai/upscale, and cycle-segregated
+ *   period usage recording.
  * - Relational Normalization: Evaluates quotas, allowances, Anlas deductions, and bans strictly
  *   against the canonical user_id (Security Principal), eliminating multi-device quota inflation.
  * - ACS-1 Domain Engine: Authoritative NovelAI Anlas formula (Module 643656 parity), bounded
@@ -20,7 +21,7 @@
 'use strict';
 
 const { get, all, run } = require('./database');
-const { loadConfig } = require('./config');
+const { loadConfig, parseSemVer, compareSemVer } = require('./config');
 
 // NovelAI Pricing Formula Constants (Module 643656 / Module 875333 / anlas-calculation.md)
 const ANLAS_ALPHA = 2.951823174884865e-6;
@@ -196,6 +197,58 @@ function isV5ModelFamily(model) {
 function isV5MediumModel(model) {
   if (!isV5ModelFamily(model)) return false;
   return /medium/i.test(model.trim());
+}
+
+/**
+ * Validates the client's `X-Script-Version` header against `config.MINIMUM_USERSCRIPT_VERSION`.
+ * Rejects missing, non-string, malformed, or outdated client script versions with HTTP 426
+ * (`SCRIPT_UPDATE_REQUIRED`) strictly without banning or mutating database state.
+ *
+ * @param {*} rawVersionHeader - Inbound `x-script-version` header candidate.
+ * @returns {{ok: boolean, status?: number, error?: string, message?: string, version?: string, minVersion: string}}
+ */
+function verifyScriptVersion(rawVersionHeader) {
+  const config = getConfig();
+  const minVersion = config.MINIMUM_USERSCRIPT_VERSION;
+
+  if (typeof rawVersionHeader !== 'string' || rawVersionHeader.trim().length === 0) {
+    return {
+      ok: false,
+      status: 426,
+      error: 'SCRIPT_UPDATE_REQUIRED',
+      message: `Your GuildWeave Tampermonkey userscript is missing version metadata or outdated (minimum required: v${minVersion}). Please update to the latest version to proceed.`,
+      minVersion
+    };
+  }
+
+  const trimmed = rawVersionHeader.trim();
+  const parsed = parseSemVer(trimmed);
+  if (!parsed) {
+    return {
+      ok: false,
+      status: 426,
+      error: 'SCRIPT_UPDATE_REQUIRED',
+      message: `Unrecognized GuildWeave Tampermonkey userscript version. Minimum required version is v${minVersion}. Please update to the latest version to proceed.`,
+      minVersion
+    };
+  }
+
+  if (compareSemVer(parsed, minVersion) < 0) {
+    return {
+      ok: false,
+      status: 426,
+      error: 'SCRIPT_UPDATE_REQUIRED',
+      message: `Your GuildWeave Tampermonkey userscript (v${trimmed}) is outdated (minimum required: v${minVersion}). Please update to the latest version to proceed.`,
+      version: trimmed,
+      minVersion
+    };
+  }
+
+  return {
+    ok: true,
+    version: trimmed,
+    minVersion
+  };
 }
 
 /**
@@ -2763,6 +2816,7 @@ async function getNextRefillTime(id, tier) {
 
 module.exports = {
   verifyDevice,
+  verifyScriptVersion,
   commitSecurityBan,
   isV5ModelFamily,
   isV5MediumModel,

@@ -4,7 +4,7 @@
  *
  * DESIGN PRINCIPLES:
  * 1. Pure functional configuration isolation without runtime execution side-effects.
- * 2. Strict parametric schema validation for priority tiers, firewall thresholds, and timing parameters.
+ * 2. Strict parametric schema validation for priority tiers, firewall thresholds, SemVer minimums, and timing parameters.
  * 3. Normalizes external JSON 'null' limits to internal JavaScript 'Infinity' thresholds.
  * 4. Merges custom tier definitions defensively over DEFAULT_TIER_CONFIGS to prevent missing-tier crashes.
  * 5. Deterministic error propagation: throws structured exceptions on schema violations.
@@ -39,13 +39,17 @@ const PROXY_PATH_WHITELIST = Object.freeze(new Set([
 
 const SUBDOMAIN_WHITELIST = Object.freeze(['api', 'image', 'text']);
 
+const SEMVER_REGEX = /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-([0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*))?(?:\+([0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*))?$/;
+const NUMERIC_PRERELEASE_ID_REGEX = /^(0|[1-9]\d*)$/;
+
 // Static operational defaults
 const OPERATIONAL_DEFAULTS = Object.freeze({
   PORT: 3000,
   DATABASE_PATH: 'staging_data.db',
   NODE_ENV: 'development',
   MAX_CONCURRENT_TEXT_GENS: 3,
-  
+  MINIMUM_USERSCRIPT_VERSION: '6.0.0',
+
   // Upstream Destination Boundary
   UPSTREAM_BASE_URL_TEMPLATE: 'https://{subdomain}.novelai.net',
 
@@ -83,6 +87,98 @@ const OPERATIONAL_DEFAULTS = Object.freeze({
   UPLOAD_INACTIVITY_TIMEOUT_MS: 5000,
   UPLOAD_DURATION_CEILING_MS: 60000
 });
+
+/**
+ * Strictly parses a SemVer 2.0.0 string (`MAJOR.MINOR.PATCH[-PRERELEASE][+BUILD]`).
+ * Rejects leading `v` prefixes, incomplete tuples (e.g. `6.0`), leading zeros on
+ * numeric components or prerelease identifiers, non-string values, and unsafe integers.
+ *
+ * @param {*} raw - Version string candidate.
+ * @returns {{major: number, minor: number, patch: number, prerelease: Array<string|number>, raw: string}|null} Parsed SemVer record or null.
+ */
+function parseSemVer(raw) {
+  if (typeof raw !== 'string') return null;
+  const trimmed = raw.trim();
+  const match = SEMVER_REGEX.exec(trimmed);
+  if (!match) return null;
+
+  const major = Number(match[1]);
+  const minor = Number(match[2]);
+  const patch = Number(match[3]);
+  if (!Number.isSafeInteger(major) || !Number.isSafeInteger(minor) || !Number.isSafeInteger(patch)) {
+    return null;
+  }
+
+  const prerelease = [];
+  if (match[4]) {
+    const parts = match[4].split('.');
+    for (const part of parts) {
+      if (/^\d+$/.test(part)) {
+        if (!NUMERIC_PRERELEASE_ID_REGEX.test(part)) {
+          return null;
+        }
+        const num = Number(part);
+        if (!Number.isSafeInteger(num)) return null;
+        prerelease.push(num);
+      } else {
+        prerelease.push(part);
+      }
+    }
+  }
+
+  return { major, minor, patch, prerelease, raw: trimmed };
+}
+
+/**
+ * Compares two SemVer 2.0.0 strings or parsed objects according to SemVer §11 precedence.
+ * Build metadata (`+...`) is ignored during precedence comparison.
+ *
+ * @param {string|object} a - Left SemVer version.
+ * @param {string|object} b - Right SemVer version.
+ * @returns {number} `-1` if a < b, `0` if a == b, `1` if a > b.
+ * @throws {Error} If either operand fails SemVer 2.0.0 validation.
+ */
+function compareSemVer(a, b) {
+  const pa = typeof a === 'string'
+    ? parseSemVer(a)
+    : (a && typeof a === 'object' && Number.isSafeInteger(a.major) && Number.isSafeInteger(a.minor) && Number.isSafeInteger(a.patch) && Array.isArray(a.prerelease) ? a : null);
+  const pb = typeof b === 'string'
+    ? parseSemVer(b)
+    : (b && typeof b === 'object' && Number.isSafeInteger(b.major) && Number.isSafeInteger(b.minor) && Number.isSafeInteger(b.patch) && Array.isArray(b.prerelease) ? b : null);
+
+  if (!pa || !pb) {
+    throw new Error('[Config Error] Invalid SemVer version supplied to compareSemVer.');
+  }
+
+  if (pa.major !== pb.major) return pa.major < pb.major ? -1 : 1;
+  if (pa.minor !== pb.minor) return pa.minor < pb.minor ? -1 : 1;
+  if (pa.patch !== pb.patch) return pa.patch < pb.patch ? -1 : 1;
+
+  const aHasPre = pa.prerelease.length > 0;
+  const bHasPre = pb.prerelease.length > 0;
+  if (!aHasPre && !bHasPre) return 0;
+  if (!aHasPre && bHasPre) return 1;
+  if (aHasPre && !bHasPre) return -1;
+
+  const maxLen = Math.max(pa.prerelease.length, pb.prerelease.length);
+  for (let i = 0; i < maxLen; i++) {
+    if (i >= pa.prerelease.length) return -1;
+    if (i >= pb.prerelease.length) return 1;
+
+    const idA = pa.prerelease[i];
+    const idB = pb.prerelease[i];
+    if (idA === idB) continue;
+
+    const aIsNum = typeof idA === 'number';
+    const bIsNum = typeof idB === 'number';
+    if (aIsNum && bIsNum) return idA < idB ? -1 : 1;
+    if (aIsNum && !bIsNum) return -1;
+    if (!aIsNum && bIsNum) return 1;
+    return idA < idB ? -1 : 1;
+  }
+
+  return 0;
+}
 
 /**
  * Validates and parses raw TIER_CONFIGS JSON strings into normalized runtime objects.
@@ -283,6 +379,18 @@ function loadConfig(env = process.env) {
     maxPayloadSizeBytes = parsedLimit;
   }
 
+  let minimumUserscriptVersion = OPERATIONAL_DEFAULTS.MINIMUM_USERSCRIPT_VERSION;
+  if (env.MINIMUM_USERSCRIPT_VERSION !== undefined) {
+    if (typeof env.MINIMUM_USERSCRIPT_VERSION !== 'string') {
+      throw new Error('Fatal schema violation in MINIMUM_USERSCRIPT_VERSION: Value must be a SemVer string (e.g. "6.0.0").');
+    }
+    const rawMinVer = env.MINIMUM_USERSCRIPT_VERSION.trim();
+    if (!parseSemVer(rawMinVer)) {
+      throw new Error(`Fatal schema violation in MINIMUM_USERSCRIPT_VERSION: "${env.MINIMUM_USERSCRIPT_VERSION}" must be a valid SemVer 2.0.0 string (e.g. "6.0.0").`);
+    }
+    minimumUserscriptVersion = rawMinVer;
+  }
+
   // Operational Parameter Overrides with Strict Regex Validation
   let nominalDailyV5Compute = OPERATIONAL_DEFAULTS.NOMINAL_DAILY_V5_COMPUTE;
   if (env.NOMINAL_DAILY_V5_COMPUTE !== undefined) {
@@ -350,6 +458,7 @@ function loadConfig(env = process.env) {
     ADMIN_SECRET_KEY: adminSecretKey.trim(),
     DATABASE_PATH: databasePath,
     NODE_ENV: nodeEnv,
+    MINIMUM_USERSCRIPT_VERSION: minimumUserscriptVersion,
     UPSTREAM_BASE_URL_TEMPLATE: upstreamTemplate,
     MAX_PAYLOAD_SIZE_BYTES: maxPayloadSizeBytes,
     TIER_CONFIGS: tierConfigs,
@@ -384,6 +493,8 @@ function loadConfig(env = process.env) {
 module.exports = {
   loadConfig,
   parseTierConfigs,
+  parseSemVer,
+  compareSemVer,
   DEFAULT_TIER_CONFIGS,
   MANDATORY_BASE_TIERS,
   PROXY_PATH_WHITELIST,

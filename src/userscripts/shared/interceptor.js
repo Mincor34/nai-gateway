@@ -24,7 +24,7 @@
  *    telemetry refreshes on Anlas-consuming `/ai/encode-vibe`, `/ai/upscale`, and image generations.
  * 7. WAF Request Smuggling Shield: Deletes `Content-Length`, `Content-Type` (for FormData), and `Host`.
  * 8. Dual-Timing Stream Coordination & Strict Lock Teardown: Resolves on `onloadstart` for HTTP 200
- *    streams, propagates structured server error messages (`400`, `403`, `429`, `503`), surfaces HUD
+ *    streams, propagates structured server error messages (`400`, `403`, `426`, `429`, `503`), surfaces HUD
  *    alerts + refreshes telemetry on proxy rejections, and triggers `/queue/complete` on client aborts.
  */
 
@@ -161,8 +161,8 @@ async function tryResolveProxyResponse(responseDetails, resolveObj, isImageGen, 
             setClientPolicyState({ isInDebt: true, bypassEnabled: false });
             refreshDualLedgerHud();
             setHudAlert(parsedError.message || 'Anlas overdrawn. Paid features paused until balance is restored.', 'error');
-        } else if (parsedError && (parsedError.message || parsedError.error) && (status === 400 || status === 403 || status === 429 || status === 503)) {
-            setHudAlert(parsedError.message || parsedError.error, (status === 403 || status === 503) ? 'error' : 'warning');
+        } else if (parsedError && (parsedError.message || parsedError.error) && (status === 400 || status === 403 || status === 426 || status === 429 || status === 503)) {
+            setHudAlert(parsedError.message || parsedError.error, (status === 403 || status === 426 || status === 503) ? 'error' : 'warning');
         }
 
         if (typeof envConfig.onTelemetryRefresh === 'function' && (status === 403 || status === 429 || status === 503)) {
@@ -175,11 +175,11 @@ async function tryResolveProxyResponse(responseDetails, resolveObj, isImageGen, 
             ? JSON.stringify({
                 statusCode: parsedError.statusCode || status,
                 error: parsedError.error,
-                message: parsedError.message || parsedError.error || errorText || "GuildWeave processing error"
+                message: parsedError.message || parsedError.error || errorText || "GuildWeave error"
               })
             : JSON.stringify({
                 statusCode: status,
-                message: errorText || "GuildWeave processing error"
+                message: errorText || "GuildWeave error"
               });
 
         resolveObj(new Response(responseBody, {
@@ -258,9 +258,9 @@ async function dispatchThroughChannelA({
                 }, 0);
             }
 
-            if (joinRes.status === 400 || joinRes.status === 403 || joinRes.status === 429 || joinRes.status === 503) {
+            if (joinRes.status === 400 || joinRes.status === 403 || joinRes.status === 426 || joinRes.status === 429 || joinRes.status === 503) {
                 const msg = errorDetails.message || errorDetails.error || "Queue admission rejected.";
-                setHudAlert(msg, joinRes.status === 403 || joinRes.status === 503 ? 'error' : 'warning');
+                setHudAlert(msg, (joinRes.status === 403 || joinRes.status === 426 || joinRes.status === 503) ? 'error' : 'warning');
                 return new Response(JSON.stringify({
                     statusCode: joinRes.status,
                     error: errorDetails.error,
@@ -310,7 +310,7 @@ async function dispatchThroughChannelA({
                 },
                 data: JSON.stringify({ req_id, browser_id: envConfig.browserId })
             });
-            return new Response(JSON.stringify({ statusCode: 502, message: "Queue processing aborted" }), { status: 502 });
+            return new Response(JSON.stringify({ statusCode: 502, message: "Queue teardown aborted" }), { status: 502 });
         }
     }
 

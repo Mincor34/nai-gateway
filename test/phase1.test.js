@@ -231,9 +231,13 @@ async function waitForServerToBootstrap(url, timeoutMs = 5000) {
 }
 
 async function queryGateway(endpoint, method = 'GET', headers = {}, body = null) {
+  const defaultHeaders = { 'Content-Type': 'application/json' };
+  if (!endpoint.startsWith('/admin')) {
+    defaultHeaders['X-Script-Version'] = '6.0.0';
+  }
   const response = await fetch(`http://127.0.0.1:${GATEWAY_PORT}${endpoint}`, {
     method,
-    headers: { 'Content-Type': 'application/json', ...headers },
+    headers: { ...defaultHeaders, ...headers },
     body: body ? (typeof body === 'string' ? body : JSON.stringify(body)) : null
   });
   const contentType = response.headers.get('content-type') || '';
@@ -323,6 +327,7 @@ test("NovelAI Gateway Phase 1 Comprehensive Security & Resilience Gate", async (
       headers: {
         'X-Browser-ID': 'client_evict_a',
         'X-Request-ID': 'req_evict_a',
+        'X-Script-Version': '6.0.0',
         'X-Gen-Width': '1024',
         'X-Gen-Height': '1024',
         'X-Gen-Steps': '28',
@@ -371,7 +376,8 @@ test("NovelAI Gateway Phase 1 Comprehensive Security & Resilience Gate", async (
         headers: {
           'Content-Type': 'application/json',
           'Authorization': 'Bearer secret_txt',
-          'X-Browser-ID': 'client_txt'
+          'X-Browser-ID': 'client_txt',
+          'X-Script-Version': '6.0.0'
         },
         body: JSON.stringify({ prompt: "Once upon a time", model: "kayra-v1" })
       });
@@ -554,6 +560,7 @@ test("NovelAI Gateway Phase 1 Comprehensive Security & Resilience Gate", async (
         'Authorization': 'Bearer secret_stream',
         'X-Browser-ID': 'client_stream',
         'X-Request-ID': 'req_stream_test',
+        'X-Script-Version': '6.0.0',
         'X-Gen-Width': '1024',
         'X-Gen-Height': '1024',
         'X-Gen-Steps': '28',
@@ -694,7 +701,8 @@ test("NovelAI Gateway Phase 1 Comprehensive Security & Resilience Gate", async (
       headers: {
         'Content-Type': 'application/json',
         'Authorization': 'Bearer secret_char_sse',
-        'X-Browser-ID': 'client_char_sse'
+        'X-Browser-ID': 'client_char_sse',
+        'X-Script-Version': '6.0.0'
       },
       body: JSON.stringify({ prompt: "Alice", model: "kayra-v1" })
     });

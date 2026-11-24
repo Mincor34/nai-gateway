@@ -3472,8 +3472,8 @@
         setClientPolicyState({ isInDebt: true, bypassEnabled: false });
         refreshDualLedgerHud();
         setHudAlert(parsedError.message || "Anlas overdrawn. Paid features paused until balance is restored.", "error");
-      } else if (parsedError && (parsedError.message || parsedError.error) && (status === 400 || status === 403 || status === 429 || status === 503)) {
-        setHudAlert(parsedError.message || parsedError.error, status === 403 || status === 503 ? "error" : "warning");
+      } else if (parsedError && (parsedError.message || parsedError.error) && (status === 400 || status === 403 || status === 426 || status === 429 || status === 503)) {
+        setHudAlert(parsedError.message || parsedError.error, status === 403 || status === 426 || status === 503 ? "error" : "warning");
       }
       if (typeof envConfig.onTelemetryRefresh === "function" && (status === 403 || status === 429 || status === 503)) {
         setTimeout(() => {
@@ -3486,10 +3486,10 @@
       const responseBody = parsedError && (parsedError.statusCode || parsedError.message || parsedError.error) ? JSON.stringify({
         statusCode: parsedError.statusCode || status,
         error: parsedError.error,
-        message: parsedError.message || parsedError.error || errorText || "GuildWeave processing error"
+        message: parsedError.message || parsedError.error || errorText || "GuildWeave error"
       }) : JSON.stringify({
         statusCode: status,
-        message: errorText || "GuildWeave processing error"
+        message: errorText || "GuildWeave error"
       });
       resolveObj(new Response(responseBody, {
         status,
@@ -3555,9 +3555,9 @@
             }
           }, 0);
         }
-        if (joinRes.status === 400 || joinRes.status === 403 || joinRes.status === 429 || joinRes.status === 503) {
+        if (joinRes.status === 400 || joinRes.status === 403 || joinRes.status === 426 || joinRes.status === 429 || joinRes.status === 503) {
           const msg = errorDetails.message || errorDetails.error || "Queue admission rejected.";
-          setHudAlert(msg, joinRes.status === 403 || joinRes.status === 503 ? "error" : "warning");
+          setHudAlert(msg, joinRes.status === 403 || joinRes.status === 426 || joinRes.status === 503 ? "error" : "warning");
           return new Response(JSON.stringify({
             statusCode: joinRes.status,
             error: errorDetails.error,
@@ -3604,7 +3604,7 @@
           },
           data: JSON.stringify({ req_id, browser_id: envConfig.browserId })
         });
-        return new Response(JSON.stringify({ statusCode: 502, message: "Queue processing aborted" }), { status: 502 });
+        return new Response(JSON.stringify({ statusCode: 502, message: "Queue teardown aborted" }), { status: 502 });
       }
     }
     const originalUrlObj = new URL(url);
@@ -4008,6 +4008,17 @@
   var selectedCycleEpoch = "";
   var activeSubTab = "governance";
   var expandedKeys = /* @__PURE__ */ new Set();
+  function parseVersionUpgradeMessage(responseText) {
+    let msg = "Your GuildWeave Admin userscript is outdated. Please update to the latest version to proceed.";
+    try {
+      const parsed = JSON.parse(responseText || "{}");
+      if (parsed && typeof parsed.message === "string" && parsed.message.trim().length > 0) {
+        msg = parsed.message;
+      }
+    } catch (_) {
+    }
+    return msg;
+  }
   function parseStrictPromptInt(rawInput) {
     if (typeof rawInput !== "string") return null;
     const trimmed = rawInput.trim();
@@ -4153,6 +4164,9 @@
           registerBtn.disabled = true;
           step3Container.style.display = "block";
           showStep3();
+        } else if (res.status === 426) {
+          step2Status.style.color = `var(--theme-error, ${theme.error})`;
+          step2Status.textContent = parseVersionUpgradeMessage(res.responseText);
         } else {
           throw new Error("Registration failed");
         }
@@ -4196,6 +4210,9 @@
             GM_setValue("admin_token", passkey);
             GM_setValue("approved", true);
             setTimeout(() => window.location.reload(), 1500);
+          } else if (res.status === 426) {
+            adminStatus.style.color = `var(--theme-error, ${theme.error})`;
+            adminStatus.textContent = parseVersionUpgradeMessage(res.responseText);
           } else {
             throw new Error("Invalid key");
           }
@@ -4454,6 +4471,8 @@
               }).join("");
               attachCopyChipHandlers(devicesEl);
             }
+          } else if (res.status === 426) {
+            setHudAlert(parseVersionUpgradeMessage(res.responseText), "error");
           }
         }).catch(() => {
         });
@@ -4486,6 +4505,9 @@
             nickStatus.style.color = `var(--theme-success, ${theme.success})`;
             nickStatus.textContent = "Saved.";
             GM_setValue("device_nickname", newNickname);
+          } else if (res.status === 426) {
+            nickStatus.style.color = `var(--theme-error, ${theme.error})`;
+            nickStatus.textContent = parseVersionUpgradeMessage(res.responseText);
           } else {
             throw new Error("Update failed");
           }
@@ -4522,6 +4544,8 @@
           const data = JSON.parse(res.responseText);
           updateAllowanceBar(null, Infinity, 0);
           updateDualLedgerHud(data);
+        } else if (res.status === 426) {
+          setHudAlert(parseVersionUpgradeMessage(res.responseText), "error");
         }
       } catch (e) {
         console.error("GuildWeave (Admin): Failed to poll operator telemetry", e);
@@ -4600,6 +4624,8 @@
               alert("Master Token saved securely.");
               pollAdminTelemetryState();
               renderGovernanceTab(contentHost, parentContainer, onClose);
+            } else if (res.status === 426) {
+              alert(parseVersionUpgradeMessage(res.responseText));
             } else {
               alert("Token registration denied.");
             }
@@ -4865,6 +4891,7 @@
                 data: JSON.stringify(payload)
               });
               if (actionRes.status === 200) renderGovernanceTab(contentHost, parentContainer, onClose);
+              else if (actionRes.status === 426) alert(parseVersionUpgradeMessage(actionRes.responseText));
               else alert("Failed to adjust Anlas balance.");
             };
           });
@@ -4885,6 +4912,7 @@
                 data: JSON.stringify(payload)
               });
               if (actionRes.status === 200) renderGovernanceTab(contentHost, parentContainer, onClose);
+              else if (actionRes.status === 426) alert(parseVersionUpgradeMessage(actionRes.responseText));
               else alert("Failed to adjust V5 credits.");
             };
           });
@@ -4902,6 +4930,7 @@
                 data: JSON.stringify(payload)
               });
               if (actionRes.status === 200) renderGovernanceTab(contentHost, parentContainer, onClose);
+              else if (actionRes.status === 426) alert(parseVersionUpgradeMessage(actionRes.responseText));
               else alert("Failed to reconcile Anlas debt.");
             };
           });
@@ -4997,6 +5026,16 @@
               if (actionRes.status === 200) renderGovernanceTab(contentHost, parentContainer, onClose);
             };
           });
+        } else if (res.status === 426) {
+          const msg = parseVersionUpgradeMessage(res.responseText);
+          setHudAlert(msg, "error");
+          const container = contentHost.querySelector("#vps-client-list");
+          if (container) {
+            container.innerHTML = `<div style="color:var(--theme-error, ${theme.error}); font-weight:600;">${escapeHtml(msg)}</div>`;
+          }
+        } else {
+          const container = contentHost.querySelector("#vps-client-list");
+          if (container) container.textContent = `Error retrieving system data records (HTTP ${res.status}).`;
         }
       } catch (e) {
         const container = contentHost.querySelector("#vps-client-list");

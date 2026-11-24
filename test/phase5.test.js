@@ -94,9 +94,13 @@ const mockUpstream = http.createServer((req, res) => {
 });
 
 async function queryGateway(endpoint, method = 'GET', headers = {}, body = null) {
+  const defaultHeaders = { 'Content-Type': 'application/json' };
+  if (!endpoint.startsWith('/admin')) {
+    defaultHeaders['X-Script-Version'] = '6.0.0';
+  }
   const response = await fetch(`http://127.0.0.1:${TEST_PORT}${endpoint}`, {
     method,
-    headers: { 'Content-Type': 'application/json', ...headers },
+    headers: { ...defaultHeaders, ...headers },
     body: body ? (typeof body === 'string' ? body : JSON.stringify(body)) : null
   });
   const contentType = response.headers.get('content-type') || '';
@@ -237,6 +241,7 @@ test("Phase 5: Stream Safety Invariants & Complete Gateway Integration", async (
         'Authorization': 'Bearer proxy_secret',
         'X-Browser-Id': 'proxy_client',
         'X-Request-Id': 'req_stream_test',
+        'X-Script-Version': '6.0.0',
         'X-Gen-Model': 'legacy',
         'Content-Type': 'application/json',
         'Transfer-Encoding': 'chunked'
@@ -286,6 +291,7 @@ test("Phase 5: Stream Safety Invariants & Complete Gateway Integration", async (
         'Authorization': 'Bearer proxy_secret',
         'X-Browser-Id': 'proxy_client',
         'X-Request-Id': 'req_413_test',
+        'X-Script-Version': '6.0.0',
         'X-Gen-Model': 'legacy',
         'Content-Type': 'application/json'
       }
@@ -329,6 +335,7 @@ test("Phase 5: Stream Safety Invariants & Complete Gateway Integration", async (
         'Authorization': 'Bearer proxy_secret',
         'X-Browser-Id': 'proxy_client',
         'X-Request-Id': 'req_mid_sever',
+        'X-Script-Version': '6.0.0',
         'X-Gen-Model': 'legacy',
         'Content-Type': 'application/json'
       }
@@ -385,6 +392,7 @@ test("Phase 5: Stream Safety Invariants & Complete Gateway Integration", async (
         'Authorization': 'Bearer proxy_secret',
         'X-Browser-Id': 'proxy_client',
         'X-Request-Id': 'req_inbound_err',
+        'X-Script-Version': '6.0.0',
         'X-Gen-Model': 'legacy',
         'Content-Type': 'application/json'
       }
@@ -585,6 +593,7 @@ test("Phase 5: Stream Safety Invariants & Complete Gateway Integration", async (
           'Authorization': 'Bearer sec_bilateral',
           'X-Browser-Id': 'bilateral_guest',
           'X-Request-Id': 'req_bilateral_pass_multipart',
+          'X-Script-Version': '6.0.0',
           'X-Gen-Model': 'legacy',
           'X-Debug-Mode': 'true',
           'Content-Type': `multipart/form-data; boundary=${boundary}`

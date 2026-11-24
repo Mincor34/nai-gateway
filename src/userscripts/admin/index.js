@@ -6,9 +6,9 @@
  * Intercepts outbound generation/upscale requests, executes secure token swaps, exposes
  * billing-cycle-segregated telemetry (`GET /admin/cycles`, `?cycle_epoch=` filtering),
  * Anlas/V5 balances, expired/offline token states, immediate post-push telemetry refresh,
- * clickable linked-browser ID copy chips, balance adjustments (`POST /admin/adjust-balance`),
- * debt forgiveness (`POST /admin/reconcile-debt`), escapes all untrusted identifiers against
- * stored XSS, and coordinates bilateral debug gates.
+ * 426 version-mismatch surfacing, clickable linked-browser ID copy chips, balance adjustments
+ * (`POST /admin/adjust-balance`), debt forgiveness (`POST /admin/reconcile-debt`), escapes all
+ * untrusted identifiers against stored XSS, and coordinates bilateral debug gates.
  */
 
 'use strict';
@@ -22,6 +22,7 @@ import {
   updateDualLedgerHud,
   refreshDualLedgerHud,
   setClientPolicyState,
+  setHudAlert,
   initDOMObserver,
   ensureGuildWeaveStyles,
   escapeHtml,
@@ -38,6 +39,23 @@ let currentSort = GM_getValue("admin_sort_mode", "anlas");
 let selectedCycleEpoch = ""; // "" -> active billing cycle, "all" -> lifetime, or numeric epoch string
 let activeSubTab = "governance"; // "governance" | "settings"
 const expandedKeys = new Set();
+
+/**
+ * Extracts a human-readable message from an HTTP 426 SCRIPT_UPDATE_REQUIRED payload.
+ *
+ * @param {string} responseText - Raw JSON response text.
+ * @returns {string} Extracted update prompt message.
+ */
+function parseVersionUpgradeMessage(responseText) {
+    let msg = "Your GuildWeave Admin userscript is outdated. Please update to the latest version to proceed.";
+    try {
+        const parsed = JSON.parse(responseText || '{}');
+        if (parsed && typeof parsed.message === 'string' && parsed.message.trim().length > 0) {
+            msg = parsed.message;
+        }
+    } catch (_) {}
+    return msg;
+}
 
 /**
  * Strictly parses a signed safe integer from admin prompt text.
@@ -213,6 +231,9 @@ function renderSetupWizard(container) {
                 registerBtn.disabled = true;
                 step3Container.style.display = "block";
                 showStep3();
+            } else if (res.status === 426) {
+                step2Status.style.color = `var(--theme-error, ${theme.error})`;
+                step2Status.textContent = parseVersionUpgradeMessage(res.responseText);
             } else {
                 throw new Error("Registration failed");
             }
@@ -260,6 +281,9 @@ function renderSetupWizard(container) {
                     GM_setValue("admin_token", passkey);
                     GM_setValue("approved", true);
                     setTimeout(() => window.location.reload(), 1500);
+                } else if (res.status === 426) {
+                    adminStatus.style.color = `var(--theme-error, ${theme.error})`;
+                    adminStatus.textContent = parseVersionUpgradeMessage(res.responseText);
                 } else {
                     throw new Error("Invalid key");
                 }
@@ -311,6 +335,8 @@ if (!approved || !VPS_HOST || !deviceSecret) {
                 const data = JSON.parse(res.responseText);
                 updateAllowanceBar(null, Infinity, 0);
                 updateDualLedgerHud(data);
+            } else if (res.status === 426) {
+                setHudAlert(parseVersionUpgradeMessage(res.responseText), 'error');
             }
         } catch (e) {
             console.error("GuildWeave (Admin): Failed to poll operator telemetry", e);
@@ -496,6 +522,8 @@ if (!approved || !VPS_HOST || !deviceSecret) {
                         alert("Master Token saved securely.");
                         pollAdminTelemetryState();
                         renderGovernanceTab(contentHost, parentContainer, onClose);
+                    } else if (res.status === 426) {
+                        alert(parseVersionUpgradeMessage(res.responseText));
                     } else {
                         alert("Token registration denied.");
                     }
@@ -800,6 +828,7 @@ if (!approved || !VPS_HOST || !deviceSecret) {
                             data: JSON.stringify(payload)
                         });
                         if (actionRes.status === 200) renderGovernanceTab(contentHost, parentContainer, onClose);
+                        else if (actionRes.status === 426) alert(parseVersionUpgradeMessage(actionRes.responseText));
                         else alert("Failed to adjust Anlas balance.");
                     };
                 });
@@ -821,6 +850,7 @@ if (!approved || !VPS_HOST || !deviceSecret) {
                             data: JSON.stringify(payload)
                         });
                         if (actionRes.status === 200) renderGovernanceTab(contentHost, parentContainer, onClose);
+                        else if (actionRes.status === 426) alert(parseVersionUpgradeMessage(actionRes.responseText));
                         else alert("Failed to adjust V5 credits.");
                     };
                 });
@@ -839,6 +869,7 @@ if (!approved || !VPS_HOST || !deviceSecret) {
                             data: JSON.stringify(payload)
                         });
                         if (actionRes.status === 200) renderGovernanceTab(contentHost, parentContainer, onClose);
+                        else if (actionRes.status === 426) alert(parseVersionUpgradeMessage(actionRes.responseText));
                         else alert("Failed to reconcile Anlas debt.");
                     };
                 });
@@ -945,6 +976,16 @@ if (!approved || !VPS_HOST || !deviceSecret) {
                         if (actionRes.status === 200) renderGovernanceTab(contentHost, parentContainer, onClose);
                     };
                 });
+            } else if (res.status === 426) {
+                const msg = parseVersionUpgradeMessage(res.responseText);
+                setHudAlert(msg, 'error');
+                const container = contentHost.querySelector("#vps-client-list");
+                if (container) {
+                    container.innerHTML = `<div style="color:var(--theme-error, ${theme.error}); font-weight:600;">${escapeHtml(msg)}</div>`;
+                }
+            } else {
+                const container = contentHost.querySelector("#vps-client-list");
+                if (container) container.textContent = `Error retrieving system data records (HTTP ${res.status}).`;
             }
         } catch (e) {
             const container = contentHost.querySelector("#vps-client-list");
@@ -1106,6 +1147,8 @@ if (!approved || !VPS_HOST || !deviceSecret) {
                             .join('');
                         attachCopyChipHandlers(devicesEl);
                     }
+                } else if (res.status === 426) {
+                    setHudAlert(parseVersionUpgradeMessage(res.responseText), 'error');
                 }
             }).catch(() => {});
         }
@@ -1140,6 +1183,9 @@ if (!approved || !VPS_HOST || !deviceSecret) {
                     nickStatus.style.color = `var(--theme-success, ${theme.success})`;
                     nickStatus.textContent = "Saved.";
                     GM_setValue("device_nickname", newNickname);
+                } else if (res.status === 426) {
+                    nickStatus.style.color = `var(--theme-error, ${theme.error})`;
+                    nickStatus.textContent = parseVersionUpgradeMessage(res.responseText);
                 } else {
                     throw new Error("Update failed");
                 }

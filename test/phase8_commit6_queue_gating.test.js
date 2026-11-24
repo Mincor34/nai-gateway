@@ -110,9 +110,13 @@ const mockUpstream = http.createServer((req, res) => {
 });
 
 async function queryGateway(endpoint, method = 'GET', headers = {}, body = undefined) {
+  const defaultHeaders = { 'Content-Type': 'application/json' };
+  if (!endpoint.startsWith('/admin')) {
+    defaultHeaders['X-Script-Version'] = '6.0.0';
+  }
   const fetchOptions = {
     method,
-    headers: { 'Content-Type': 'application/json', ...headers }
+    headers: { ...defaultHeaders, ...headers }
   };
   if (body !== undefined) {
     fetchOptions.body = typeof body === 'string' ? body : JSON.stringify(body);

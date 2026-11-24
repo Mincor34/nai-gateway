@@ -2,6 +2,9 @@
  * LEVEL 4: STREAM-SAFE PROXY ROUTER (routes/proxyRouter.js)
  * 
  * Enforces strict req.pause() Stream Safety before executing database transactions.
+ * Enforces MINIMUM_USERSCRIPT_VERSION via X-Script-Version (426 SCRIPT_UPDATE_REQUIRED, zero bans)
+ * strictly after device verification and before Stage 1 parameter checks, staging semaphore intake,
+ * and Stage 5 anti-spoofing bans so un-updated v5.0.0 clients never trigger false parameter forgery bans.
  * Enforces ACS-1 ingress staging semaphore (activeBufferingStreams <= INGRESS_SEMAPHORE_MAX),
  * upload inactivity & duration deadlines, TTL re-anchoring at req.on('end'), synchronous
  * Stage 5 anti-spoofing parameter reconciliation, Stage 6 V5 model-aware deadband firewall,
@@ -316,9 +319,30 @@ router.all('/:subdomain/{*splat}', async (req, res) => {
     }
     const device = auth.device;
     const tierConfig = config.TIER_CONFIGS[device.priority_tier] || config.TIER_CONFIGS['Normal'];
-    queueManager.ping(browserId);
 
     const requestId = req.headers['x-request-id'];
+
+    // Resolve any Channel A task owned by this authenticated client prior to version/stage gates so early drops release locks
+    if (isImageGen || isUpscale) {
+      activeTask = requestId ? queueManager.getProcessingTask(requestId, browserId) : null;
+    }
+
+    // Userscript Version Gatekeeper (rejects missing/outdated X-Script-Version without banning prior to Stage 1/5)
+    const versionCheck = auditEngine.verifyScriptVersion(req.headers['x-script-version']);
+    if (!versionCheck.ok) {
+      console.warn(
+        `[GuildWeave Version Gatekeeper] Rejected ${pathPart} from browser "${browserId}" (User: "${device.user_id}"): version="${typeof req.headers['x-script-version'] === 'string' ? req.headers['x-script-version'] : 'missing'}", min="${versionCheck.minVersion}".`
+      );
+      return sendEarlyError(versionCheck.status, {
+        statusCode: versionCheck.status,
+        error: versionCheck.error,
+        message: versionCheck.message,
+        min_version: versionCheck.minVersion
+      });
+    }
+
+    queueManager.ping(browserId);
+
     let isBasePaidHeader = false;
     let declaredAnlas = 0;
     let declaredAnlasProvided = false;
@@ -343,9 +367,6 @@ router.all('/:subdomain/{*splat}', async (req, res) => {
           message: 'Invalid X-Gen-Model routing header.'
         });
       }
-
-      // Resolve any Channel A task owned by this authenticated client prior to gated exits so early drops never strand locks
-      activeTask = requestId ? queueManager.getProcessingTask(requestId, browserId) : null;
 
       const basePaidParsed = parseBooleanHeader(req.headers['x-base-paid']);
       if (!basePaidParsed.ok) {
@@ -586,8 +607,6 @@ router.all('/:subdomain/{*splat}', async (req, res) => {
       }
     } else if (isUpscale) {
       // Stage 1: Channel A Upscale Gate (Anlas-billed, exempt from V5 battery/NCP limits)
-      activeTask = requestId ? queueManager.getProcessingTask(requestId, browserId) : null;
-
       const declaredAnlasParsed = parseStrictNonNegativeIntHeader(req.headers['x-declared-anlas'], UPSCALE_MIN_ANLAS_COST);
       if (!declaredAnlasParsed.ok) {
         return sendEarlyError(400, {

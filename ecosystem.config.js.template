@@ -12,6 +12,7 @@ module.exports = {
       PORT: 3000,
       DATABASE_PATH: "data.db",
       ADMIN_SECRET_KEY: "YOUR_SUPER_SECRET_KEY_HERE",
+      MINIMUM_USERSCRIPT_VERSION: "6.0.0",
       // Harmonized Tier Settings: Use 'null' to denote unlimited parameters (mapped to Infinity on boot)
       TIER_CONFIGS: JSON.stringify({
         'Admin':   { "basePriority": 30, "preciseLimit": null, "maxBurst": null, "refillRate": 0,      "maxAllowance": null, "refillRateMs": 0,       "monthlyAnlas": null, "v5Weight": 4, "v5MaxBankDays": null, "v5SurplusEligible": true },

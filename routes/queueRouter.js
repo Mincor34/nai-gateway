@@ -3,6 +3,9 @@
  * Coordinates single-concurrency Channel A locks, FIFO queue positions, and ACS-1
  * pre-flight V5 compute gating / reservation holds, plus Anlas-billed `/ai/upscale`
  * concurrency admission.
+ * Enforces MINIMUM_USERSCRIPT_VERSION via X-Script-Version (426 SCRIPT_UPDATE_REQUIRED,
+ * without banning) across `/join`, `/status`, and `/complete` immediately after authentication
+ * and before optional payload parsing, telemetry syncs, or queue state mutations.
  * Relational Normalization: Enforces concurrency, allowances, billing-cycle Anlas spend gates,
  * master solvency checks, expired-token shielding, and two-bucket V5 NCP reservations on canonical user_id.
  */
@@ -134,106 +137,122 @@ router.post('/join', async (req, res) => {
     return res.status(400).json({ statusCode: 400, error: 'INVALID_PARAMETERS', message: 'tab_id must be a string or null.' });
   }
 
-  if (model !== undefined && model !== null) {
-    if (typeof model !== 'string' || model.trim().length === 0) {
-      return res.status(400).json({ statusCode: 400, error: 'INVALID_PARAMETERS', message: 'model must be a non-empty string when provided.' });
-    }
-  }
-
-  if (is_base_paid !== undefined && typeof is_base_paid !== 'boolean') {
-    return res.status(400).json({ statusCode: 400, error: 'INVALID_PARAMETERS', message: 'is_base_paid must be a boolean.' });
-  }
-
-  if (is_v5 !== undefined && typeof is_v5 !== 'boolean') {
-    return res.status(400).json({ statusCode: 400, error: 'INVALID_PARAMETERS', message: 'is_v5 must be a boolean.' });
-  }
-
-  if (is_upscale !== undefined && typeof is_upscale !== 'boolean') {
-    return res.status(400).json({ statusCode: 400, error: 'INVALID_PARAMETERS', message: 'is_upscale must be a boolean.' });
-  }
-
-  const isUpscale = is_upscale === true;
-
-  if (isUpscale && (is_v5 === true || is_base_paid === true)) {
-    return res.status(400).json({ statusCode: 400, error: 'INVALID_PARAMETERS', message: 'is_upscale cannot be combined with is_v5 or is_base_paid.' });
-  }
-
-  let parsedSteps = null;
-  if (steps !== undefined && steps !== null) {
-    parsedSteps = parsePositiveSafeInt(steps);
-    if (parsedSteps === null) {
-      return res.status(400).json({ statusCode: 400, error: 'INVALID_PARAMETERS', message: 'steps must be a positive safe integer.' });
-    }
-  }
-
-  let parsedWidth = null;
-  if (width !== undefined && width !== null) {
-    parsedWidth = parsePositiveSafeInt(width);
-    if (parsedWidth === null) {
-      return res.status(400).json({ statusCode: 400, error: 'INVALID_PARAMETERS', message: 'width must be a positive safe integer.' });
-    }
-  }
-
-  let parsedHeight = null;
-  if (height !== undefined && height !== null) {
-    parsedHeight = parsePositiveSafeInt(height);
-    if (parsedHeight === null) {
-      return res.status(400).json({ statusCode: 400, error: 'INVALID_PARAMETERS', message: 'height must be a positive safe integer.' });
-    }
-  }
-
-  if ((parsedWidth !== null) !== (parsedHeight !== null)) {
-    return res.status(400).json({ statusCode: 400, error: 'INVALID_PARAMETERS', message: 'width and height must both be provided together.' });
-  }
-
-  let parsedSamples = null;
-  if (n_samples !== undefined && n_samples !== null) {
-    parsedSamples = parsePositiveSafeInt(n_samples);
-    if (parsedSamples === null) {
-      return res.status(400).json({ statusCode: 400, error: 'INVALID_PARAMETERS', message: 'n_samples must be a positive safe integer.' });
-    }
-  }
-
-  let parsedDeclaredAnlas = null;
-  if (declared_anlas !== undefined && declared_anlas !== null) {
-    parsedDeclaredAnlas = parseNonNegativeSafeInt(declared_anlas);
-    if (parsedDeclaredAnlas === null) {
-      return res.status(400).json({ statusCode: 400, error: 'INVALID_PARAMETERS', message: 'declared_anlas must be a non-negative safe integer.' });
-    }
-  }
-
   const device_secret = extractBearerToken(req.headers['authorization']);
-  const trimmedModel = typeof model === 'string' ? model.trim() : '';
-
-  let isV5 = false;
-  if (!isUpscale) {
-    if (trimmedModel.length > 0) {
-      const modelIsV5 = auditEngine.isV5ModelFamily(trimmedModel);
-      if (is_v5 !== undefined && is_v5 !== modelIsV5) {
-        return res.status(400).json({
-          statusCode: 400,
-          error: 'INVALID_PARAMETERS',
-          message: `Conflicting model identifier ("${trimmedModel}") and is_v5 (${is_v5}) flag.`
-        });
-      }
-      isV5 = modelIsV5;
-    } else {
-      isV5 = is_v5 === true;
-    }
-  }
-
-  const isV5Medium = !isUpscale && trimmedModel.length > 0 && auditEngine.isV5MediumModel(trimmedModel);
-  const isBasePaid = !isUpscale && is_base_paid === true;
-  const requestsAnlasBypass = isUpscale || isBasePaid || (parsedDeclaredAnlas !== null && parsedDeclaredAnlas > 0);
 
   try {
-    // Authenticate and enforce approval/ban status prior to evaluating business policy gates
+    // Authenticate and enforce approval/ban status prior to version & policy checks
     const auth = await auditEngine.verifyDevice(browser_id, device_secret, { requireApproval: true });
     if (!auth.ok) {
       return res.status(auth.status).json({ error: auth.error });
     }
     const device = auth.device;
+
+    // Userscript Version Gatekeeper (executes prior to optional schema checks, telemetry syncs, and accruals)
+    const versionCheck = auditEngine.verifyScriptVersion(req.headers['x-script-version']);
+    if (!versionCheck.ok) {
+      console.warn(
+        `[GuildWeave Version Gatekeeper] Rejected /queue/join from browser "${browser_id}" (User: "${device.user_id}"): version="${typeof req.headers['x-script-version'] === 'string' ? req.headers['x-script-version'] : 'missing'}", min="${versionCheck.minVersion}".`
+      );
+      return res.status(versionCheck.status).json({
+        statusCode: versionCheck.status,
+        error: versionCheck.error,
+        message: versionCheck.message,
+        min_version: versionCheck.minVersion
+      });
+    }
+
     queueManager.ping(browser_id);
+
+    if (model !== undefined && model !== null) {
+      if (typeof model !== 'string' || model.trim().length === 0) {
+        return res.status(400).json({ statusCode: 400, error: 'INVALID_PARAMETERS', message: 'model must be a non-empty string when provided.' });
+      }
+    }
+
+    if (is_base_paid !== undefined && typeof is_base_paid !== 'boolean') {
+      return res.status(400).json({ statusCode: 400, error: 'INVALID_PARAMETERS', message: 'is_base_paid must be a boolean.' });
+    }
+
+    if (is_v5 !== undefined && typeof is_v5 !== 'boolean') {
+      return res.status(400).json({ statusCode: 400, error: 'INVALID_PARAMETERS', message: 'is_v5 must be a boolean.' });
+    }
+
+    if (is_upscale !== undefined && typeof is_upscale !== 'boolean') {
+      return res.status(400).json({ statusCode: 400, error: 'INVALID_PARAMETERS', message: 'is_upscale must be a boolean.' });
+    }
+
+    const isUpscale = is_upscale === true;
+
+    if (isUpscale && (is_v5 === true || is_base_paid === true)) {
+      return res.status(400).json({ statusCode: 400, error: 'INVALID_PARAMETERS', message: 'is_upscale cannot be combined with is_v5 or is_base_paid.' });
+    }
+
+    let parsedSteps = null;
+    if (steps !== undefined && steps !== null) {
+      parsedSteps = parsePositiveSafeInt(steps);
+      if (parsedSteps === null) {
+        return res.status(400).json({ statusCode: 400, error: 'INVALID_PARAMETERS', message: 'steps must be a positive safe integer.' });
+      }
+    }
+
+    let parsedWidth = null;
+    if (width !== undefined && width !== null) {
+      parsedWidth = parsePositiveSafeInt(width);
+      if (parsedWidth === null) {
+        return res.status(400).json({ statusCode: 400, error: 'INVALID_PARAMETERS', message: 'width must be a positive safe integer.' });
+      }
+    }
+
+    let parsedHeight = null;
+    if (height !== undefined && height !== null) {
+      parsedHeight = parsePositiveSafeInt(height);
+      if (parsedHeight === null) {
+        return res.status(400).json({ statusCode: 400, error: 'INVALID_PARAMETERS', message: 'height must be a positive safe integer.' });
+      }
+    }
+
+    if ((parsedWidth !== null) !== (parsedHeight !== null)) {
+      return res.status(400).json({ statusCode: 400, error: 'INVALID_PARAMETERS', message: 'width and height must both be provided together.' });
+    }
+
+    let parsedSamples = null;
+    if (n_samples !== undefined && n_samples !== null) {
+      parsedSamples = parsePositiveSafeInt(n_samples);
+      if (parsedSamples === null) {
+        return res.status(400).json({ statusCode: 400, error: 'INVALID_PARAMETERS', message: 'n_samples must be a positive safe integer.' });
+      }
+    }
+
+    let parsedDeclaredAnlas = null;
+    if (declared_anlas !== undefined && declared_anlas !== null) {
+      parsedDeclaredAnlas = parseNonNegativeSafeInt(declared_anlas);
+      if (parsedDeclaredAnlas === null) {
+        return res.status(400).json({ statusCode: 400, error: 'INVALID_PARAMETERS', message: 'declared_anlas must be a non-negative safe integer.' });
+      }
+    }
+
+    const trimmedModel = typeof model === 'string' ? model.trim() : '';
+
+    let isV5 = false;
+    if (!isUpscale) {
+      if (trimmedModel.length > 0) {
+        const modelIsV5 = auditEngine.isV5ModelFamily(trimmedModel);
+        if (is_v5 !== undefined && is_v5 !== modelIsV5) {
+          return res.status(400).json({
+            statusCode: 400,
+            error: 'INVALID_PARAMETERS',
+            message: `Conflicting model identifier ("${trimmedModel}") and is_v5 (${is_v5}) flag.`
+          });
+        }
+        isV5 = modelIsV5;
+      } else {
+        isV5 = is_v5 === true;
+      }
+    }
+
+    const isV5Medium = !isUpscale && trimmedModel.length > 0 && auditEngine.isV5MediumModel(trimmedModel);
+    const isBasePaid = !isUpscale && is_base_paid === true;
+    const requestsAnlasBypass = isUpscale || isBasePaid || (parsedDeclaredAnlas !== null && parsedDeclaredAnlas > 0);
 
     let upscaleCost = null;
     if (isUpscale) {
@@ -552,6 +571,16 @@ router.get('/status', async (req, res) => {
       return res.status(auth.status).json({ error: auth.error });
     }
 
+    const versionCheck = auditEngine.verifyScriptVersion(req.headers['x-script-version']);
+    if (!versionCheck.ok) {
+      return res.status(versionCheck.status).json({
+        statusCode: versionCheck.status,
+        error: versionCheck.error,
+        message: versionCheck.message,
+        min_version: versionCheck.minVersion
+      });
+    }
+
     const pollResult = queueManager.poll(req_id, browser_id);
     if (!pollResult) return res.status(404).json({ error: 'Task missing' });
 
@@ -577,6 +606,16 @@ router.post('/complete', async (req, res) => {
     const auth = await auditEngine.verifyDevice(browser_id, device_secret, { requireApproval: true });
     if (!auth.ok) {
       return res.status(auth.status).json({ error: auth.error });
+    }
+
+    const versionCheck = auditEngine.verifyScriptVersion(req.headers['x-script-version']);
+    if (!versionCheck.ok) {
+      return res.status(versionCheck.status).json({
+        statusCode: versionCheck.status,
+        error: versionCheck.error,
+        message: versionCheck.message,
+        min_version: versionCheck.minVersion
+      });
     }
 
     queueManager.complete(req_id, browser_id);

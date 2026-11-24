@@ -3,6 +3,9 @@
  * Manages device registration, nicknames, client authorization queries, dual-ledger status
  * serialization, cycle-segregated period usage telemetry, physical master-tank solvency
  * bounds on reported V5 availability, and in-band diagnostic intent signaling.
+ * Enforces MINIMUM_USERSCRIPT_VERSION via X-Script-Version (426 SCRIPT_UPDATE_REQUIRED,
+ * without banning, registering, or marking outdated clients online) across all authenticated
+ * /auth/* operations and device registrations while preserving unauthenticated connectivity pings.
  * Rejects HTML/control-character payloads in device labels to prevent stored XSS in Admin UI.
  * Masks uninitialized or 401-invalidated telemetry to prevent phantom capacity exposure.
  * Relational Normalization: Integrates canonical users and physical devices tables.
@@ -136,6 +139,16 @@ router.post('/register', async (req, res) => {
     }
     cleanLabel = validatedLabel;
   }
+
+  const versionCheck = auditEngine.verifyScriptVersion(req.headers['x-script-version']);
+  if (!versionCheck.ok) {
+    return res.status(versionCheck.status).json({
+      statusCode: versionCheck.status,
+      error: versionCheck.error,
+      message: versionCheck.message,
+      min_version: versionCheck.minVersion
+    });
+  }
   
   try {
     // Prevent registering a new unapproved device directly against an existing non-browser canonical principal
@@ -192,6 +205,16 @@ router.post('/update-label', async (req, res) => {
       return res.status(auth.status).json({ error: 'Unauthorized nickname change' });
     }
 
+    const versionCheck = auditEngine.verifyScriptVersion(req.headers['x-script-version']);
+    if (!versionCheck.ok) {
+      return res.status(versionCheck.status).json({
+        statusCode: versionCheck.status,
+        error: versionCheck.error,
+        message: versionCheck.message,
+        min_version: versionCheck.minVersion
+      });
+    }
+
     await run('UPDATE devices SET label = ? WHERE browser_id = ?', [cleanLabel, browser_id]);
     console.log(`[GuildWeave Telemetry] Device "${browser_id}" updated nickname: "${cleanLabel}"`);
     res.json({ success: true });
@@ -221,6 +244,16 @@ router.post('/debug-intent', async (req, res) => {
     const auth = await auditEngine.verifyDevice(browser_id, device_secret, { requireApproval: false });
     if (!auth.ok) {
       return res.status(auth.status).json({ error: auth.error });
+    }
+
+    const versionCheck = auditEngine.verifyScriptVersion(req.headers['x-script-version']);
+    if (!versionCheck.ok) {
+      return res.status(versionCheck.status).json({
+        statusCode: versionCheck.status,
+        error: versionCheck.error,
+        message: versionCheck.message,
+        min_version: versionCheck.minVersion
+      });
     }
 
     const intentState = enabled;
@@ -258,6 +291,17 @@ router.get('/status', async (req, res) => {
       return res.status(auth.status).json({ error: auth.error });
     }
     const device = auth.device;
+
+    const versionCheck = auditEngine.verifyScriptVersion(req.headers['x-script-version']);
+    if (!versionCheck.ok) {
+      return res.status(versionCheck.status).json({
+        statusCode: versionCheck.status,
+        error: versionCheck.error,
+        message: versionCheck.message,
+        min_version: versionCheck.minVersion
+      });
+    }
+
     queueManager.ping(browser_id);
     const tierConfig = config.TIER_CONFIGS[device.priority_tier] || config.TIER_CONFIGS['Normal'];
     const now = Date.now();

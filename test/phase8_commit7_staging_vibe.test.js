@@ -175,13 +175,18 @@ const mockUpstream = http.createServer((req, res) => {
 });
 
 function sendRawRequest({ method = 'POST', path: reqPath, headers = {}, body = undefined }) {
+  const hasScriptVersion = Object.keys(headers).some(k => k.toLowerCase() === 'x-script-version');
+  const finalHeaders = (!reqPath.startsWith('/admin') && !hasScriptVersion)
+    ? { 'X-Script-Version': '6.0.0', ...headers }
+    : headers;
+
   return new Promise((resolve, reject) => {
     const req = http.request({
       hostname: '127.0.0.1',
       port: TEST_PORT,
       path: reqPath,
       method,
-      headers
+      headers: finalHeaders
     }, (res) => {
       const chunks = [];
       res.on('data', c => chunks.push(c));
@@ -566,6 +571,7 @@ test('Phase 8 Commit 7: Ingress Staging Semaphore, Upload Deadlines & Channel B 
         headers: {
           'Authorization': 'Bearer sec_vibe',
           'X-Browser-Id': 'dev_vibe',
+          'X-Script-Version': '6.0.0',
           'Content-Type': 'application/json',
           'Transfer-Encoding': 'chunked'
         }
@@ -581,6 +587,7 @@ test('Phase 8 Commit 7: Ingress Staging Semaphore, Upload Deadlines & Channel B 
         headers: {
           'Authorization': 'Bearer sec_three',
           'X-Browser-Id': 'dev_three',
+          'X-Script-Version': '6.0.0',
           'Content-Type': 'application/json',
           'Transfer-Encoding': 'chunked'
         }
@@ -650,6 +657,7 @@ test('Phase 8 Commit 7: Ingress Staging Semaphore, Upload Deadlines & Channel B 
           headers: {
             'Authorization': 'Bearer sec_vibe',
             'X-Browser-Id': 'dev_vibe',
+            'X-Script-Version': '6.0.0',
             'Content-Type': 'application/json',
             'Transfer-Encoding': 'chunked'
           }
@@ -685,6 +693,7 @@ test('Phase 8 Commit 7: Ingress Staging Semaphore, Upload Deadlines & Channel B 
           headers: {
             'Authorization': 'Bearer sec_vibe',
             'X-Browser-Id': 'dev_vibe',
+            'X-Script-Version': '6.0.0',
             'Content-Type': 'application/json',
             'Transfer-Encoding': 'chunked'
           }
@@ -755,6 +764,7 @@ test('Phase 8 Commit 7: Ingress Staging Semaphore, Upload Deadlines & Channel B 
           headers: {
             'Authorization': 'Bearer sec_vibe',
             'X-Browser-Id': 'dev_vibe',
+            'X-Script-Version': '6.0.0',
             'Content-Type': 'application/json'
           }
         });
@@ -1121,6 +1131,7 @@ test('Phase 8 Commit 7: Ingress Staging Semaphore, Upload Deadlines & Channel B 
           'Authorization': 'Bearer sec_vibe',
           'X-Browser-Id': 'dev_vibe',
           'X-Request-Id': 'req_reanchor_c7',
+          'X-Script-Version': '6.0.0',
           'X-Gen-Width': '1024',
           'X-Gen-Height': '1024',
           'X-Gen-Steps': '28',
@@ -1172,6 +1183,7 @@ test('Phase 8 Commit 7: Ingress Staging Semaphore, Upload Deadlines & Channel B 
           'Authorization': 'Bearer sec_vibe',
           'X-Browser-Id': 'dev_vibe',
           'X-Request-Id': 'req_evict_mid_upload',
+          'X-Script-Version': '6.0.0',
           'X-Gen-Width': '1024',
           'X-Gen-Height': '1024',
           'X-Gen-Steps': '28',

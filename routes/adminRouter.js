@@ -1,6 +1,9 @@
 /**
  * LEVEL 4: ADMINISTRATIVE ROUTER (routes/adminRouter.js)
  * Isolates all privileged control panel, Discord bot, and management interactions.
+ * Enforces MINIMUM_USERSCRIPT_VERSION when Tampermonkey callers supply `X-Script-Version`
+ * (`426 SCRIPT_UPDATE_REQUIRED`, without banning), while allowing external Discord bot
+ * and operator CLI callers that authenticate via ADMIN_SECRET_KEY without userscript headers.
  * Exposes dual-ledger Anlas/V5 NCP telemetry, Cluster Surplus state, billing-cycle-segregated
  * period usage & historical archives (`GET /admin/cycles`, `?cycle_epoch=` on `/devices` & `/global-stats`),
  * and atomic balance adjustment / debt reconciliation controls.
@@ -126,6 +129,21 @@ const verifyAdmin = (req, res, next) => {
   if (authHeader.split(' ')[1] !== config.ADMIN_SECRET_KEY) {
     return res.status(403).json({ error: 'Invalid admin token' });
   }
+
+  // External Discord bot / CLI requests omit X-Script-Version; when supplied by Admin UserScript, enforce min version
+  const rawScriptVersion = req.headers['x-script-version'];
+  if (rawScriptVersion !== undefined) {
+    const versionCheck = auditEngine.verifyScriptVersion(rawScriptVersion);
+    if (!versionCheck.ok) {
+      return res.status(versionCheck.status).json({
+        statusCode: versionCheck.status,
+        error: versionCheck.error,
+        message: versionCheck.message,
+        min_version: versionCheck.minVersion
+      });
+    }
+  }
+
   next();
 };
 

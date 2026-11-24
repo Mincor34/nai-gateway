@@ -189,13 +189,18 @@ const mockUpstream = http.createServer((req, res) => {
 });
 
 function sendRawRequest({ method = 'POST', path: reqPath, headers = {}, body = undefined }) {
+  const hasScriptVersion = Object.keys(headers).some(k => k.toLowerCase() === 'x-script-version');
+  const finalHeaders = (!reqPath.startsWith('/admin') && !hasScriptVersion)
+    ? { 'X-Script-Version': '6.0.0', ...headers }
+    : headers;
+
   return new Promise((resolve, reject) => {
     const req = http.request({
       hostname: '127.0.0.1',
       port: TEST_PORT,
       path: reqPath,
       method,
-      headers
+      headers: finalHeaders
     }, (res) => {
       const chunks = [];
       res.on('data', c => chunks.push(c));

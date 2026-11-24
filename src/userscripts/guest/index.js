@@ -4,10 +4,10 @@
  *
  * Implements client-side metadata spoofing (Opus subscription mapping), dual-ledger HUD rendering
  * (Monthly Anlas balance + debt lockouts + V5 free generation allowance + shared bonus pool +
- * recharge ETA), explicit Anlas usage toggle governance, and redirects generation/upscale operations
- * to the GuildWeave gateway.
+ * recharge ETA), explicit Anlas usage toggle governance, 426 version-mismatch alerting across
+ * onboarding and polling, and redirects generation/upscale operations to the GuildWeave gateway.
  *
- * PROCESS FLOW:
+ * FLOW:
  * 1. Generates unique identities and stores them in sandbox memory (GM_setValue).
  * 2. Authenticates queries using bearer token parameters.
  * 3. Hijacks unsafeWindow.fetch calls to mock tier-specific capabilities.
@@ -30,6 +30,7 @@ import {
   syncUIControlConstraints,
   getClientPolicyState,
   setClientPolicyState,
+  setHudAlert,
   initDOMObserver,
   ensureGuildWeaveStyles,
   escapeHtml,
@@ -46,6 +47,23 @@ let approved = GM_getValue("approved", false);
 let VPS_HOST = GM_getValue("vps_host", "");
 
 const DEFAULT_BYPASS_HINT = 'Enables sizes >1MP, batches (>1), and >28 steps using monthly Anlas. On V5 High, steps 24–28 remain blocked to protect shared limits—use ≤23 steps, Medium, or 29+ steps.';
+
+/**
+ * Extracts a human-readable message from an HTTP 426 SCRIPT_UPDATE_REQUIRED payload.
+ *
+ * @param {string} responseText - Raw JSON response text.
+ * @returns {string} Extracted update prompt message.
+ */
+function parseVersionUpgradeMessage(responseText) {
+    let msg = "Your GuildWeave Tampermonkey userscript is outdated. Please update to the latest version to proceed.";
+    try {
+        const parsed = JSON.parse(responseText || '{}');
+        if (parsed && typeof parsed.message === 'string' && parsed.message.trim().length > 0) {
+            msg = parsed.message;
+        }
+    } catch (_) {}
+    return msg;
+}
 
 try {
     if (!browserId || !deviceSecret) {
@@ -211,6 +229,9 @@ function renderSetupWizard(container) {
                 registerBtn.disabled = true;
                 step3Container.style.display = "block";
                 showStep3();
+            } else if (res.status === 426) {
+                step2Status.style.color = `var(--theme-error, ${theme.error})`;
+                step2Status.textContent = parseVersionUpgradeMessage(res.responseText);
             } else {
                 throw new Error("Registration rejected");
             }
@@ -228,7 +249,7 @@ function renderSetupWizard(container) {
             <div role="button" tabindex="0" class="gw-code-chip gw-copy-chip" data-copy-id="/link browser_id:${safeFullBid}" title="Click to copy command" style="display:block; padding:10px; text-align:center; word-break:break-all; color:var(--theme-warning, ${theme.warning}); margin-bottom:10px;">
                 /link browser_id:${safeFullBid}
             </div>
-            <p style="margin:0; font-size:11px; text-align:center; animation: gwPulse 1.5s infinite alternate;">Waiting for approval...</p>
+            <p id="step-3-poll-status" style="margin:0; font-size:11px; text-align:center; animation: gwPulse 1.5s infinite alternate;">Waiting for approval...</p>
         `;
         attachCopyChipHandlers(step3Content);
 
@@ -244,6 +265,14 @@ function renderSetupWizard(container) {
                     if (data.approved) {
                         GM_setValue("approved", true);
                         window.location.reload();
+                    }
+                } else if (res.status === 426) {
+                    const pollStatusEl = step3Content.querySelector("#step-3-poll-status");
+                    if (pollStatusEl) {
+                        pollStatusEl.style.animation = "none";
+                        pollStatusEl.style.color = `var(--theme-error, ${theme.error})`;
+                        pollStatusEl.style.fontWeight = "600";
+                        pollStatusEl.textContent = parseVersionUpgradeMessage(res.responseText);
                     }
                 } else if (res.status === 401) {
                     console.warn("GuildWeave (Guest): Server returned 401 during poll. Re-registering silently...");
@@ -307,6 +336,8 @@ if (!approved || !VPS_HOST) {
                     updateAllowanceBar(null, Infinity, 0);
                 }
                 updateDualLedgerHud(data);
+            } else if (res.status === 426) {
+                setHudAlert(parseVersionUpgradeMessage(res.responseText), 'error');
             }
         } catch (e) {
             console.error("GuildWeave (Guest): Failed to poll session state", e);
@@ -659,6 +690,11 @@ if (!approved || !VPS_HOST) {
                             debugStatus.textContent = "Disabled";
                         }
                     }
+                } else if (res.status === 426) {
+                    const msg = parseVersionUpgradeMessage(res.responseText);
+                    const tierEl = container.querySelector("#guest-assigned-tier");
+                    if (tierEl) tierEl.innerHTML = `<span style="color:var(--theme-error, ${theme.error});">Update Required</span>`;
+                    setHudAlert(msg, 'error');
                 }
             }).catch(() => {});
         }
@@ -694,6 +730,9 @@ if (!approved || !VPS_HOST) {
                     nickStatus.style.color = `var(--theme-success, ${theme.success})`;
                     nickStatus.textContent = "Saved.";
                     GM_setValue("device_nickname", newNickname);
+                } else if (res.status === 426) {
+                    nickStatus.style.color = `var(--theme-error, ${theme.error})`;
+                    nickStatus.textContent = parseVersionUpgradeMessage(res.responseText);
                 } else {
                     throw new Error("Update failed");
                 }
@@ -746,6 +785,9 @@ if (!approved || !VPS_HOST) {
                         debugIntentStatus.style.color = `var(--theme-textSecondary, ${theme.textMuted})`;
                         debugIntentStatus.textContent = "Disabled";
                     }
+                } else if (res.status === 426) {
+                    debugIntentStatus.style.color = `var(--theme-error, ${theme.error})`;
+                    debugIntentStatus.textContent = parseVersionUpgradeMessage(res.responseText);
                 } else {
                     throw new Error("Synchronization rejected");
                 }

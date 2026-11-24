@@ -114,6 +114,11 @@
  *      for unlinked principals across approve/revoke/ban, verifies `<select>` setter syncs `<option>` selections,
  *      rejects malformed deltas (`"12.5"`, `"50abc"`) without dispatching requests, and dispatches
  *      `POST /admin/adjust-balance` and `POST /admin/reconcile-debt`.
+ * 8. Hell Path: Client `HTTP 426 SCRIPT_UPDATE_REQUIRED` Propagation & UI Alerting:
+ *    - Verifies Guest `POST /queue/join`, `POST /proxy/image/ai/generate-image-stream`, and `GET /auth/status`
+ *      returning `426` propagate exact `426` status (never `502`), display `#gw-hud-alert`, and leave `approved: true`.
+ *    - Verifies Admin `GET /auth/status` poll and Governance `GET /admin/devices` returning `426` display
+ *      `#gw-hud-alert` and `#vps-client-list` update prompt instead of hanging.
  */
 
 'use strict';
@@ -3004,5 +3009,138 @@ test('Phase 8 Commit 10: Client UserScript Runtime, Dynamic Design Engine & Prod
     await new Promise(r => setTimeout(r, 10));
     assert.strictEqual(copiedTexts[1], fullAdminLinkedBid, 'Operator linked browser chip must copy full browser_id');
     assert.strictEqual(opChip.textContent, 'b_admin_li...');
+  });
+
+  // ---------------------------------------------------------------------------
+  // 8. HELL PATH: CLIENT HTTP 426 SCRIPT_UPDATE_REQUIRED PROPAGATION & UI ALERTING
+  // ---------------------------------------------------------------------------
+  await t.test('Hell Path: Propagates HTTP 426 SCRIPT_UPDATE_REQUIRED across /queue/join, /proxy, /auth/status & Admin UI without wiping approval', async () => {
+    const guestBox = createBrowserSandbox({
+      approved: true,
+      vps_host: 'https://vps.example.duckdns.org',
+      device_secret: 'sec_426_guest',
+      browser_id: 'b_426_guest'
+    }, guestCode);
+
+    guestBox.context.document.body.innerHTML = `
+      <div class="image-gen-footer">
+        <button class="image-gen-generate-button"><span>Generate 1 Image</span></button>
+      </div>
+    `;
+
+    vm.runInContext(guestCode, guestBox.context);
+    guestBox.triggerObserverSync();
+
+    // 1. /queue/join returning 426 must resolve 426 (never 502), alert HUD, and keep approved: true
+    const join426Promise = vm.runInContext(`
+      unsafeWindow.fetch('https://image.novelai.net/ai/generate-image-stream', {
+        method: 'POST',
+        body: JSON.stringify({ model: 'nai-diffusion-4-5-full', parameters: { width: 1024, height: 1024, steps: 28, n_samples: 1 } })
+      })
+    `, guestBox.context);
+    await new Promise(r => setTimeout(r, 20));
+    guestBox.networkCalls[0].onload({
+      status: 426,
+      responseText: JSON.stringify({
+        statusCode: 426,
+        error: 'SCRIPT_UPDATE_REQUIRED',
+        message: 'Your GuildWeave Tampermonkey userscript (v5.0.0) is outdated (minimum required: v6.0.0).'
+      })
+    });
+    const join426Resp = await join426Promise;
+    assert.strictEqual(join426Resp.status, 426, 'Must propagate 426 from /queue/join rather than throwing 502');
+    const join426Body = await join426Resp.json();
+    assert.strictEqual(join426Body.error, 'SCRIPT_UPDATE_REQUIRED');
+    assert.strictEqual(guestBox.storage.get('approved'), true);
+    assert.strictEqual(guestBox.context.document.getElementById('gw-hud-alert').style.display, 'block');
+    assert.match(guestBox.context.document.getElementById('gw-hud-alert').textContent, /outdated \(minimum required: v6\.0\.0\)/);
+
+    // 2. /proxy/image/* returning 426 must propagate 426, alert HUD, and keep approved: true
+    guestBox.networkCalls.length = 0;
+    const proxy426Promise = vm.runInContext(`
+      unsafeWindow.fetch('https://image.novelai.net/ai/generate-image-stream', {
+        method: 'POST',
+        body: JSON.stringify({ model: 'nai-diffusion-4-5-full', parameters: { width: 1024, height: 1024, steps: 28, n_samples: 1 } })
+      })
+    `, guestBox.context);
+    await new Promise(r => setTimeout(r, 20));
+    guestBox.networkCalls[0].onload({ status: 200, responseText: '{"success":true}' });
+    await new Promise(r => setTimeout(r, 1050));
+    guestBox.networkCalls[1].onload({ status: 200, responseText: '{"status":"your_turn"}' });
+    await new Promise(r => setTimeout(r, 20));
+    guestBox.networkCalls[2].onload({
+      status: 426,
+      readyState: 4,
+      responseHeaders: 'HTTP/1.1 426 Upgrade Required\r\nContent-Type: application/json',
+      responseText: JSON.stringify({
+        statusCode: 426,
+        error: 'SCRIPT_UPDATE_REQUIRED',
+        message: 'Please update GuildWeave script to v6.0.0.'
+      })
+    });
+    const proxy426Resp = await proxy426Promise;
+    assert.strictEqual(proxy426Resp.status, 426);
+    assert.strictEqual(guestBox.storage.get('approved'), true);
+    assert.match(guestBox.context.document.getElementById('gw-hud-alert').textContent, /Please update GuildWeave script to v6\.0\.0/);
+
+    // 3. Guest /auth/status poll returning 426 surfaces #gw-hud-alert immediately
+    guestBox.networkCalls.length = 0;
+    guestBox.triggerIntervalAtMs(10000);
+    await new Promise(r => setTimeout(r, 20));
+    guestBox.networkCalls[0].onload({
+      status: 426,
+      responseText: JSON.stringify({
+        statusCode: 426,
+        error: 'SCRIPT_UPDATE_REQUIRED',
+        message: 'Update required from status poll.'
+      })
+    });
+    await new Promise(r => setTimeout(r, 20));
+    assert.match(guestBox.context.document.getElementById('gw-hud-alert').textContent, /Update required from status poll/);
+
+    // 4. Admin /auth/status poll & /admin/devices returning 426 surface HUD alert & #vps-client-list update notice
+    const adminBox = createBrowserSandbox({
+      approved: true,
+      vps_host: 'https://vps.example.duckdns.org',
+      admin_token: 'adm_sec_426',
+      browser_id: 'b_426_admin'
+    }, adminCode);
+    adminBox.context.document.body.innerHTML = `
+      <div class="image-gen-nav-row"><button aria-label="menu"></button></div>
+      <div class="image-gen-footer">
+        <button class="image-gen-generate-button"><span>Generate 1 Image</span></button>
+      </div>
+    `;
+    vm.runInContext(adminCode, adminBox.context);
+    adminBox.triggerObserverSync();
+
+    adminBox.triggerIntervalAtMs(10000);
+    await new Promise(r => setTimeout(r, 20));
+    adminBox.networkCalls[0].onload({
+      status: 426,
+      responseText: JSON.stringify({
+        statusCode: 426,
+        error: 'SCRIPT_UPDATE_REQUIRED',
+        message: 'Admin script outdated (min v6.0.0).'
+      })
+    });
+    await new Promise(r => setTimeout(r, 20));
+    assert.match(adminBox.context.document.getElementById('gw-hud-alert').textContent, /Admin script outdated/);
+
+    adminBox.networkCalls.length = 0;
+    adminBox.context.document.getElementById('gw-nav-badge').onclick({ preventDefault: () => {}, stopPropagation: () => {} });
+    await new Promise(r => setTimeout(r, 20));
+    const admDevCall = adminBox.networkCalls.find(c => c.url.includes('/admin/devices'));
+    assert.ok(admDevCall);
+    admDevCall.onload({
+      status: 426,
+      responseText: JSON.stringify({
+        statusCode: 426,
+        error: 'SCRIPT_UPDATE_REQUIRED',
+        message: 'Update Admin panel to v6.0.0.'
+      })
+    });
+    await new Promise(r => setTimeout(r, 20));
+    assert.match(adminBox.context.document.getElementById('vps-client-list').textContent, /Update Admin panel to v6\.0\.0/);
   });
 });
