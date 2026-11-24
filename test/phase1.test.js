@@ -15,7 +15,8 @@
  * 5. SSRF and Destination Whitelist Shields: Subdomain and path violations (403).
  * 6. Rolling Token Allowance Depletion: Immediate 403 rejection on exhausted balance.
  * 7. End-to-End Streaming Integrity: Verification of chunked multi-part payload delivery across a 2.0-second sustained interval.
- * 8. Model-Spoofing Audit: Detection of stealth V5 calls, immediate persistent database ban, AND active queue eviction.
+ * 8. Model-Spoofing Audit: Detection of stealth V5 calls across variants (nai-diffusion-5-full and bare nai-diffusion-5),
+ *    immediate persistent database ban, AND active queue eviction.
  * 9. Upstream Socket Disruption: Graceful HTTP 502 recovery on 50% header socket sever.
  * 10. Spec-Compliant Delayed SSE Stream: Single-character event-stream delivery with 100ms pauses.
  */
@@ -230,9 +231,13 @@ async function waitForServerToBootstrap(url, timeoutMs = 5000) {
 }
 
 async function queryGateway(endpoint, method = 'GET', headers = {}, body = null) {
+  const defaultHeaders = { 'Content-Type': 'application/json' };
+  if (!endpoint.startsWith('/admin')) {
+    defaultHeaders['X-Script-Version'] = '6.0.0';
+  }
   const response = await fetch(`http://127.0.0.1:${GATEWAY_PORT}${endpoint}`, {
     method,
-    headers: { 'Content-Type': 'application/json', ...headers },
+    headers: { ...defaultHeaders, ...headers },
     body: body ? (typeof body === 'string' ? body : JSON.stringify(body)) : null
   });
   const contentType = response.headers.get('content-type') || '';
@@ -322,6 +327,7 @@ test("NovelAI Gateway Phase 1 Comprehensive Security & Resilience Gate", async (
       headers: {
         'X-Browser-ID': 'client_evict_a',
         'X-Request-ID': 'req_evict_a',
+        'X-Script-Version': '6.0.0',
         'X-Gen-Width': '1024',
         'X-Gen-Height': '1024',
         'X-Gen-Steps': '28',
@@ -370,7 +376,8 @@ test("NovelAI Gateway Phase 1 Comprehensive Security & Resilience Gate", async (
         headers: {
           'Content-Type': 'application/json',
           'Authorization': 'Bearer secret_txt',
-          'X-Browser-ID': 'client_txt'
+          'X-Browser-ID': 'client_txt',
+          'X-Script-Version': '6.0.0'
         },
         body: JSON.stringify({ prompt: "Once upon a time", model: "kayra-v1" })
       });
@@ -553,6 +560,7 @@ test("NovelAI Gateway Phase 1 Comprehensive Security & Resilience Gate", async (
         'Authorization': 'Bearer secret_stream',
         'X-Browser-ID': 'client_stream',
         'X-Request-ID': 'req_stream_test',
+        'X-Script-Version': '6.0.0',
         'X-Gen-Width': '1024',
         'X-Gen-Height': '1024',
         'X-Gen-Steps': '28',
@@ -584,7 +592,7 @@ test("NovelAI Gateway Phase 1 Comprehensive Security & Resilience Gate", async (
   });
 
   // 8. Model-Spoofing Audit and Automatic Ban Execution
-  await t.test("Hell Path: Model-Spoofing Audit and Immediate Ban Execution", async () => {
+  await t.test("Hell Path: Model-Spoofing Audit and Immediate Ban Execution across V5 variants", async () => {
     await queryGateway('/auth/register', 'POST', {}, { browser_id: 'client_spoof', device_secret: 'secret_spoof', label: 'Spoof Tester' });
     await queryGateway('/admin/approve', 'POST', { 'Authorization': 'Bearer test_admin_key_super_secret_123' }, { browser_id: 'client_spoof', priority_tier: 'Normal' });
 
@@ -622,6 +630,37 @@ test("NovelAI Gateway Phase 1 Comprehensive Security & Resilience Gate", async (
     // 3. INVARIANT ASSERTION: Verify the malicious client's footprint was completely purged from memory queue RAM
     const taskStatus = await queryGateway('/queue/status?req_id=req_spoof_primary&browser_id=client_spoof', 'GET', { 'Authorization': 'Bearer secret_spoof' });
     assert.strictEqual(taskStatus.status, 403, "Spoofing client's task footprint must be evicted from active queue RAM");
+
+    // 4. ADDITIVE INVARIANT ASSERTION: Verify bare 'nai-diffusion-5' variant without full/curated suffixes also triggers permanent ban
+    await queryGateway('/auth/register', 'POST', {}, { browser_id: 'client_spoof_bare', device_secret: 'secret_spoof_bare', label: 'Spoof Bare' });
+    await queryGateway('/admin/approve', 'POST', { 'Authorization': 'Bearer test_admin_key_super_secret_123' }, { browser_id: 'client_spoof_bare', priority_tier: 'Normal' });
+
+    await queryGateway('/queue/join', 'POST', { 'Authorization': 'Bearer secret_spoof_bare' }, { browser_id: 'client_spoof_bare', tab_id: 'tab_sb', req_id: 'req_spoof_bare_primary' });
+    while (true) {
+      const { data } = await queryGateway('/queue/status?req_id=req_spoof_bare_primary&browser_id=client_spoof_bare', 'GET', { 'Authorization': 'Bearer secret_spoof_bare' });
+      if (data.status === 'your_turn') break;
+      await new Promise(r => setTimeout(r, 50));
+    }
+
+    await queryGateway('/proxy/image/ai/generate-image-stream', 'POST', {
+      'X-Browser-ID': 'client_spoof_bare',
+      'X-Request-ID': 'req_spoof_bare_primary',
+      'X-Gen-Width': '1024',
+      'X-Gen-Height': '1024',
+      'X-Gen-Steps': '28',
+      'X-Gen-Samples': '1',
+      'X-Gen-Model': 'legacy',
+      'Authorization': 'Bearer secret_spoof_bare'
+    }, { model: 'nai-diffusion-5', parameters: { width: 1024, height: 1024, steps: 28, n_samples: 1 } });
+
+    await new Promise(r => setTimeout(r, 200));
+
+    const statusBareRes = await queryGateway('/auth/status?browser_id=client_spoof_bare', 'GET', { 'Authorization': 'Bearer secret_spoof_bare' });
+    assert.strictEqual(statusBareRes.status, 403, "Bare 'nai-diffusion-5' without suffixes must trigger 403 Forbidden ban");
+    assert.match(statusBareRes.data.error, /permanently banned/i);
+
+    const attemptRejoinBare = await queryGateway('/queue/join', 'POST', { 'Authorization': 'Bearer secret_spoof_bare' }, { browser_id: 'client_spoof_bare', tab_id: 'tab_sb', req_id: 'req_spoof_bare_sec' });
+    assert.strictEqual(attemptRejoinBare.status, 403, "Banned device attempting bare V5 spoof must be blocked at queue ingress");
   });
 
   // 9. Upstream Disruption Handling
@@ -662,7 +701,8 @@ test("NovelAI Gateway Phase 1 Comprehensive Security & Resilience Gate", async (
       headers: {
         'Content-Type': 'application/json',
         'Authorization': 'Bearer secret_char_sse',
-        'X-Browser-ID': 'client_char_sse'
+        'X-Browser-ID': 'client_char_sse',
+        'X-Script-Version': '6.0.0'
       },
       body: JSON.stringify({ prompt: "Alice", model: "kayra-v1" })
     });

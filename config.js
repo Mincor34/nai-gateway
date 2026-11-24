@@ -4,7 +4,7 @@
  *
  * DESIGN PRINCIPLES:
  * 1. Pure functional configuration isolation without runtime execution side-effects.
- * 2. Strict parametric schema validation for priority tiers, firewall thresholds, and timing parameters.
+ * 2. Strict parametric schema validation for priority tiers, firewall thresholds, SemVer minimums, and timing parameters.
  * 3. Normalizes external JSON 'null' limits to internal JavaScript 'Infinity' thresholds.
  * 4. Merges custom tier definitions defensively over DEFAULT_TIER_CONFIGS to prevent missing-tier crashes.
  * 5. Deterministic error propagation: throws structured exceptions on schema violations.
@@ -12,16 +12,17 @@
  * 7. Explicit key sanitization protects against prototype pollution while preserving standard Object prototype methods.
  * 8. Deep immutability: all tier objects and manifests are deeply frozen across both default and custom paths.
  * 9. Upstream URL Template Injection: Allows end-to-end transport isolation without runtime monkey-patching.
+ * 10. ACS-1 Architecture Invariant: Strict integer enforcement on discrete quotas and weights (zero float drift).
  */
 
 'use strict';
 
 const DEFAULT_TIER_CONFIGS = Object.freeze({
-  'Admin':   Object.freeze({ basePriority: 30, preciseLimit: Infinity, maxBurst: Infinity, refillRate: 0,      maxAllowance: Infinity, refillRateMs: 0 }),
-  'High':    Object.freeze({ basePriority: 20, preciseLimit: 3,        maxBurst: Infinity, refillRate: 0,      maxAllowance: Infinity, refillRateMs: 0 }),
-  'Normal':  Object.freeze({ basePriority: 10, preciseLimit: 2,        maxBurst: 15,       refillRate: 120000, maxAllowance: Infinity, refillRateMs: 0 }),
-  'Low':     Object.freeze({ basePriority: 0,  preciseLimit: 1,        maxBurst: 10,       refillRate: 120000, maxAllowance: Infinity, refillRateMs: 0 }),
-  'Metered': Object.freeze({ basePriority: 0,  preciseLimit: 0,        maxBurst: 5,        refillRate: 120000, maxAllowance: 100,      refillRateMs: 1800000 })
+  'Admin':   Object.freeze({ basePriority: 30, preciseLimit: Infinity, maxBurst: Infinity, refillRate: 0,      maxAllowance: Infinity, refillRateMs: 0,       monthlyAnlas: Infinity, v5Weight: 4, v5MaxBankDays: Infinity, v5SurplusEligible: true }),
+  'High':    Object.freeze({ basePriority: 20, preciseLimit: 3,        maxBurst: Infinity, refillRate: 0,      maxAllowance: Infinity, refillRateMs: 0,       monthlyAnlas: 1000,     v5Weight: 3, v5MaxBankDays: 3,        v5SurplusEligible: true }),
+  'Normal':  Object.freeze({ basePriority: 10, preciseLimit: 2,        maxBurst: 15,       refillRate: 120000, maxAllowance: Infinity, refillRateMs: 0,       monthlyAnlas: 500,      v5Weight: 2, v5MaxBankDays: 3,        v5SurplusEligible: true }),
+  'Low':     Object.freeze({ basePriority: 0,  preciseLimit: 1,        maxBurst: 10,       refillRate: 120000, maxAllowance: Infinity, refillRateMs: 0,       monthlyAnlas: 200,      v5Weight: 1, v5MaxBankDays: 3,        v5SurplusEligible: true }),
+  'Metered': Object.freeze({ basePriority: 0,  preciseLimit: 0,        maxBurst: 5,        refillRate: 120000, maxAllowance: 100,      refillRateMs: 1800000, monthlyAnlas: 0,        v5Weight: 0, v5MaxBankDays: 0,        v5SurplusEligible: false })
 });
 
 const MANDATORY_BASE_TIERS = Object.freeze(['Admin', 'High', 'Normal', 'Low', 'Metered']);
@@ -30,6 +31,7 @@ const PROXY_PATH_WHITELIST = Object.freeze(new Set([
   'ai/generate-image',
   'ai/generate-image-stream',
   'ai/encode-vibe',      // Whitelisted path to support vibe transfer pre-processing via master token
+  'ai/upscale',          // Whitelisted path to support Anlas-billed image upscaling via master token
   'ai/generate-stream',  // Legacy Text/story Generation API endpoint
   'oa/v1/completions',   // New OpenAI-compatible Text Generation API endpoint (GLM-4, Erato, Xialong, etc.)
   'user/subscription'    // Allow proxying of read-only subscription telemetry to spoof native UI meters
@@ -37,17 +39,21 @@ const PROXY_PATH_WHITELIST = Object.freeze(new Set([
 
 const SUBDOMAIN_WHITELIST = Object.freeze(['api', 'image', 'text']);
 
+const SEMVER_REGEX = /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-([0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*))?(?:\+([0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*))?$/;
+const NUMERIC_PRERELEASE_ID_REGEX = /^(0|[1-9]\d*)$/;
+
 // Static operational defaults
 const OPERATIONAL_DEFAULTS = Object.freeze({
   PORT: 3000,
   DATABASE_PATH: 'staging_data.db',
   NODE_ENV: 'development',
   MAX_CONCURRENT_TEXT_GENS: 3,
-  
+  MINIMUM_USERSCRIPT_VERSION: '6.0.0',
+
   // Upstream Destination Boundary
   UPSTREAM_BASE_URL_TEMPLATE: 'https://{subdomain}.novelai.net',
 
-  // Physical Memory Boundary: 50MB maximum request buffer fits comfortably within PM2 200MB heap
+  // Physical Memory Boundary: 50MB maximum request buffer bounds per-request staging allocations
   // while supporting multiple Base64-inflated high-resolution reference images
   MAX_PAYLOAD_SIZE_BYTES: 52428800,
 
@@ -71,10 +77,108 @@ const OPERATIONAL_DEFAULTS = Object.freeze({
   
   // Identity & Account Policies
   ACTIVE_SESSION_TTL_MS: 30000, // Active presence RAM threshold
-  MAX_LINKED_DEVICES_PER_USER: 3
+  MAX_LINKED_DEVICES_PER_USER: 3,
 
-  //TODO: Add a MINIMUM_USERSCRIPT_VERSION parameter to enforce legacy client versioning and prevent unsupported API calls.
+  // ACS-1 Operational Constants
+  NOMINAL_DAILY_V5_COMPUTE: 190.0,
+  V5_CIRCUIT_BREAKER_PERCENT: 5.5,
+  V5_SURPLUS_THRESHOLD_PERCENT: 50.0,
+  INGRESS_SEMAPHORE_MAX: 2,
+  UPLOAD_INACTIVITY_TIMEOUT_MS: 5000,
+  UPLOAD_DURATION_CEILING_MS: 60000
 });
+
+/**
+ * Strictly parses a SemVer 2.0.0 string (`MAJOR.MINOR.PATCH[-PRERELEASE][+BUILD]`).
+ * Rejects leading `v` prefixes, incomplete tuples (e.g. `6.0`), leading zeros on
+ * numeric components or prerelease identifiers, non-string values, and unsafe integers.
+ *
+ * @param {*} raw - Version string candidate.
+ * @returns {{major: number, minor: number, patch: number, prerelease: Array<string|number>, raw: string}|null} Parsed SemVer record or null.
+ */
+function parseSemVer(raw) {
+  if (typeof raw !== 'string') return null;
+  const trimmed = raw.trim();
+  const match = SEMVER_REGEX.exec(trimmed);
+  if (!match) return null;
+
+  const major = Number(match[1]);
+  const minor = Number(match[2]);
+  const patch = Number(match[3]);
+  if (!Number.isSafeInteger(major) || !Number.isSafeInteger(minor) || !Number.isSafeInteger(patch)) {
+    return null;
+  }
+
+  const prerelease = [];
+  if (match[4]) {
+    const parts = match[4].split('.');
+    for (const part of parts) {
+      if (/^\d+$/.test(part)) {
+        if (!NUMERIC_PRERELEASE_ID_REGEX.test(part)) {
+          return null;
+        }
+        const num = Number(part);
+        if (!Number.isSafeInteger(num)) return null;
+        prerelease.push(num);
+      } else {
+        prerelease.push(part);
+      }
+    }
+  }
+
+  return { major, minor, patch, prerelease, raw: trimmed };
+}
+
+/**
+ * Compares two SemVer 2.0.0 strings or parsed objects according to SemVer §11 precedence.
+ * Build metadata (`+...`) is ignored during precedence comparison.
+ *
+ * @param {string|object} a - Left SemVer version.
+ * @param {string|object} b - Right SemVer version.
+ * @returns {number} `-1` if a < b, `0` if a == b, `1` if a > b.
+ * @throws {Error} If either operand fails SemVer 2.0.0 validation.
+ */
+function compareSemVer(a, b) {
+  const pa = typeof a === 'string'
+    ? parseSemVer(a)
+    : (a && typeof a === 'object' && Number.isSafeInteger(a.major) && Number.isSafeInteger(a.minor) && Number.isSafeInteger(a.patch) && Array.isArray(a.prerelease) ? a : null);
+  const pb = typeof b === 'string'
+    ? parseSemVer(b)
+    : (b && typeof b === 'object' && Number.isSafeInteger(b.major) && Number.isSafeInteger(b.minor) && Number.isSafeInteger(b.patch) && Array.isArray(b.prerelease) ? b : null);
+
+  if (!pa || !pb) {
+    throw new Error('[Config Error] Invalid SemVer version supplied to compareSemVer.');
+  }
+
+  if (pa.major !== pb.major) return pa.major < pb.major ? -1 : 1;
+  if (pa.minor !== pb.minor) return pa.minor < pb.minor ? -1 : 1;
+  if (pa.patch !== pb.patch) return pa.patch < pb.patch ? -1 : 1;
+
+  const aHasPre = pa.prerelease.length > 0;
+  const bHasPre = pb.prerelease.length > 0;
+  if (!aHasPre && !bHasPre) return 0;
+  if (!aHasPre && bHasPre) return 1;
+  if (aHasPre && !bHasPre) return -1;
+
+  const maxLen = Math.max(pa.prerelease.length, pb.prerelease.length);
+  for (let i = 0; i < maxLen; i++) {
+    if (i >= pa.prerelease.length) return -1;
+    if (i >= pb.prerelease.length) return 1;
+
+    const idA = pa.prerelease[i];
+    const idB = pb.prerelease[i];
+    if (idA === idB) continue;
+
+    const aIsNum = typeof idA === 'number';
+    const bIsNum = typeof idB === 'number';
+    if (aIsNum && bIsNum) return idA < idB ? -1 : 1;
+    if (aIsNum && !bIsNum) return -1;
+    if (!aIsNum && bIsNum) return 1;
+    return idA < idB ? -1 : 1;
+  }
+
+  return 0;
+}
 
 /**
  * Validates and parses raw TIER_CONFIGS JSON strings into normalized runtime objects.
@@ -122,6 +226,8 @@ function parseTierConfigs(rawTierJson) {
       throw new Error(`Fatal schema violation in TIER_CONFIGS: Tier "${tier}" configuration must be an object.`);
     }
 
+    const defaultCfg = DEFAULT_TIER_CONFIGS[tier];
+
     // Strict numerical property checks and non-negative bounds
     if (typeof cfg.basePriority !== 'number' || !Number.isFinite(cfg.basePriority) || cfg.basePriority < 0) {
       throw new Error(`Fatal schema violation in TIER_CONFIGS: Tier "${tier}": basePriority must be a non-negative finite number.`);
@@ -148,13 +254,60 @@ function parseTierConfigs(rawTierJson) {
       throw new Error(`Fatal schema violation in TIER_CONFIGS: Tier "${tier}": maxAllowance must be a non-negative number or null.`);
     }
 
+    // ACS-1 Tier Attributes: monthlyAnlas, v5Weight, v5MaxBankDays, v5SurplusEligible
+    let monthlyAnlas;
+    if (cfg.monthlyAnlas !== undefined) {
+      const val = cfg.monthlyAnlas === null ? Infinity : cfg.monthlyAnlas;
+      if (val !== Infinity && (!Number.isInteger(val) || val < 0)) {
+        throw new Error(`Fatal schema violation in TIER_CONFIGS: Tier "${tier}": monthlyAnlas must be a non-negative integer or null.`);
+      }
+      monthlyAnlas = val;
+    } else {
+      monthlyAnlas = defaultCfg ? defaultCfg.monthlyAnlas : 0;
+    }
+
+    let v5Weight;
+    if (cfg.v5Weight !== undefined) {
+      if (!Number.isInteger(cfg.v5Weight) || cfg.v5Weight < 0) {
+        throw new Error(`Fatal schema violation in TIER_CONFIGS: Tier "${tier}": v5Weight must be a non-negative integer.`);
+      }
+      v5Weight = cfg.v5Weight;
+    } else {
+      v5Weight = defaultCfg ? defaultCfg.v5Weight : 0;
+    }
+
+    let v5MaxBankDays;
+    if (cfg.v5MaxBankDays !== undefined) {
+      const val = cfg.v5MaxBankDays === null ? Infinity : cfg.v5MaxBankDays;
+      if (val !== Infinity && (!Number.isInteger(val) || val < 0)) {
+        throw new Error(`Fatal schema violation in TIER_CONFIGS: Tier "${tier}": v5MaxBankDays must be a non-negative integer or null.`);
+      }
+      v5MaxBankDays = val;
+    } else {
+      v5MaxBankDays = defaultCfg ? defaultCfg.v5MaxBankDays : 0;
+    }
+
+    let v5SurplusEligible;
+    if (cfg.v5SurplusEligible !== undefined) {
+      if (typeof cfg.v5SurplusEligible !== 'boolean') {
+        throw new Error(`Fatal schema violation in TIER_CONFIGS: Tier "${tier}": v5SurplusEligible must be a boolean.`);
+      }
+      v5SurplusEligible = cfg.v5SurplusEligible;
+    } else {
+      v5SurplusEligible = defaultCfg ? defaultCfg.v5SurplusEligible : false;
+    }
+
     mergedConfigs[tier] = Object.freeze({
       basePriority: cfg.basePriority,
       preciseLimit,
       maxBurst,
       refillRate: cfg.refillRate,
       maxAllowance,
-      refillRateMs: cfg.refillRateMs
+      refillRateMs: cfg.refillRateMs,
+      monthlyAnlas,
+      v5Weight,
+      v5MaxBankDays,
+      v5SurplusEligible
     });
   }
 
@@ -179,7 +332,7 @@ function parseTierConfigs(rawTierJson) {
 function loadConfig(env = process.env) {
   const adminSecretKey = env.ADMIN_SECRET_KEY;
   if (!adminSecretKey || typeof adminSecretKey !== 'string' || adminSecretKey.trim() === '') {
-    throw new Error("[VPS Critical] ADMIN_SECRET_KEY variable is unconfigured! Crashing boot sequence.");
+    throw new Error("[GuildWeave Critical] ADMIN_SECRET_KEY variable is unconfigured! Crashing boot sequence.");
   }
 
   let port = OPERATIONAL_DEFAULTS.PORT;
@@ -226,6 +379,77 @@ function loadConfig(env = process.env) {
     maxPayloadSizeBytes = parsedLimit;
   }
 
+  let minimumUserscriptVersion = OPERATIONAL_DEFAULTS.MINIMUM_USERSCRIPT_VERSION;
+  if (env.MINIMUM_USERSCRIPT_VERSION !== undefined) {
+    if (typeof env.MINIMUM_USERSCRIPT_VERSION !== 'string') {
+      throw new Error('Fatal schema violation in MINIMUM_USERSCRIPT_VERSION: Value must be a SemVer string (e.g. "6.0.0").');
+    }
+    const rawMinVer = env.MINIMUM_USERSCRIPT_VERSION.trim();
+    if (!parseSemVer(rawMinVer)) {
+      throw new Error(`Fatal schema violation in MINIMUM_USERSCRIPT_VERSION: "${env.MINIMUM_USERSCRIPT_VERSION}" must be a valid SemVer 2.0.0 string (e.g. "6.0.0").`);
+    }
+    minimumUserscriptVersion = rawMinVer;
+  }
+
+  // Operational Parameter Overrides with Strict Regex Validation
+  let nominalDailyV5Compute = OPERATIONAL_DEFAULTS.NOMINAL_DAILY_V5_COMPUTE;
+  if (env.NOMINAL_DAILY_V5_COMPUTE !== undefined) {
+    const rawVal = String(env.NOMINAL_DAILY_V5_COMPUTE).trim();
+    if (!/^\d+(\.\d+)?$/.test(rawVal)) {
+      throw new Error(`Fatal schema violation in NOMINAL_DAILY_V5_COMPUTE: "${env.NOMINAL_DAILY_V5_COMPUTE}" must be a positive number.`);
+    }
+    const parsedVal = parseFloat(rawVal);
+    if (!Number.isFinite(parsedVal) || parsedVal <= 0) {
+      throw new Error(`Fatal schema violation in NOMINAL_DAILY_V5_COMPUTE: "${env.NOMINAL_DAILY_V5_COMPUTE}" must be a positive number.`);
+    }
+    nominalDailyV5Compute = parsedVal;
+  }
+
+  let v5CircuitBreakerPercent = OPERATIONAL_DEFAULTS.V5_CIRCUIT_BREAKER_PERCENT;
+  if (env.V5_CIRCUIT_BREAKER_PERCENT !== undefined) {
+    const rawVal = String(env.V5_CIRCUIT_BREAKER_PERCENT).trim();
+    if (!/^\d+(\.\d+)?$/.test(rawVal)) {
+      throw new Error(`Fatal schema violation in V5_CIRCUIT_BREAKER_PERCENT: "${env.V5_CIRCUIT_BREAKER_PERCENT}" must be a non-negative number.`);
+    }
+    v5CircuitBreakerPercent = parseFloat(rawVal);
+  }
+
+  let v5SurplusThresholdPercent = OPERATIONAL_DEFAULTS.V5_SURPLUS_THRESHOLD_PERCENT;
+  if (env.V5_SURPLUS_THRESHOLD_PERCENT !== undefined) {
+    const rawVal = String(env.V5_SURPLUS_THRESHOLD_PERCENT).trim();
+    if (!/^\d+(\.\d+)?$/.test(rawVal)) {
+      throw new Error(`Fatal schema violation in V5_SURPLUS_THRESHOLD_PERCENT: "${env.V5_SURPLUS_THRESHOLD_PERCENT}" must be a non-negative number.`);
+    }
+    v5SurplusThresholdPercent = parseFloat(rawVal);
+  }
+
+  let ingressSemaphoreMax = OPERATIONAL_DEFAULTS.INGRESS_SEMAPHORE_MAX;
+  if (env.INGRESS_SEMAPHORE_MAX !== undefined) {
+    const rawVal = String(env.INGRESS_SEMAPHORE_MAX).trim();
+    if (!/^\d+$/.test(rawVal) || parseInt(rawVal, 10) < 1) {
+      throw new Error(`Fatal schema violation in INGRESS_SEMAPHORE_MAX: "${env.INGRESS_SEMAPHORE_MAX}" must be a positive integer.`);
+    }
+    ingressSemaphoreMax = parseInt(rawVal, 10);
+  }
+
+  let uploadInactivityTimeoutMs = OPERATIONAL_DEFAULTS.UPLOAD_INACTIVITY_TIMEOUT_MS;
+  if (env.UPLOAD_INACTIVITY_TIMEOUT_MS !== undefined) {
+    const rawVal = String(env.UPLOAD_INACTIVITY_TIMEOUT_MS).trim();
+    if (!/^\d+$/.test(rawVal) || parseInt(rawVal, 10) < 100) {
+      throw new Error(`Fatal schema violation in UPLOAD_INACTIVITY_TIMEOUT_MS: "${env.UPLOAD_INACTIVITY_TIMEOUT_MS}" must be at least 100ms.`);
+    }
+    uploadInactivityTimeoutMs = parseInt(rawVal, 10);
+  }
+
+  let uploadDurationCeilingMs = OPERATIONAL_DEFAULTS.UPLOAD_DURATION_CEILING_MS;
+  if (env.UPLOAD_DURATION_CEILING_MS !== undefined) {
+    const rawVal = String(env.UPLOAD_DURATION_CEILING_MS).trim();
+    if (!/^\d+$/.test(rawVal) || parseInt(rawVal, 10) < 1000) {
+      throw new Error(`Fatal schema violation in UPLOAD_DURATION_CEILING_MS: "${env.UPLOAD_DURATION_CEILING_MS}" must be at least 1000ms.`);
+    }
+    uploadDurationCeilingMs = parseInt(rawVal, 10);
+  }
+
   const nodeEnv = env.NODE_ENV ? String(env.NODE_ENV).trim() : OPERATIONAL_DEFAULTS.NODE_ENV;
   const tierConfigs = parseTierConfigs(env.TIER_CONFIGS);
 
@@ -234,6 +458,7 @@ function loadConfig(env = process.env) {
     ADMIN_SECRET_KEY: adminSecretKey.trim(),
     DATABASE_PATH: databasePath,
     NODE_ENV: nodeEnv,
+    MINIMUM_USERSCRIPT_VERSION: minimumUserscriptVersion,
     UPSTREAM_BASE_URL_TEMPLATE: upstreamTemplate,
     MAX_PAYLOAD_SIZE_BYTES: maxPayloadSizeBytes,
     TIER_CONFIGS: tierConfigs,
@@ -253,13 +478,23 @@ function loadConfig(env = process.env) {
     TELEMETRY_STALE_MS: OPERATIONAL_DEFAULTS.TELEMETRY_STALE_MS,
     TELEMETRY_COOLDOWN_MS: OPERATIONAL_DEFAULTS.TELEMETRY_COOLDOWN_MS,
     ACTIVE_SESSION_TTL_MS: OPERATIONAL_DEFAULTS.ACTIVE_SESSION_TTL_MS,
-    MAX_LINKED_DEVICES_PER_USER: OPERATIONAL_DEFAULTS.MAX_LINKED_DEVICES_PER_USER
+    MAX_LINKED_DEVICES_PER_USER: OPERATIONAL_DEFAULTS.MAX_LINKED_DEVICES_PER_USER,
+
+    // ACS-1 Operational Constants
+    NOMINAL_DAILY_V5_COMPUTE: nominalDailyV5Compute,
+    V5_CIRCUIT_BREAKER_PERCENT: v5CircuitBreakerPercent,
+    V5_SURPLUS_THRESHOLD_PERCENT: v5SurplusThresholdPercent,
+    INGRESS_SEMAPHORE_MAX: ingressSemaphoreMax,
+    UPLOAD_INACTIVITY_TIMEOUT_MS: uploadInactivityTimeoutMs,
+    UPLOAD_DURATION_CEILING_MS: uploadDurationCeilingMs
   });
 }
 
 module.exports = {
   loadConfig,
   parseTierConfigs,
+  parseSemVer,
+  compareSemVer,
   DEFAULT_TIER_CONFIGS,
   MANDATORY_BASE_TIERS,
   PROXY_PATH_WHITELIST,

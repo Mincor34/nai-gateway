@@ -28,6 +28,9 @@
  *      * Generate button shield overlay: total occlusion of sibling children (`visibility: hidden`) with no text collision.
  *      * Deprecated settings tab quarantine: verifies no redundant `#gw-settings-tab` injection into settings sidebar.
  *      * Complete toast eradication: verifies no floating `#vps-queue-banner` elements exist anywhere in the DOM.
+ *    - Branding & Upgrade Continuity Contract:
+ *      * Zero residual legacy brand leaks (`Nai-Gateway`, `Nai-Admin`, `Nai-Guest`, `VPS Gateway`, `GATEWAY COORDINATOR`) in bundles.
+ *      * Preserves Tampermonkey storage keys (`vps_host`, `vps_tab_id`) and DOM hooks for zero-regression upgrades.
  */
 
 'use strict';
@@ -1017,9 +1020,9 @@ test("Phase 6: UserScript Target Environment Verification (Tampermonkey Browser 
   });
 
   // ---------------------------------------------------------------------------
-  // 11. ARTIFACT METADATA & ENCAPSULATION CONTRACT (BOTH TARGETS)
+  // 11. ARTIFACT METADATA, BRANDING HYGIENE & ENCAPSULATION CONTRACT (BOTH TARGETS)
   // ---------------------------------------------------------------------------
-  await t.test("Artifact Contract: Production bundles enforce strict Tampermonkey headers and IIFE boundaries", () => {
+  await t.test("Artifact Contract: Production bundles enforce Tampermonkey headers, GuildWeave branding, upgrade continuity, and IIFE boundaries", () => {
     for (const target of targets) {
       assert.ok(fs.existsSync(target.outfile), `Artifact must exist on disk: ${target.outfile}`);
       const code = fs.readFileSync(target.outfile, 'utf8');
@@ -1034,8 +1037,8 @@ test("Phase 6: UserScript Target Environment Verification (Tampermonkey Browser 
       assert.match(headerBlock, /@grant\s+GM_setValue/);
       assert.match(headerBlock, /@grant\s+GM_getValue/);
       assert.match(headerBlock, /@run-at\s+document-start/);
-      assert.match(headerBlock, /@updateURL\s+https:\/\//);
-      assert.match(headerBlock, /@downloadURL\s+https:\/\//);
+      assert.match(headerBlock, /@updateURL\s+https:\/\/raw\.githubusercontent\.com\/Mincor34\/nai-gateway\//);
+      assert.match(headerBlock, /@downloadURL\s+https:\/\/raw\.githubusercontent\.com\/Mincor34\/nai-gateway\//);
 
       // 2. Encapsulation: Strict IIFE formatting
       const bodyContent = code.slice(code.indexOf('// ==/UserScript=='));
@@ -1047,6 +1050,19 @@ test("Phase 6: UserScript Target Environment Verification (Tampermonkey Browser 
 
       // 3. Node.js Isolation: Asserts no leaked require() calls
       assert.doesNotMatch(bodyContent, /\brequire\s*\(/, `Artifact ${target.name} contains leaked require() calls`);
+
+      // 4. Branding Hygiene: Rejects residual legacy brand strings inside compiled runtime
+      assert.doesNotMatch(bodyContent, /\bNai-Gateway\b/i, `Artifact ${target.name} leaked legacy Nai-Gateway brand`);
+      assert.doesNotMatch(bodyContent, /\bNai-Admin\b/, `Artifact ${target.name} leaked legacy Nai-Admin brand`);
+      assert.doesNotMatch(bodyContent, /\bNai-Guest\b/, `Artifact ${target.name} leaked legacy Nai-Guest brand`);
+      assert.doesNotMatch(bodyContent, /VPS Gateway/, `Artifact ${target.name} leaked legacy VPS Gateway brand`);
+      assert.doesNotMatch(bodyContent, /GATEWAY COORDINATOR/, `Artifact ${target.name} leaked legacy GATEWAY COORDINATOR heading`);
+      assert.doesNotMatch(bodyContent, /VPS DEBUG (?:MODE|INTENT) ACTIVE/, `Artifact ${target.name} leaked legacy VPS debug badge copy`);
+
+      // 5. Upgrade Continuity Invariant: Persistent storage keys & DOM IDs remain intact
+      assert.match(bodyContent, /"vps_host"/, `Artifact ${target.name} must preserve vps_host storage key`);
+      assert.match(bodyContent, /"vps_tab_id"/, `Artifact ${target.name} must preserve vps_tab_id sessionStorage key`);
+      assert.match(bodyContent, /"vps-approval-overlay"/, `Artifact ${target.name} must preserve setup overlay DOM ID`);
     }
   });
 

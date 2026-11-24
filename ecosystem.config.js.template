@@ -2,20 +2,24 @@ module.exports = {
   apps: [{
     name: "nai-gateway-prod",
     script: "./server.js",
+    // Optional: pin explicit Node binary path when using nvm so shell PATH drift cannot swap runtimes
+    // interpreter: "/path/to/node",
     watch: false,
-    max_memory_restart: "200M",
+    // Must exceed baseline Node/SQLite RSS + (INGRESS_SEMAPHORE_MAX * MAX_PAYLOAD_SIZE_BYTES) + concat/JSON headroom
+    max_memory_restart: "512M",
     env: {
       NODE_ENV: "production",
       PORT: 3000,
       DATABASE_PATH: "data.db",
       ADMIN_SECRET_KEY: "YOUR_SUPER_SECRET_KEY_HERE",
+      MINIMUM_USERSCRIPT_VERSION: "6.0.0",
       // Harmonized Tier Settings: Use 'null' to denote unlimited parameters (mapped to Infinity on boot)
       TIER_CONFIGS: JSON.stringify({
-        'Admin':   { "basePriority": 30, "preciseLimit": null, "maxBurst": null, "refillRate": 0,      "maxAllowance": null, "refillRateMs": 0 },
-        'High':    { "basePriority": 20, "preciseLimit": 3,    "maxBurst": null, "refillRate": 0,      "maxAllowance": null, "refillRateMs": 0 },
-        'Normal':  { "basePriority": 10, "preciseLimit": 2,    "maxBurst": 15,   "refillRate": 120000, "maxAllowance": null, "refillRateMs": 0 },
-        'Low':     { "basePriority": 0,  "preciseLimit": 1,    "maxBurst": 10,   "refillRate": 120000, "maxAllowance": null, "refillRateMs": 0 },
-        'Metered': { "basePriority": 0,  "preciseLimit": 0,    "maxBurst": 5,    "refillRate": 120000, "maxAllowance": 100,  "refillRateMs": 1800000 }
+        'Admin':   { "basePriority": 30, "preciseLimit": null, "maxBurst": null, "refillRate": 0,      "maxAllowance": null, "refillRateMs": 0,       "monthlyAnlas": null, "v5Weight": 4, "v5MaxBankDays": null, "v5SurplusEligible": true },
+        'High':    { "basePriority": 20, "preciseLimit": null, "maxBurst": null, "refillRate": 0,      "maxAllowance": null, "refillRateMs": 0,       "monthlyAnlas": 1000, "v5Weight": 3, "v5MaxBankDays": 3,    "v5SurplusEligible": true },
+        'Normal':  { "basePriority": 10, "preciseLimit": null, "maxBurst": 15,   "refillRate": 120000, "maxAllowance": null, "refillRateMs": 0,       "monthlyAnlas": 500,  "v5Weight": 2, "v5MaxBankDays": 3,    "v5SurplusEligible": true },
+        'Low':     { "basePriority": 0,  "preciseLimit": null, "maxBurst": 10,   "refillRate": 120000, "maxAllowance": null, "refillRateMs": 0,       "monthlyAnlas": 250,  "v5Weight": 1, "v5MaxBankDays": 3,    "v5SurplusEligible": true },
+        'Metered': { "basePriority": 0,  "preciseLimit": null, "maxBurst": 5,    "refillRate": 120000, "maxAllowance": 300,  "refillRateMs": 1800000, "monthlyAnlas": 0,    "v5Weight": 0, "v5MaxBankDays": 0,    "v5SurplusEligible": true }
       })
     }
   }]

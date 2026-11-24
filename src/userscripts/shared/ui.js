@@ -8,7 +8,7 @@
  *    to remain visible above React modal dialogues.
  * 3. Autonomous Animation Styling: Injects isolated keyframe animations (@keyframes gwPulse)
  *    dynamically to eliminate external CSS dependencies.
- * 4. Re-exports DOM Engine primitives for unified module ingestion across userscript targets.
+ * 4. Re-exports DOM Engine, Clipboard helpers, and live Theme Scraper primitives for unified module ingestion.
  */
 
 'use strict';
@@ -16,21 +16,56 @@
 import {
   injectNavBadge,
   injectAllowanceBar,
+  injectDualLedgerBar,
   updateAllowanceBar,
+  updateDualLedgerHud,
+  refreshDualLedgerHud,
+  readNativeModelAndEffortFromDOM,
+  readNativeGenerationSpecsFromDOM,
+  setHudAlert,
+  syncUIControlConstraints,
+  scrapeDisplayedAnlasCost,
+  getClientPolicyState,
+  setClientPolicyState,
   injectQueueShield,
   setQueueShieldState,
+  setGenerateLockoutState,
   initDOMObserver,
   stopDOMObserver
 } from './domEngine.js';
 
+import {
+  escapeHtml,
+  copyTextToClipboard,
+  attachCopyChipHandlers,
+  scrapeNovelAITheme,
+  ensureGuildWeaveStyles
+} from './theme.js';
+
 export {
   injectNavBadge,
   injectAllowanceBar,
+  injectDualLedgerBar,
   updateAllowanceBar,
+  updateDualLedgerHud,
+  refreshDualLedgerHud,
+  readNativeModelAndEffortFromDOM,
+  readNativeGenerationSpecsFromDOM,
+  setHudAlert,
+  syncUIControlConstraints,
+  scrapeDisplayedAnlasCost,
+  getClientPolicyState,
+  setClientPolicyState,
   injectQueueShield,
   setQueueShieldState,
+  setGenerateLockoutState,
   initDOMObserver,
-  stopDOMObserver
+  stopDOMObserver,
+  escapeHtml,
+  copyTextToClipboard,
+  attachCopyChipHandlers,
+  scrapeNovelAITheme,
+  ensureGuildWeaveStyles
 };
 
 /**
@@ -59,8 +94,8 @@ export function injectWarningBadge(message, bgColor) {
   if (document.getElementById("vps-debug-badge")) return;
   const badge = document.createElement("div");
   badge.id = "vps-debug-badge";
-  badge.innerHTML = message;
-  badge.style.cssText = `position:fixed; top:10px; left:50%; transform:translateX(-50%); background:${bgColor}; color:#fff; font-weight:bold; font-size:11px; padding:6px 12px; border-radius:4px; z-index:99999; box-shadow:0 2px 8px rgba(0,0,0,0.4); pointer-events:none; font-family:sans-serif;`;
+  badge.textContent = message;
+  badge.style.cssText = `position:fixed; top:10px; left:50%; transform:translateX(-50%); background:${bgColor}; color:#fff; font-weight:600; font-size:11px; padding:6px 14px; border-radius:999px; z-index:99999; box-shadow:0 4px 12px rgba(0,0,0,0.45); pointer-events:none; font-family:sans-serif;`;
   const root = document.body || document.documentElement;
   if (root) root.appendChild(badge);
 }

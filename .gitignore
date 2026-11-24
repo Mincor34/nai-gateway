@@ -37,6 +37,10 @@ Thumbs.db
 .dev/
 .tmp/
 
+#vscode
+.vscode/
+
 # Other
 Caddy.template
 Plan.md
+docs/temp/*
