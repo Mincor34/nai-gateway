@@ -3,7 +3,7 @@
   "version": "1.0.1",
   "main": "server.js",
   "engines": {
-    "node": ">=26.0.0"
+    "node": ">=26.13.1"
   },
   "scripts": {
     "start": "node server.js",
@@ -23,6 +23,9 @@
   "dependencies": {
     "express": "^5.3.0",
     "sqlite3": "^6.0.1"
+  },
+    "overrides": {
+    "body-parser": ">=2.4.0"
   },
   "devDependencies": {
     "esbuild": "^0.28.2"
